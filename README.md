@@ -408,6 +408,12 @@ the frozen binary measured 102.9 tok/s on the prose benchmark. DFlash2 was imple
 validated against a host fp32 reference but produced lower throughput under the tested
 configurations.
 
+## Related
+
+A separate engine for a different model and hardware pairing, by the same author:
+[openPangu-2.0-Flash-CUDA-ROCm](https://github.com/bespokeontology/openPangu-2.0-Flash-CUDA-ROCm) -
+native CUDA and HIP/ROCm backends for openPangu-2.0-Flash on NVIDIA GB10 and 4x AMD MI50.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
