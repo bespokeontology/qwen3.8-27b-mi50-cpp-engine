@@ -1,0 +1,17 @@
+Implement, in C++17, a thread-safe bounded blocking queue template `BoundedQueue<T>` with the following interface and semantics, then a small worker pool built on it, then a unit test program.
+
+Requirements for the queue:
+1. Constructor takes the capacity (must be > 0; throw std::invalid_argument otherwise).
+2. `void push(T value)` blocks while the queue is full.
+3. `bool try_push_for(T value, std::chrono::milliseconds timeout)` returns false if the queue stayed full for the whole timeout.
+4. `T pop()` blocks while the queue is empty.
+5. `std::optional<T> try_pop_for(std::chrono::milliseconds timeout)` returns std::nullopt on timeout.
+6. `void close()` wakes every waiter; after close, push throws std::runtime_error and pop drains the remaining items, then throws std::runtime_error when empty.
+7. `size_t size() const` and `bool closed() const`.
+Use std::mutex and two std::condition_variable objects (not_full, not_empty); no busy waiting; no spurious-wakeup bugs (use predicate loops).
+
+Worker pool `WorkerPool`: constructor takes the number of threads and a queue capacity; `std::future<R> submit(F&& f)` for callables returning R (use std::packaged_task and a std::function<void()> queue); the destructor closes the queue and joins every thread; tasks submitted after the destructor started must fail cleanly.
+
+Unit test program (plain asserts, no framework): (a) FIFO order with one producer and one consumer over 10,000 items; (b) 4 producers x 4 consumers over 100,000 items summing to the expected total; (c) try_pop_for times out on an empty queue within a tolerance; (d) close() wakes a blocked consumer; (e) the pool runs 1,000 tasks and every future resolves to its expected value.
+
+Write the complete code in one file with brief comments explaining the memory-ordering and lifetime choices (why the predicate loops, why close() must notify_all under the lock, why the pool's destructor order matters). Do not omit any part.

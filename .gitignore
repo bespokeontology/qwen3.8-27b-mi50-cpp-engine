@@ -1,0 +1,7 @@
+*.o
+*.d
+q27_gen
+q27_tok
+tools/df2_oracle
+tools/st_dump
+isa/

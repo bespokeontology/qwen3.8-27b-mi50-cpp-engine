@@ -1,0 +1,18 @@
+#!/bin/bash
+# q27_chat <model_dir> "first user message"
+#   Loads the model once, answers, then reads further user turns from stdin (one per line) until EOF.
+#   Env: Q27_CTX (default 16384 positions), Q27_MAXN (first answer cap, 512), Q27_SERVE_MAXN (later
+#   answers, 512), Q27_THINK=1 to let the model think, Q27_SYSTEM="..." for a system turn,
+#   Q27_SPEC=0 to disable speculative decoding (default on, greedy), Q27_TEMP/Q27_TOPP/Q27_TOPK to sample
+#   (sampling uses the plain decode path).
+M=${1:?usage: q27_chat <model_dir> "first user message"}; shift
+[ $# -ge 1 ] || { echo "q27_chat: give the first user message as an argument" >&2; exit 2; }
+# rocBLAS 5.7.1 sometimes resolves its Tensile library directory to a nonexistent path and aborts at
+# init; pinning it makes the lookup deterministic.
+if [ -z "${ROCBLAS_TENSILE_LIBPATH:-}" ]; then
+  for d in /opt/rocm/lib/rocblas/library /opt/rocm-*/lib/rocblas/library; do
+    [ -d "$d" ] && { export ROCBLAS_TENSILE_LIBPATH="$d"; break; }
+  done
+fi
+exec env Q27_TEXT=1 Q27_SERVE=1 Q27_SERVE_MAXN=${Q27_SERVE_MAXN:-512} \
+  "$(dirname "$0")/q27_gen" "$M" 4 ${Q27_CTX:-16384} ${Q27_MAXN:-512} "" "$@"
