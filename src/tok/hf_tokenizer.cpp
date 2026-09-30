@@ -477,9 +477,12 @@ private:
         if (match == nullptr) throw std::runtime_error("cannot allocate tokenizer regex match data");
         try {
             std::size_t cursor = 0;
+            // The first PCRE2 match validates the whole UTF-8 subject. Every later
+            // cursor is a match boundary in that same immutable string. Revalidating
+            // the complete subject for every word makes long prompts quadratic.
             while (cursor < text.size()) {
                 const int result = pcre2_match(regex_, reinterpret_cast<PCRE2_SPTR>(text.data()),
-                                               text.size(), cursor, 0, match, nullptr);
+                                               text.size(), cursor, cursor == 0 ? 0 : PCRE2_NO_UTF_CHECK, match, nullptr);
                 if (result == PCRE2_ERROR_NOMATCH) {
                     encode_piece(text.substr(cursor), output);
                     break;

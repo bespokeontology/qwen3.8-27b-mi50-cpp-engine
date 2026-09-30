@@ -1,0 +1,15 @@
+{
+  "capacity_target": 32768,
+  "prompt_tokens": 32512,
+  "passed": true,
+  "repeat_exact": true,
+  "rewind_exercised": true,
+  "tool_gate": "pending separate actual Harness turn",
+  "tests": [
+    "long-initial",
+    "long-repeat",
+    "long-continuation",
+    "long-rewind",
+    "reset-divergent"
+  ]
+}

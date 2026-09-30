@@ -1,0 +1,57 @@
+18:02:38 fe: turn 6 prompt=32512 resident=16384 lcp=32512 PARTIAL-REUSE(rewind) rewind_to=16384 tail=16128 maxn=96 tools=0
+engine: Q27_MS T5b_primed           186.74 s
+Q27_XFER_BEGIN req=12 timing=0
+engine: Q27_MS T5c_all_primed       186.74 s
+Q27_PHASE req=12 phase=prefill edge=begin monotonic_ms=31517223.772421
+engine: Q27_MS T6_sweep_begin       186.74 s
+engine: Q27_MS T6_embed_done        186.74 s
+engine: Q27_MS T6_events_done       186.74 s
+engine: Q27_MS T6_setup_done        186.78 s
+engine: Q27_MS T6a_jobs_begin       186.78 s
+engine: Q27_MS T6b_loop_done        205.49 s
+engine: Q27_MS T6_prefill_begin     205.51 s
+engine: Q27_MS T6b_finals_done      205.51 s
+Q27_PHASE req=12 phase=prefill edge=end monotonic_ms=31536084.258886
+engine: Q27_MTP_PREFILL positions=16127 ms=97.6
+engine: Q27_MS T6b_sweep_end        205.60 s
+Q27_PHASE req=12 phase=decode edge=begin pos=32512 monotonic_ms=31536087.964473
+Q27_PHASE req=12 phase=decode edge=end pos=32512 monotonic_ms=31536117.604952
+Q27_PHASE req=12 phase=decode edge=begin pos=32515 monotonic_ms=31536117.660284
+engine: Q27_LS_SWEEP positions=16128 host_coll_ms=0.0 (layer-split: no intra-layer collectives)
+engine: Q27_MS T7_decode_begin      205.64 s
+Q27_PHASE req=12 phase=decode edge=end pos=32515 monotonic_ms=31536145.242365
+Q27_PHASE req=12 phase=decode edge=begin pos=32518 monotonic_ms=31536145.339785
+Q27_PHASE req=12 phase=decode edge=end pos=32518 monotonic_ms=31536173.005330
+Q27_PHASE req=12 phase=decode edge=begin pos=32521 monotonic_ms=31536173.090828
+Q27_PHASE req=12 phase=decode edge=end pos=32521 monotonic_ms=31536200.736516
+Q27_PHASE req=12 phase=decode edge=begin pos=32524 monotonic_ms=31536200.834647
+Q27_PHASE req=12 phase=decode edge=end pos=32524 monotonic_ms=31536229.035770
+Q27_PHASE req=12 phase=decode edge=begin pos=32527 monotonic_ms=31536229.125205
+Q27_PHASE req=12 phase=decode edge=end pos=32527 monotonic_ms=31536256.703489
+engine: Q27_SPEC rounds=96 accepted=171 per-round=1.781  P(>=1)=0.948  P(>=2)=0.833
+Q27_PHASE req=12 phase=decode edge=begin pos=32530 monotonic_ms=31536256.796932
+Q27_PHASE req=12 phase=decode edge=end pos=32530 monotonic_ms=31536284.370207
+Q27_PHASE req=12 phase=decode edge=begin pos=32533 monotonic_ms=31536284.468278
+Q27_PHASE req=12 phase=decode edge=end pos=32533 monotonic_ms=31536312.032656
+engine: Q27_MS T8_decode_24         205.83 s
+Q27_PHASE req=12 phase=decode edge=begin pos=32536 monotonic_ms=31536312.123333
+Q27_PHASE req=12 phase=decode edge=end pos=32536 monotonic_ms=31536340.274384
+Q27_HOST_STAGE_AB req=12 enabled=0 summed_host_wall_ms=0.000000
+Q27_XFER req=12 kind=peer bytes=5593313280 calls=8841 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=peer2d bytes=300095280 calls=256 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=same_device bytes=258637824 calls=87 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=h2d bytes=1157898240 calls=565 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=d2h bytes=165150728 calls=65 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=h2h bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=unknown bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=host_staged bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=12 kind=stream_wait bytes=0 calls=2159 event_ms=0.000000 timing=0
+Q27_MEMORY label=req12-pos32539 physical=0 allocator_live=20329301256 allocations=925 free=13247709184 total=34342961152 used=21095251968
+Q27_MEMORY label=req12-pos32539 physical=1 allocator_live=19309632776 allocations=923 free=14287896576 total=34342961152 used=20055064576
+Q27_MEMORY label=req12-pos32539 physical=2 allocator_live=22033923704 allocations=982 free=11544821760 total=34342961152 used=22798139392
+Q27_FINITE req=12 logical=1 pos=32539 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_FINITE req=12 logical=2 pos=32539 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_FINITE req=12 logical=0 pos=32539 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_SPECT 12 rounds=9 ms/round: draft=2.3136 draft_xchg=0.0042 embed=0.0336 layers=4.6242 head_sync=20.9497 head_xchg=0.0000 tail=0.0249 total=27.9503
+engine: Q27_REQ 12 prompt_tokens=16128 prefill_ms=18860.5 ttft_ms=18860.5 gen_tokens=26 decode_ms_per_tok=9.319 decode_tok_s=107.31 rounds=9 ms_per_round=27.9558 tok_per_round=3.0000 acc_p1=1.000 acc_p2=1.000 dup=0 arm=0 coll_host=0 coll_p2p=1188 coll_push=0 coll_pull=0 coll_sdma=0 coll_ll=1188 epi=12672/12672 nr_eff=3 p2p_min=1 pos_end=32539 spec=1 spec_k=2 finish=stop tokhash=ec87dcb4a713886f bin=e2e2a0b1 exl3_calls=0 exl3_rows=0 exl3_m1=0 ex_o=0 ex_op=0 ex_qkv=0 ex_z=0
+18:02:57 fe: turn 6 done gen=25 tools=0 resident=32537

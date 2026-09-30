@@ -1,0 +1,87 @@
+{
+  "run": "k16-corrected-qualification-serve-01",
+  "target": 262144,
+  "label": "ctx262",
+  "time": "2026-09-29T22:28:53.151Z",
+  "passed": true,
+  "no_mtp_host_fallback_observed": true,
+  "rewind_exercised": true,
+  "rows": [
+    {
+      "name": "long-initial",
+      "expected_answer_matched": true,
+      "finite": true,
+      "finite_cards": [
+        0,
+        1,
+        2
+      ],
+      "zero_host_collectives": true,
+      "zero_host_staging": true,
+      "prefill_tok_s": 264.31704723236066,
+      "committed_tok_s": 43.51,
+      "ok": true
+    },
+    {
+      "name": "long-repeat",
+      "expected_answer_matched": true,
+      "finite": true,
+      "finite_cards": [
+        0,
+        1,
+        2
+      ],
+      "zero_host_collectives": true,
+      "zero_host_staging": true,
+      "prefill_tok_s": 147.81846777652723,
+      "committed_tok_s": 43.62,
+      "ok": true
+    },
+    {
+      "name": "long-continuation",
+      "expected_answer_matched": true,
+      "finite": true,
+      "finite_cards": [
+        0,
+        1,
+        2
+      ],
+      "zero_host_collectives": true,
+      "zero_host_staging": true,
+      "prefill_tok_s": 17.810880829015545,
+      "committed_tok_s": 45.71,
+      "ok": true
+    },
+    {
+      "name": "long-rewind",
+      "expected_answer_matched": true,
+      "finite": true,
+      "finite_cards": [
+        0,
+        1,
+        2
+      ],
+      "zero_host_collectives": true,
+      "zero_host_staging": true,
+      "prefill_tok_s": 18.495316508561544,
+      "committed_tok_s": 45.8,
+      "ok": true
+    },
+    {
+      "name": "reset-divergent",
+      "expected_answer_matched": true,
+      "finite": true,
+      "finite_cards": [
+        0,
+        1,
+        2
+      ],
+      "zero_host_collectives": true,
+      "zero_host_staging": true,
+      "prefill_tok_s": 86.07594936708861,
+      "committed_tok_s": 135.2,
+      "ok": true
+    }
+  ],
+  "note": "Expected-answer/state/transport checks only; generated token hashes are diagnostic. Memory residency source audit and actual Harness tool receipt remain separate."
+}

@@ -1,0 +1,163 @@
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=6 nr=1 splits=2 pattern=1 bad=195
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=6 nr=1 splits=7 pattern=1 bad=193
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=6 nr=1 splits=128 pattern=1 bad=217
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=6 nr=3 splits=2 pattern=1 bad=623
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=6 nr=3 splits=7 pattern=1 bad=591
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=6 nr=3 splits=128 pattern=1 bad=658
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=6 nr=4 splits=2 pattern=1 bad=830
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=6 nr=4 splits=7 pattern=1 bad=774
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=6 nr=4 splits=128 pattern=1 bad=874
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=12 nr=1 splits=2 pattern=1 bad=396
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=12 nr=1 splits=7 pattern=1 bad=387
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=12 nr=1 splits=128 pattern=1 bad=428
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=12 nr=3 splits=2 pattern=1 bad=1178
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=12 nr=3 splits=7 pattern=1 bad=1184
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=12 nr=3 splits=128 pattern=1 bad=1271
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=0 heads=12 nr=4 splits=2 pattern=1 bad=1590
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=0 heads=12 nr=4 splits=7 pattern=1 bad=1564
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=0 heads=12 nr=4 splits=128 pattern=1 bad=1699
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=6 nr=1 splits=2 pattern=1 bad=195
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=6 nr=1 splits=7 pattern=1 bad=193
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=6 nr=1 splits=128 pattern=1 bad=217
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=6 nr=3 splits=2 pattern=1 bad=623
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=6 nr=3 splits=7 pattern=1 bad=591
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=6 nr=3 splits=128 pattern=1 bad=658
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=6 nr=4 splits=2 pattern=1 bad=830
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=6 nr=4 splits=7 pattern=1 bad=774
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=6 nr=4 splits=128 pattern=1 bad=874
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=12 nr=1 splits=2 pattern=1 bad=396
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=12 nr=1 splits=7 pattern=1 bad=387
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=12 nr=1 splits=128 pattern=1 bad=428
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=12 nr=3 splits=2 pattern=1 bad=1178
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=12 nr=3 splits=7 pattern=1 bad=1184
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=12 nr=3 splits=128 pattern=1 bad=1271
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=1 heads=12 nr=4 splits=2 pattern=1 bad=1590
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=1 heads=12 nr=4 splits=7 pattern=1 bad=1564
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=1 heads=12 nr=4 splits=128 pattern=1 bad=1699
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=6 nr=1 splits=2 pattern=1 bad=195
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=6 nr=1 splits=7 pattern=1 bad=193
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=6 nr=1 splits=128 pattern=1 bad=217
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=6 nr=3 splits=2 pattern=1 bad=623
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=6 nr=3 splits=7 pattern=1 bad=591
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=6 nr=3 splits=128 pattern=1 bad=658
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=6 nr=4 splits=2 pattern=1 bad=830
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=6 nr=4 splits=7 pattern=1 bad=774
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=6 nr=4 splits=128 pattern=1 bad=874
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=12 nr=1 splits=2 pattern=1 bad=396
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=12 nr=1 splits=7 pattern=1 bad=387
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=12 nr=1 splits=128 pattern=1 bad=428
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=12 nr=3 splits=2 pattern=1 bad=1178
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=12 nr=3 splits=7 pattern=1 bad=1184
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=12 nr=3 splits=128 pattern=1 bad=1271
+Q/guards first=43 reference=-24 fused=-23
+scales/guards first=32 reference=0.0850394 fused=0.0851583
+ATTN dev=2 heads=12 nr=4 splits=2 pattern=1 bad=1590
+Q/guards first=35 reference=-12 fused=-11
+scales/guards first=32 reference=0.0692913 fused=0.0693138
+ATTN dev=2 heads=12 nr=4 splits=7 pattern=1 bad=1564
+Q/guards first=45 reference=61 fused=62
+scales/guards first=32 reference=0.0246063 fused=0.0246326
+ATTN dev=2 heads=12 nr=4 splits=128 pattern=1 bad=1699
+ATTN cases=108 mismatches=43956

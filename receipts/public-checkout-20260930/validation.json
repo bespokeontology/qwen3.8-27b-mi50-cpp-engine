@@ -1,0 +1,36 @@
+{
+  "date": "2026-09-30T08:24:35.434Z",
+  "build": "make -j2 all component-build CH=256 TSLOT=256 V4=1 EXP=0",
+  "compiler": "ROCm 5.7.1 hipcc, GCC 11 toolchain",
+  "engine_sha256": "d0a4bc2f8404e6fc84221e758afdb14c5b03d4bb9753e0f0ef81263ad6c5a72e",
+  "frontend_sha256": "657d25c53b69954057f27f32459110af8fc86ccad10065155227767136ebf499",
+  "attention": {
+    "cases": 108,
+    "mismatches": 0
+  },
+  "gdn": {
+    "cases": 54,
+    "mismatches": 0
+  },
+  "flag_guard_cases": 10,
+  "packer_layout_cases": 65539,
+  "packer_invalid_cases": 4,
+  "frontend_checks": 26,
+  "python_used": false,
+  "frontend_fix": "Separate reasoning from non-streaming content when the prompt already opened <think>; regression cases cover closed, truncated and disabled-thinking output.",
+  "startup": {
+    "ordinary_checkpoint": true,
+    "ready": true
+  },
+  "http_smoke": {
+    "status": 200,
+    "answer_pass": true,
+    "reasoning_separate": true,
+    "receipt": "http-smoke.json",
+    "native_log": "http-smoke-engine.log",
+    "finite_devices": 3,
+    "non_finite": 0,
+    "host_collective_calls": 0,
+    "host_staged_bytes": 0
+  }
+}

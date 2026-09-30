@@ -12,6 +12,10 @@ struct q27_i8g_d_t {              // device-resident int8 per-64-group weight
     float*       s = nullptr;     // [rows][K/64] fp32 group scales
     float        alpha = 1.f;
     int          rows = 0, K = 0;
+    // K-VIEW STRIDES, must mirror q27_i8g_t (q27_df2_gemm casts this struct to q27_i8g_t and
+    // the router reads these two ints). 0 = dense, i.e. the row stride is K and the scale-plane
+    // stride is K/64 -- which is what every construction here produces.
+    int          ldw = 0, lds = 0;
     size_t       bytes() const { return (size_t)rows * K + (size_t)rows * (K / 64) * 4; }
 };
 

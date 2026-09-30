@@ -1,0 +1,725 @@
+Q27_PF_BLAS config enabled=1 force=0 mode=long normal_M=256 normal_min_pos0=8192
+Q27_MS T0_start               0.00 s
+Q27_CATALOG tensors=2194 payload=21921428072
+Q27_MS T1_open_done           0.00 s
+Q27_MEMORY label=before_weights physical=0 allocator_live=0 allocations=0 free=34319892480 total=34342961152 used=23068672
+Q27_MEMORY label=before_weights physical=1 allocator_live=0 allocations=0 free=22615687168 total=34342961152 used=11727273984
+Q27_MEMORY label=before_weights physical=2 allocator_live=0 allocations=0 free=20937965568 total=34342961152 used=13404995584
+Q27_SHARD_MAP logical 0,1,2,3 -> physical 0,1,2,2; mapped physical peer access
+Q27_STORAGE origin_monotonic_ns=29649213542421
+Q27_STORAGE native replay: 4556 uploads, 2 physical drives
+Q27_STORAGE payload_ready logical=0 physical=0 elapsed_ms=1148.069 uploads=1139
+Q27_STORAGE owner_ready logical=0 physical=0 elapsed_ms=1148.130 stage=tp-native
+Q27_STORAGE payload_ready logical=1 physical=0 elapsed_ms=3044.896 uploads=2278
+Q27_STORAGE owner_ready logical=1 physical=0 elapsed_ms=3044.943 stage=tp-native
+Q27_STORAGE payload_ready logical=2 physical=1 elapsed_ms=5111.061 uploads=3417
+Q27_STORAGE owner_ready logical=2 physical=1 elapsed_ms=5111.152 stage=tp-native
+Q27_LSOWN_DEAL ndev=3 blk=4 blocks=16 got/quota=5/5,5/5,6/6 adjacent_collisions=0
+Q27_LSOWN_MAP  2012012012012012
+Q27_LS_HEAD owner=2 TP_rows=82688 required_rows=248320 alias=0
+Q27_STORAGE payload_ready logical=0 physical=0 elapsed_ms=6278.716 uploads=3772
+Q27_STORAGE owner_ready logical=0 physical=0 elapsed_ms=7037.340 stage=ls-mirrors
+Q27_STORAGE payload_ready logical=1 physical=0 elapsed_ms=8250.900 uploads=4127
+Q27_STORAGE owner_ready logical=1 physical=0 elapsed_ms=9017.804 stage=ls-mirrors
+Q27_STORAGE payload_ready logical=2 physical=1 elapsed_ms=10733.703 uploads=4556
+Q27_STORAGE owner_ready logical=2 physical=1 elapsed_ms=11607.418 stage=ls-mirrors
+Q27_STORAGE native_load_complete uploads=4556 elapsed_ms=11607.508
+q27 checkpoint ./data/qwen38-27b/model
+  catalog: 2194 tensors, 21921428072 payload bytes (20.4159 GiB)
+  skipped: model.visual.* (vision tower) and mtp.* (draft head) - not used by decode
+  TENSOR PARALLEL over 3 cards: all 64 layers resident on every card, each holding its shard
+  card 0 (device 0): 5751191808 B (5.3562 GiB) resident  layers [0,64) sharded 1/3 +final_norm +lm_head[82944 rows]
+  card 1 (device 1): 5958203648 B (5.5490 GiB) resident  layers [0,64) sharded 1/3 +final_norm +lm_head[82688 rows]
+  card 2 (device 2): 6676655616 B (6.2181 GiB) resident  layers [0,64) sharded 1/3 +final_norm +lm_head[82688 rows]
+  total resident: 18386051072 B (17.1233 GiB)
+Q27_UPLOAD_MS 13414
+Q27_MS T2_weights_resident    13.45 s
+Q27_TP_SHARD worker 0: q_heads [0,+12) kv_heads [0,+2) attn_g=2 gdn_key_heads [0,+4) value_heads [0,+12) mlp [0,+5888) vocab [0,+82944) | QL=6144 KVL=512 OL=3072 QKVL=2560 ZL=1536
+Q27_TP_SHARD worker 1: q_heads [12,+6) kv_heads [2,+1) attn_g=4 gdn_key_heads [4,+6) value_heads [12,+18) mlp [5888,+5760) vocab [82944,+82688) | QL=3072 KVL=256 OL=1536 QKVL=3840 ZL=2304
+Q27_TP_SHARD worker 2: q_heads [18,+6) kv_heads [3,+1) attn_g=4 gdn_key_heads [10,+6) value_heads [30,+18) mlp [11648,+5760) vocab [165632,+82688) | QL=3072 KVL=256 OL=1536 QKVL=3840 ZL=2304
+Q27_TP_NDEV_ANY: running the FOUR-CARD TP path at ndev=3 by explicit opt-in.  ndev!=1: the in_proj_qkv shard ranges and GDN offsets were NEVER reviewed for this width. Verify output before trusting it.
+Q27_STORAGE owner_ready logical=0 physical=0 elapsed_ms=13747.405 stage=all-weights-with-decode-mirrors
+Q27_STORAGE owner_ready logical=1 physical=0 elapsed_ms=13898.960 stage=all-weights-with-decode-mirrors
+Q27_STORAGE owner_ready logical=2 physical=1 elapsed_ms=14050.191 stage=all-weights-with-decode-mirrors
+Q27_MEMORY label=weights_resident physical=0 allocator_live=13645459328 allocations=713 free=20150484992 total=34342961152 used=14192476160
+Q27_MEMORY label=weights_resident physical=1 allocator_live=13869510528 allocations=713 free=19951255552 total=34342961152 used=14391705600
+Q27_MEMORY label=weights_resident physical=2 allocator_live=16139028736 allocations=772 free=17663262720 total=34342961152 used=16679698432
+Q27_TP_READY cards=3 ctx=4096
+Q27_DEC_I8 on: 624 int8 per-64 layer mirrors, 6.72 GiB over 3 cards (0 failed)
+Q27_VRAM after_i8_mirrors card 0: free 16.70 GiB of 31.98 GiB
+Q27_VRAM after_i8_mirrors card 1: free 16.26 GiB of 31.98 GiB
+Q27_VRAM after_i8_mirrors card 2: free 14.13 GiB of 31.98 GiB
+Q27_DEC_I8: freed 2.24 GiB of fp8 layer projections per card (mirrors carry every consumer)
+Q27_VRAM after_fp8_free card 0: free 18.77 GiB of 31.98 GiB
+Q27_VRAM after_fp8_free card 1: free 18.58 GiB of 31.98 GiB
+Q27_VRAM after_fp8_free card 2: free 16.45 GiB of 31.98 GiB
+Q27_MS T3_devalloc_begin     15.90 s
+Q27_REWIND_CK 2 banks x 71.6 MiB = 0.14 GiB/card (S 69.8 + conv 1.8 MiB)
+Q27_KVPLACE card 0 ls=1 kc=0.041 GiB vc=0.021 GiB ks=0.005 GiB vs=0.003 GiB S=69.8 MiB conv=1.8 MiB
+Q27_KVPLACE card 1 ls=1 kc=0.030 GiB vc=0.015 GiB ks=0.004 GiB vs=0.002 GiB S=82.1 MiB conv=2.1 MiB
+Q27_KVPLACE card 2 ls=1 kc=0.033 GiB vc=0.017 GiB ks=0.004 GiB vs=0.002 GiB S=87.8 MiB conv=2.3 MiB
+Q27_MS T4_devalloc_done      16.27 s
+Q27_MTP weights skipped: target-only K=0, draft and prompt-head disabled
+Q27_SPECCFG spec=1 K=0 verify_rows=1 draft=0 mtp_pp=0 paged=1
+Q27_BOOTSTAMP identity=prelaunch; live inode hash verified after timed readiness
+Q27_BOOTSTAMP exe_md5=e2e2a0b1e57d918d1dd1f81589882f8c size=9050048 mtime=1790717406 spec=1 spec_k=0 ctx=4096 ndev=3 v4=1 pf_ch=256 pf_tslot=256 ls=1 kvplace=1 dec_mlp_nv=1 nr=1 nr_p2p=4 nr_p2p_min=1 coll_nrbf16=1 tpsr=0 ovr=Q27X_ALIAS_MLP=0(fe:0),Q27X_SPEC=1(fe:1)
+Q27_VRAM after_devalloc card 0: free 17.89 GiB of 31.98 GiB
+Q27_VRAM after_devalloc card 1: free 17.68 GiB of 31.98 GiB
+Q27_VRAM after_devalloc card 2: free 15.45 GiB of 31.98 GiB
+Q27_VRAM pre_mtp_init card 0: free 17.89 GiB of 31.98 GiB
+Q27_VRAM pre_mtp_init card 1: free 17.68 GiB of 31.98 GiB
+Q27_VRAM pre_mtp_init card 2: free 15.45 GiB of 31.98 GiB
+Q27_BOOTSTAMP exe_md5=e2e2a0b1e57d918d1dd1f81589882f8c size=9050048 mtime=1790717406 spec=1 spec_k=0 ctx=4096 ndev=3 v4=1 pf_ch=256 pf_tslot=256 ls=1 kvplace=1 dec_mlp_nv=1 nr=1 nr_p2p=4 nr_p2p_min=1 coll_nrbf16=1 tpsr=0 ovr=Q27X_ALIAS_MLP=0(fe:0),Q27X_SPEC=1(fe:1)
+Q27_COLL_PAD: ndev=3 -- collective slots 3..3 zero-filled (the host reduces are unrolled over hp[0..3])
+Q27_MEMORY label=runtime_resident physical=0 allocator_live=14606793736 allocations=842 free=19145949184 total=34342961152 used=15197011968
+Q27_MEMORY label=runtime_resident physical=1 allocator_live=14850995208 allocations=840 free=18923651072 total=34342961152 used=15419310080
+Q27_MEMORY label=runtime_resident physical=2 allocator_live=17228911992 allocations=899 free=16526606336 total=34342961152 used=17816354816
+Q27_DEC_I8 on: 0 int8 per-64 draft-head mirrors, 0.000 GiB over 3 cards (0 failed)
+Q27_VRAM after_head_mirrors card 0: free 17.86 GiB of 31.98 GiB
+Q27_VRAM after_head_mirrors card 1: free 17.66 GiB of 31.98 GiB
+Q27_VRAM after_head_mirrors card 2: free 15.42 GiB of 31.98 GiB
+Q27_NR_P2P=4 on: LL flag-in-data pack + copy-engine push + local spin reduce for the 3-card row-batched collective (uncached slots, 4 deep, self-test 6/6)
+Q27_VRAM after_spec_init card 0: free 17.86 GiB of 31.98 GiB
+Q27_VRAM after_spec_init card 1: free 17.65 GiB of 31.98 GiB
+Q27_VRAM after_spec_init card 2: free 15.42 GiB of 31.98 GiB
+Q27_SLOTS cap=1024
+Q27_VRAM after_pfslots card 0: free 17.83 GiB of 31.98 GiB
+Q27_VRAM after_pfslots card 1: free 17.62 GiB of 31.98 GiB
+Q27_VRAM after_pfslots card 2: free 15.39 GiB of 31.98 GiB
+Q27_MS T5_threads_begin      16.86 s
+Q27_MS T5b_primed            22.46 s
+Q27_MS T5c_all_primed        22.50 s
+Q27_XFER_BEGIN req=0 timing=0
+Q27_PHASE req=0 phase=prefill edge=begin monotonic_ms=29669866.583620
+Q27_MS T6_sweep_begin        22.50 s
+Q27_MS T6_embed_done         22.51 s
+Q27_MS T6_events_done        22.51 s
+Q27_MS T6_setup_done         22.52 s
+Q27_MS T6a_jobs_begin        22.52 s
+Q27_XCOPY probe: 0->1 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 0->2 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 0->3 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 1->0 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 1->2 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 1->3 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 2->0 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 2->1 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 2->3 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 3->0 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 3->1 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY probe: 3->2 can=1 enable=hipErrorPeerAccessAlreadyEnabled => MAPPED
+Q27_XCOPY: peer map probed, 4 device(s), caller device 0 restored
+Q27_MS T6b_loop_done         23.16 s
+Q27_MS T6_prefill_begin      23.16 s
+Q27_MS T6b_finals_done       23.16 s
+Q27_PHASE req=0 phase=prefill edge=end monotonic_ms=29670530.743871
+Q27_MS T6b_sweep_end         23.16 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1024 monotonic_ms=29670530.945653
+Q27_LL_REG_RECV_DISPATCH g=2 ndev=3 nr=1 mode=1 trunk=1 kernel=q27_k_red_nr_ll_regs spin_max=33554432
+Q27_LL_REG_RECV_DISPATCH g=0 ndev=3 nr=1 mode=1 trunk=1 kernel=q27_k_red_nr_ll_regs spin_max=33554432
+Q27_LL_REG_RECV_DISPATCH g=1 ndev=3 nr=1 mode=1 trunk=1 kernel=q27_k_red_nr_ll_regs spin_max=33554432
+Q27_SWIGLU_GROUP4 first_call device=0 n=5888 NR=1 lanes=4 block=64 trunk=1
+Q27_SWIGLU_GROUP4 first_call device=1 n=5760 NR=1 lanes=4 block=64 trunk=1
+Q27_SWIGLU_GROUP4 first_call device=2 n=5760 NR=1 lanes=4 block=64 trunk=1
+Q27_ATT_K16=1 (16-lane int8-dot decode attention)
+Q27_ATT_PF=4 (decode attention prefetch depth)
+Q27_PHASE req=0 phase=decode edge=end pos=1024 monotonic_ms=29670592.840962
+Q27_LS_SWEEP positions=1024 host_coll_ms=0.0 (layer-split: no intra-layer collectives)
+Q27_MS T7_decode_begin       23.22 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1025 monotonic_ms=29670592.862843
+Q27_PHASE req=0 phase=decode edge=end pos=1025 monotonic_ms=29670607.611819
+Q27_PHASE req=0 phase=decode edge=begin pos=1026 monotonic_ms=29670607.624773
+Q27_PHASE req=0 phase=decode edge=end pos=1026 monotonic_ms=29670622.443899
+Q27_PHASE req=0 phase=decode edge=begin pos=1027 monotonic_ms=29670622.455961
+Q27_PHASE req=0 phase=decode edge=end pos=1027 monotonic_ms=29670637.226327
+Q27_PHASE req=0 phase=decode edge=begin pos=1028 monotonic_ms=29670637.247185
+Q27_PHASE req=0 phase=decode edge=end pos=1028 monotonic_ms=29670652.090796
+Q27_PHASE req=0 phase=decode edge=begin pos=1029 monotonic_ms=29670652.109721
+Q27_PHASE req=0 phase=decode edge=end pos=1029 monotonic_ms=29670666.900955
+Q27_PHASE req=0 phase=decode edge=begin pos=1030 monotonic_ms=29670666.920521
+Q27_PHASE req=0 phase=decode edge=end pos=1030 monotonic_ms=29670682.912533
+Q27_PHASE req=0 phase=decode edge=begin pos=1031 monotonic_ms=29670682.924816
+Q27_PHASE req=0 phase=decode edge=end pos=1031 monotonic_ms=29670697.706442
+Q27_MS T8_decode_8           23.33 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1032 monotonic_ms=29670697.721971
+Q27_PHASE req=0 phase=decode edge=end pos=1032 monotonic_ms=29670712.493899
+Q27_PHASE req=0 phase=decode edge=begin pos=1033 monotonic_ms=29670712.505681
+Q27_PHASE req=0 phase=decode edge=end pos=1033 monotonic_ms=29670727.296124
+Q27_PHASE req=0 phase=decode edge=begin pos=1034 monotonic_ms=29670727.310170
+Q27_PHASE req=0 phase=decode edge=end pos=1034 monotonic_ms=29670742.111783
+Q27_PHASE req=0 phase=decode edge=begin pos=1035 monotonic_ms=29670742.135537
+Q27_PHASE req=0 phase=decode edge=end pos=1035 monotonic_ms=29670756.979479
+Q27_PHASE req=0 phase=decode edge=begin pos=1036 monotonic_ms=29670756.998955
+Q27_PHASE req=0 phase=decode edge=end pos=1036 monotonic_ms=29670771.890113
+Q27_PHASE req=0 phase=decode edge=begin pos=1037 monotonic_ms=29670771.912064
+Q27_PHASE req=0 phase=decode edge=end pos=1037 monotonic_ms=29670786.731400
+Q27_PHASE req=0 phase=decode edge=begin pos=1038 monotonic_ms=29670786.747921
+Q27_PHASE req=0 phase=decode edge=end pos=1038 monotonic_ms=29670801.620876
+Q27_PHASE req=0 phase=decode edge=begin pos=1039 monotonic_ms=29670801.651733
+Q27_PHASE req=0 phase=decode edge=end pos=1039 monotonic_ms=29670817.368466
+Q27_SPEC rounds=16 accepted=0 per-round=0.000
+Q27_MS T8_decode_16          23.45 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1040 monotonic_ms=29670817.383704
+Q27_PHASE req=0 phase=decode edge=end pos=1040 monotonic_ms=29670832.376881
+Q27_PHASE req=0 phase=decode edge=begin pos=1041 monotonic_ms=29670832.388182
+Q27_PHASE req=0 phase=decode edge=end pos=1041 monotonic_ms=29670847.136728
+Q27_PHASE req=0 phase=decode edge=begin pos=1042 monotonic_ms=29670847.147778
+Q27_PHASE req=0 phase=decode edge=end pos=1042 monotonic_ms=29670861.922101
+Q27_PHASE req=0 phase=decode edge=begin pos=1043 monotonic_ms=29670861.934033
+Q27_PHASE req=0 phase=decode edge=end pos=1043 monotonic_ms=29670876.737269
+Q27_PHASE req=0 phase=decode edge=begin pos=1044 monotonic_ms=29670876.748931
+Q27_PHASE req=0 phase=decode edge=end pos=1044 monotonic_ms=29670891.519527
+Q27_PHASE req=0 phase=decode edge=begin pos=1045 monotonic_ms=29670891.538182
+Q27_PHASE req=0 phase=decode edge=end pos=1045 monotonic_ms=29670906.330037
+Q27_PHASE req=0 phase=decode edge=begin pos=1046 monotonic_ms=29670906.342049
+Q27_PHASE req=0 phase=decode edge=end pos=1046 monotonic_ms=29670921.235602
+Q27_PHASE req=0 phase=decode edge=begin pos=1047 monotonic_ms=29670921.249448
+Q27_PHASE req=0 phase=decode edge=end pos=1047 monotonic_ms=29670936.066800
+Q27_MS T8_decode_24          23.57 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1048 monotonic_ms=29670936.081417
+Q27_PHASE req=0 phase=decode edge=end pos=1048 monotonic_ms=29670952.069582
+Q27_PHASE req=0 phase=decode edge=begin pos=1049 monotonic_ms=29670952.081664
+Q27_PHASE req=0 phase=decode edge=end pos=1049 monotonic_ms=29670966.966201
+Q27_PHASE req=0 phase=decode edge=begin pos=1050 monotonic_ms=29670966.991157
+Q27_PHASE req=0 phase=decode edge=end pos=1050 monotonic_ms=29670981.872037
+Q27_PHASE req=0 phase=decode edge=begin pos=1051 monotonic_ms=29670981.883868
+Q27_PHASE req=0 phase=decode edge=end pos=1051 monotonic_ms=29670996.767142
+Q27_PHASE req=0 phase=decode edge=begin pos=1052 monotonic_ms=29670996.782321
+Q27_PHASE req=0 phase=decode edge=end pos=1052 monotonic_ms=29671011.639176
+Q27_PHASE req=0 phase=decode edge=begin pos=1053 monotonic_ms=29671011.651148
+Q27_PHASE req=0 phase=decode edge=end pos=1053 monotonic_ms=29671026.475824
+Q27_PHASE req=0 phase=decode edge=begin pos=1054 monotonic_ms=29671026.497674
+Q27_PHASE req=0 phase=decode edge=end pos=1054 monotonic_ms=29671041.279612
+Q27_PHASE req=0 phase=decode edge=begin pos=1055 monotonic_ms=29671041.291544
+Q27_PHASE req=0 phase=decode edge=end pos=1055 monotonic_ms=29671056.060797
+Q27_SPEC rounds=32 accepted=0 per-round=0.000
+Q27_MS T8_decode_32          23.69 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1056 monotonic_ms=29671056.091945
+Q27_PHASE req=0 phase=decode edge=end pos=1056 monotonic_ms=29671070.815204
+Q27_PHASE req=0 phase=decode edge=begin pos=1057 monotonic_ms=29671070.827767
+Q27_PHASE req=0 phase=decode edge=end pos=1057 monotonic_ms=29671085.662401
+Q27_PHASE req=0 phase=decode edge=begin pos=1058 monotonic_ms=29671085.674583
+Q27_PHASE req=0 phase=decode edge=end pos=1058 monotonic_ms=29671101.449013
+Q27_PHASE req=0 phase=decode edge=begin pos=1059 monotonic_ms=29671101.461156
+Q27_PHASE req=0 phase=decode edge=end pos=1059 monotonic_ms=29671116.232253
+Q27_PHASE req=0 phase=decode edge=begin pos=1060 monotonic_ms=29671116.244746
+Q27_PHASE req=0 phase=decode edge=end pos=1060 monotonic_ms=29671131.010824
+Q27_PHASE req=0 phase=decode edge=begin pos=1061 monotonic_ms=29671131.022636
+Q27_PHASE req=0 phase=decode edge=end pos=1061 monotonic_ms=29671145.792991
+Q27_PHASE req=0 phase=decode edge=begin pos=1062 monotonic_ms=29671145.805104
+Q27_PHASE req=0 phase=decode edge=end pos=1062 monotonic_ms=29671160.556694
+Q27_PHASE req=0 phase=decode edge=begin pos=1063 monotonic_ms=29671160.568657
+Q27_PHASE req=0 phase=decode edge=end pos=1063 monotonic_ms=29671175.332170
+Q27_MS T8_decode_40          23.81 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1064 monotonic_ms=29671175.358829
+Q27_PHASE req=0 phase=decode edge=end pos=1064 monotonic_ms=29671190.210264
+Q27_PHASE req=0 phase=decode edge=begin pos=1065 monotonic_ms=29671190.222377
+Q27_PHASE req=0 phase=decode edge=end pos=1065 monotonic_ms=29671204.996870
+Q27_PHASE req=0 phase=decode edge=begin pos=1066 monotonic_ms=29671205.012649
+Q27_PHASE req=0 phase=decode edge=end pos=1066 monotonic_ms=29671219.753440
+Q27_PHASE req=0 phase=decode edge=begin pos=1067 monotonic_ms=29671219.765613
+Q27_PHASE req=0 phase=decode edge=end pos=1067 monotonic_ms=29671234.712024
+Q27_PHASE req=0 phase=decode edge=begin pos=1068 monotonic_ms=29671234.723906
+Q27_PHASE req=0 phase=decode edge=end pos=1068 monotonic_ms=29671250.668329
+Q27_PHASE req=0 phase=decode edge=begin pos=1069 monotonic_ms=29671250.680221
+Q27_PHASE req=0 phase=decode edge=end pos=1069 monotonic_ms=29671265.441680
+Q27_PHASE req=0 phase=decode edge=begin pos=1070 monotonic_ms=29671265.456588
+Q27_PHASE req=0 phase=decode edge=end pos=1070 monotonic_ms=29671280.199293
+Q27_PHASE req=0 phase=decode edge=begin pos=1071 monotonic_ms=29671280.220742
+Q27_PHASE req=0 phase=decode edge=end pos=1071 monotonic_ms=29671295.032975
+Q27_SPEC rounds=48 accepted=0 per-round=0.000
+Q27_MS T8_decode_48          23.93 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1072 monotonic_ms=29671295.046550
+Q27_PHASE req=0 phase=decode edge=end pos=1072 monotonic_ms=29671309.856409
+Q27_PHASE req=0 phase=decode edge=begin pos=1073 monotonic_ms=29671309.868361
+Q27_PHASE req=0 phase=decode edge=end pos=1073 monotonic_ms=29671324.765771
+Q27_PHASE req=0 phase=decode edge=begin pos=1074 monotonic_ms=29671324.777653
+Q27_PHASE req=0 phase=decode edge=end pos=1074 monotonic_ms=29671339.650508
+Q27_PHASE req=0 phase=decode edge=begin pos=1075 monotonic_ms=29671339.662350
+Q27_PHASE req=0 phase=decode edge=end pos=1075 monotonic_ms=29671354.547468
+Q27_PHASE req=0 phase=decode edge=begin pos=1076 monotonic_ms=29671354.558939
+Q27_PHASE req=0 phase=decode edge=end pos=1076 monotonic_ms=29671369.449587
+Q27_PHASE req=0 phase=decode edge=begin pos=1077 monotonic_ms=29671369.461398
+Q27_PHASE req=0 phase=decode edge=end pos=1077 monotonic_ms=29671384.734993
+Q27_PHASE req=0 phase=decode edge=begin pos=1078 monotonic_ms=29671384.766442
+Q27_PHASE req=0 phase=decode edge=end pos=1078 monotonic_ms=29671401.576644
+Q27_PHASE req=0 phase=decode edge=begin pos=1079 monotonic_ms=29671401.597062
+Q27_PHASE req=0 phase=decode edge=end pos=1079 monotonic_ms=29671416.500243
+Q27_MS T8_decode_56          24.05 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1080 monotonic_ms=29671416.514920
+Q27_PHASE req=0 phase=decode edge=end pos=1080 monotonic_ms=29671431.366125
+Q27_PHASE req=0 phase=decode edge=begin pos=1081 monotonic_ms=29671431.377957
+Q27_PHASE req=0 phase=decode edge=end pos=1081 monotonic_ms=29671446.240813
+Q27_PHASE req=0 phase=decode edge=begin pos=1082 monotonic_ms=29671446.273203
+Q27_PHASE req=0 phase=decode edge=end pos=1082 monotonic_ms=29671461.100564
+Q27_PHASE req=0 phase=decode edge=begin pos=1083 monotonic_ms=29671461.112466
+Q27_PHASE req=0 phase=decode edge=end pos=1083 monotonic_ms=29671475.999848
+Q27_PHASE req=0 phase=decode edge=begin pos=1084 monotonic_ms=29671476.015737
+Q27_PHASE req=0 phase=decode edge=end pos=1084 monotonic_ms=29671490.885055
+Q27_PHASE req=0 phase=decode edge=begin pos=1085 monotonic_ms=29671490.896767
+Q27_PHASE req=0 phase=decode edge=end pos=1085 monotonic_ms=29671505.782275
+Q27_PHASE req=0 phase=decode edge=begin pos=1086 monotonic_ms=29671505.794207
+Q27_PHASE req=0 phase=decode edge=end pos=1086 monotonic_ms=29671520.665199
+Q27_PHASE req=0 phase=decode edge=begin pos=1087 monotonic_ms=29671520.702678
+Q27_PHASE req=0 phase=decode edge=end pos=1087 monotonic_ms=29671536.610484
+Q27_SPEC rounds=64 accepted=0 per-round=0.000
+Q27_MS T8_decode_64          24.17 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1088 monotonic_ms=29671536.623909
+Q27_PHASE req=0 phase=decode edge=end pos=1088 monotonic_ms=29671551.431824
+Q27_PHASE req=0 phase=decode edge=begin pos=1089 monotonic_ms=29671551.461519
+Q27_PHASE req=0 phase=decode edge=end pos=1089 monotonic_ms=29671566.280725
+Q27_PHASE req=0 phase=decode edge=begin pos=1090 monotonic_ms=29671566.292226
+Q27_PHASE req=0 phase=decode edge=end pos=1090 monotonic_ms=29671581.099400
+Q27_PHASE req=0 phase=decode edge=begin pos=1091 monotonic_ms=29671581.111552
+Q27_PHASE req=0 phase=decode edge=end pos=1091 monotonic_ms=29671595.901584
+Q27_PHASE req=0 phase=decode edge=begin pos=1092 monotonic_ms=29671595.915480
+Q27_PHASE req=0 phase=decode edge=end pos=1092 monotonic_ms=29671610.742330
+Q27_PHASE req=0 phase=decode edge=begin pos=1093 monotonic_ms=29671610.754001
+Q27_PHASE req=0 phase=decode edge=end pos=1093 monotonic_ms=29671625.598334
+Q27_PHASE req=0 phase=decode edge=begin pos=1094 monotonic_ms=29671625.609895
+Q27_PHASE req=0 phase=decode edge=end pos=1094 monotonic_ms=29671640.425174
+Q27_PHASE req=0 phase=decode edge=begin pos=1095 monotonic_ms=29671640.443558
+Q27_PHASE req=0 phase=decode edge=end pos=1095 monotonic_ms=29671655.276699
+Q27_MS T8_decode_72          24.29 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1096 monotonic_ms=29671655.296396
+Q27_PHASE req=0 phase=decode edge=end pos=1096 monotonic_ms=29671670.146038
+Q27_PHASE req=0 phase=decode edge=begin pos=1097 monotonic_ms=29671670.158360
+Q27_PHASE req=0 phase=decode edge=end pos=1097 monotonic_ms=29671685.901993
+Q27_PHASE req=0 phase=decode edge=begin pos=1098 monotonic_ms=29671685.914196
+Q27_PHASE req=0 phase=decode edge=end pos=1098 monotonic_ms=29671700.794375
+Q27_PHASE req=0 phase=decode edge=begin pos=1099 monotonic_ms=29671700.806397
+Q27_PHASE req=0 phase=decode edge=end pos=1099 monotonic_ms=29671715.650809
+Q27_PHASE req=0 phase=decode edge=begin pos=1100 monotonic_ms=29671715.662431
+Q27_PHASE req=0 phase=decode edge=end pos=1100 monotonic_ms=29671730.445911
+Q27_PHASE req=0 phase=decode edge=begin pos=1101 monotonic_ms=29671730.470236
+Q27_PHASE req=0 phase=decode edge=end pos=1101 monotonic_ms=29671745.343100
+Q27_PHASE req=0 phase=decode edge=begin pos=1102 monotonic_ms=29671745.358849
+Q27_PHASE req=0 phase=decode edge=end pos=1102 monotonic_ms=29671760.283710
+Q27_PHASE req=0 phase=decode edge=begin pos=1103 monotonic_ms=29671760.301573
+Q27_PHASE req=0 phase=decode edge=end pos=1103 monotonic_ms=29671775.208331
+Q27_SPEC rounds=80 accepted=0 per-round=0.000
+Q27_MS T8_decode_80          24.41 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1104 monotonic_ms=29671775.226585
+Q27_PHASE req=0 phase=decode edge=end pos=1104 monotonic_ms=29671790.095042
+Q27_PHASE req=0 phase=decode edge=begin pos=1105 monotonic_ms=29671790.107294
+Q27_PHASE req=0 phase=decode edge=end pos=1105 monotonic_ms=29671804.943512
+Q27_PHASE req=0 phase=decode edge=begin pos=1106 monotonic_ms=29671804.955323
+Q27_PHASE req=0 phase=decode edge=end pos=1106 monotonic_ms=29671819.904159
+Q27_PHASE req=0 phase=decode edge=begin pos=1107 monotonic_ms=29671819.919407
+Q27_PHASE req=0 phase=decode edge=end pos=1107 monotonic_ms=29671835.892844
+Q27_PHASE req=0 phase=decode edge=begin pos=1108 monotonic_ms=29671835.904576
+Q27_PHASE req=0 phase=decode edge=end pos=1108 monotonic_ms=29671850.750341
+Q27_PHASE req=0 phase=decode edge=begin pos=1109 monotonic_ms=29671850.761882
+Q27_PHASE req=0 phase=decode edge=end pos=1109 monotonic_ms=29671865.673459
+Q27_PHASE req=0 phase=decode edge=begin pos=1110 monotonic_ms=29671865.685631
+Q27_PHASE req=0 phase=decode edge=end pos=1110 monotonic_ms=29671880.566391
+Q27_PHASE req=0 phase=decode edge=begin pos=1111 monotonic_ms=29671880.579395
+Q27_PHASE req=0 phase=decode edge=end pos=1111 monotonic_ms=29671895.497343
+Q27_MS T8_decode_88          24.53 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1112 monotonic_ms=29671895.511930
+Q27_PHASE req=0 phase=decode edge=end pos=1112 monotonic_ms=29671910.388632
+Q27_PHASE req=0 phase=decode edge=begin pos=1113 monotonic_ms=29671910.400444
+Q27_PHASE req=0 phase=decode edge=end pos=1113 monotonic_ms=29671925.316538
+Q27_PHASE req=0 phase=decode edge=begin pos=1114 monotonic_ms=29671925.328200
+Q27_PHASE req=0 phase=decode edge=end pos=1114 monotonic_ms=29671940.222014
+Q27_PHASE req=0 phase=decode edge=begin pos=1115 monotonic_ms=29671940.233906
+Q27_PHASE req=0 phase=decode edge=end pos=1115 monotonic_ms=29671955.107472
+Q27_PHASE req=0 phase=decode edge=begin pos=1116 monotonic_ms=29671955.138469
+Q27_PHASE req=0 phase=decode edge=end pos=1116 monotonic_ms=29671969.938830
+Q27_PHASE req=0 phase=decode edge=begin pos=1117 monotonic_ms=29671969.950652
+Q27_PHASE req=0 phase=decode edge=end pos=1117 monotonic_ms=29671985.807033
+Q27_PHASE req=0 phase=decode edge=begin pos=1118 monotonic_ms=29671985.818795
+Q27_PHASE req=0 phase=decode edge=end pos=1118 monotonic_ms=29672000.612494
+Q27_PHASE req=0 phase=decode edge=begin pos=1119 monotonic_ms=29672000.633974
+Q27_PHASE req=0 phase=decode edge=end pos=1119 monotonic_ms=29672015.445746
+Q27_SPEC rounds=96 accepted=0 per-round=0.000
+Q27_MS T8_decode_96          24.65 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1120 monotonic_ms=29672015.459942
+Q27_PHASE req=0 phase=decode edge=end pos=1120 monotonic_ms=29672030.293214
+Q27_PHASE req=0 phase=decode edge=begin pos=1121 monotonic_ms=29672030.305627
+Q27_PHASE req=0 phase=decode edge=end pos=1121 monotonic_ms=29672045.133940
+Q27_PHASE req=0 phase=decode edge=begin pos=1122 monotonic_ms=29672045.146032
+Q27_PHASE req=0 phase=decode edge=end pos=1122 monotonic_ms=29672059.956522
+Q27_PHASE req=0 phase=decode edge=begin pos=1123 monotonic_ms=29672059.968343
+Q27_PHASE req=0 phase=decode edge=end pos=1123 monotonic_ms=29672074.772181
+Q27_PHASE req=0 phase=decode edge=begin pos=1124 monotonic_ms=29672074.808939
+Q27_PHASE req=0 phase=decode edge=end pos=1124 monotonic_ms=29672089.685911
+Q27_PHASE req=0 phase=decode edge=begin pos=1125 monotonic_ms=29672089.697623
+Q27_PHASE req=0 phase=decode edge=end pos=1125 monotonic_ms=29672104.552976
+Q27_PHASE req=0 phase=decode edge=begin pos=1126 monotonic_ms=29672104.564998
+Q27_PHASE req=0 phase=decode edge=end pos=1126 monotonic_ms=29672119.402888
+Q27_PHASE req=0 phase=decode edge=begin pos=1127 monotonic_ms=29672119.415411
+Q27_PHASE req=0 phase=decode edge=end pos=1127 monotonic_ms=29672135.316034
+Q27_MS T8_decode_104         24.77 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1128 monotonic_ms=29672135.330481
+Q27_PHASE req=0 phase=decode edge=end pos=1128 monotonic_ms=29672150.136392
+Q27_PHASE req=0 phase=decode edge=begin pos=1129 monotonic_ms=29672150.162801
+Q27_PHASE req=0 phase=decode edge=end pos=1129 monotonic_ms=29672164.941011
+Q27_PHASE req=0 phase=decode edge=begin pos=1130 monotonic_ms=29672164.953084
+Q27_PHASE req=0 phase=decode edge=end pos=1130 monotonic_ms=29672179.712219
+Q27_PHASE req=0 phase=decode edge=begin pos=1131 monotonic_ms=29672179.745420
+Q27_PHASE req=0 phase=decode edge=end pos=1131 monotonic_ms=29672194.554317
+Q27_PHASE req=0 phase=decode edge=begin pos=1132 monotonic_ms=29672194.565938
+Q27_PHASE req=0 phase=decode edge=end pos=1132 monotonic_ms=29672209.508843
+Q27_PHASE req=0 phase=decode edge=begin pos=1133 monotonic_ms=29672209.521075
+Q27_PHASE req=0 phase=decode edge=end pos=1133 monotonic_ms=29672224.400953
+Q27_PHASE req=0 phase=decode edge=begin pos=1134 monotonic_ms=29672224.412675
+Q27_PHASE req=0 phase=decode edge=end pos=1134 monotonic_ms=29672239.198299
+Q27_PHASE req=0 phase=decode edge=begin pos=1135 monotonic_ms=29672239.210281
+Q27_PHASE req=0 phase=decode edge=end pos=1135 monotonic_ms=29672254.023866
+Q27_SPEC rounds=112 accepted=0 per-round=0.000
+Q27_MS T8_decode_112         24.89 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1136 monotonic_ms=29672254.037301
+Q27_PHASE req=0 phase=decode edge=end pos=1136 monotonic_ms=29672269.828352
+Q27_PHASE req=0 phase=decode edge=begin pos=1137 monotonic_ms=29672269.840354
+Q27_PHASE req=0 phase=decode edge=end pos=1137 monotonic_ms=29672284.738786
+Q27_PHASE req=0 phase=decode edge=begin pos=1138 monotonic_ms=29672284.750548
+Q27_PHASE req=0 phase=decode edge=end pos=1138 monotonic_ms=29672299.646295
+Q27_PHASE req=0 phase=decode edge=begin pos=1139 monotonic_ms=29672299.661894
+Q27_PHASE req=0 phase=decode edge=end pos=1139 monotonic_ms=29672314.503261
+Q27_PHASE req=0 phase=decode edge=begin pos=1140 monotonic_ms=29672314.524600
+Q27_PHASE req=0 phase=decode edge=end pos=1140 monotonic_ms=29672329.385834
+Q27_PHASE req=0 phase=decode edge=begin pos=1141 monotonic_ms=29672329.398517
+Q27_PHASE req=0 phase=decode edge=end pos=1141 monotonic_ms=29672344.234203
+Q27_PHASE req=0 phase=decode edge=begin pos=1142 monotonic_ms=29672344.245835
+Q27_PHASE req=0 phase=decode edge=end pos=1142 monotonic_ms=29672359.099414
+Q27_PHASE req=0 phase=decode edge=begin pos=1143 monotonic_ms=29672359.110865
+Q27_PHASE req=0 phase=decode edge=end pos=1143 monotonic_ms=29672373.997506
+Q27_MS T8_decode_120         25.01 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1144 monotonic_ms=29672374.016721
+Q27_PHASE req=0 phase=decode edge=end pos=1144 monotonic_ms=29672388.932846
+Q27_PHASE req=0 phase=decode edge=begin pos=1145 monotonic_ms=29672388.944648
+Q27_PHASE req=0 phase=decode edge=end pos=1145 monotonic_ms=29672403.785444
+Q27_PHASE req=0 phase=decode edge=begin pos=1146 monotonic_ms=29672403.797155
+Q27_PHASE req=0 phase=decode edge=end pos=1146 monotonic_ms=29672419.581624
+Q27_PHASE req=0 phase=decode edge=begin pos=1147 monotonic_ms=29672419.593435
+Q27_PHASE req=0 phase=decode edge=end pos=1147 monotonic_ms=29672434.556217
+Q27_PHASE req=0 phase=decode edge=begin pos=1148 monotonic_ms=29672434.568108
+Q27_PHASE req=0 phase=decode edge=end pos=1148 monotonic_ms=29672449.464347
+Q27_PHASE req=0 phase=decode edge=begin pos=1149 monotonic_ms=29672449.479164
+Q27_PHASE req=0 phase=decode edge=end pos=1149 monotonic_ms=29672464.337352
+Q27_PHASE req=0 phase=decode edge=begin pos=1150 monotonic_ms=29672464.353011
+Q27_PHASE req=0 phase=decode edge=end pos=1150 monotonic_ms=29672479.238048
+Q27_PHASE req=0 phase=decode edge=begin pos=1151 monotonic_ms=29672479.249860
+Q27_PHASE req=0 phase=decode edge=end pos=1151 monotonic_ms=29672494.184900
+Q27_SPEC rounds=128 accepted=0 per-round=0.000
+Q27_MS T8_decode_128         25.13 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1152 monotonic_ms=29672494.198906
+Q27_PHASE req=0 phase=decode edge=end pos=1152 monotonic_ms=29672509.071330
+Q27_PHASE req=0 phase=decode edge=begin pos=1153 monotonic_ms=29672509.083122
+Q27_PHASE req=0 phase=decode edge=end pos=1153 monotonic_ms=29672523.881700
+Q27_PHASE req=0 phase=decode edge=begin pos=1154 monotonic_ms=29672523.893091
+Q27_PHASE req=0 phase=decode edge=end pos=1154 monotonic_ms=29672538.711355
+Q27_PHASE req=0 phase=decode edge=begin pos=1155 monotonic_ms=29672538.724459
+Q27_PHASE req=0 phase=decode edge=end pos=1155 monotonic_ms=29672553.542362
+Q27_PHASE req=0 phase=decode edge=begin pos=1156 monotonic_ms=29672553.556308
+Q27_PHASE req=0 phase=decode edge=end pos=1156 monotonic_ms=29672569.306774
+Q27_PHASE req=0 phase=decode edge=begin pos=1157 monotonic_ms=29672569.318515
+Q27_PHASE req=0 phase=decode edge=end pos=1157 monotonic_ms=29672584.121772
+Q27_PHASE req=0 phase=decode edge=begin pos=1158 monotonic_ms=29672584.133934
+Q27_PHASE req=0 phase=decode edge=end pos=1158 monotonic_ms=29672598.924878
+Q27_PHASE req=0 phase=decode edge=begin pos=1159 monotonic_ms=29672598.936640
+Q27_PHASE req=0 phase=decode edge=end pos=1159 monotonic_ms=29672613.739265
+Q27_MS T8_decode_136         25.25 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1160 monotonic_ms=29672613.770102
+Q27_PHASE req=0 phase=decode edge=end pos=1160 monotonic_ms=29672628.631877
+Q27_PHASE req=0 phase=decode edge=begin pos=1161 monotonic_ms=29672628.643568
+Q27_PHASE req=0 phase=decode edge=end pos=1161 monotonic_ms=29672643.424744
+Q27_PHASE req=0 phase=decode edge=begin pos=1162 monotonic_ms=29672643.457464
+Q27_PHASE req=0 phase=decode edge=end pos=1162 monotonic_ms=29672658.309351
+Q27_PHASE req=0 phase=decode edge=begin pos=1163 monotonic_ms=29672658.324118
+Q27_PHASE req=0 phase=decode edge=end pos=1163 monotonic_ms=29672673.224744
+Q27_PHASE req=0 phase=decode edge=begin pos=1164 monotonic_ms=29672673.236436
+Q27_PHASE req=0 phase=decode edge=end pos=1164 monotonic_ms=29672688.095696
+Q27_PHASE req=0 phase=decode edge=begin pos=1165 monotonic_ms=29672688.108299
+Q27_PHASE req=0 phase=decode edge=end pos=1165 monotonic_ms=29672703.030284
+Q27_PHASE req=0 phase=decode edge=begin pos=1166 monotonic_ms=29672703.042216
+Q27_PHASE req=0 phase=decode edge=end pos=1166 monotonic_ms=29672718.862241
+Q27_PHASE req=0 phase=decode edge=begin pos=1167 monotonic_ms=29672718.876397
+Q27_PHASE req=0 phase=decode edge=end pos=1167 monotonic_ms=29672733.780780
+Q27_SPEC rounds=144 accepted=0 per-round=0.000
+Q27_MS T8_decode_144         25.37 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1168 monotonic_ms=29672733.796048
+Q27_PHASE req=0 phase=decode edge=end pos=1168 monotonic_ms=29672748.750123
+Q27_PHASE req=0 phase=decode edge=begin pos=1169 monotonic_ms=29672748.779567
+Q27_PHASE req=0 phase=decode edge=end pos=1169 monotonic_ms=29672763.742178
+Q27_PHASE req=0 phase=decode edge=begin pos=1170 monotonic_ms=29672763.759650
+Q27_PHASE req=0 phase=decode edge=end pos=1170 monotonic_ms=29672778.640941
+Q27_PHASE req=0 phase=decode edge=begin pos=1171 monotonic_ms=29672778.656490
+Q27_PHASE req=0 phase=decode edge=end pos=1171 monotonic_ms=29672793.579607
+Q27_PHASE req=0 phase=decode edge=begin pos=1172 monotonic_ms=29672793.592501
+Q27_PHASE req=0 phase=decode edge=end pos=1172 monotonic_ms=29672808.493067
+Q27_PHASE req=0 phase=decode edge=begin pos=1173 monotonic_ms=29672808.506853
+Q27_PHASE req=0 phase=decode edge=end pos=1173 monotonic_ms=29672823.457842
+Q27_PHASE req=0 phase=decode edge=begin pos=1174 monotonic_ms=29672823.469464
+Q27_PHASE req=0 phase=decode edge=end pos=1174 monotonic_ms=29672838.370931
+Q27_PHASE req=0 phase=decode edge=begin pos=1175 monotonic_ms=29672838.384957
+Q27_PHASE req=0 phase=decode edge=end pos=1175 monotonic_ms=29672854.074060
+Q27_MS T8_decode_152         25.49 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1176 monotonic_ms=29672854.089819
+Q27_PHASE req=0 phase=decode edge=end pos=1176 monotonic_ms=29672869.037873
+Q27_PHASE req=0 phase=decode edge=begin pos=1177 monotonic_ms=29672869.052740
+Q27_PHASE req=0 phase=decode edge=end pos=1177 monotonic_ms=29672883.830319
+Q27_PHASE req=0 phase=decode edge=begin pos=1178 monotonic_ms=29672883.841891
+Q27_PHASE req=0 phase=decode edge=end pos=1178 monotonic_ms=29672898.570930
+Q27_PHASE req=0 phase=decode edge=begin pos=1179 monotonic_ms=29672898.581870
+Q27_PHASE req=0 phase=decode edge=end pos=1179 monotonic_ms=29672913.280023
+Q27_PHASE req=0 phase=decode edge=begin pos=1180 monotonic_ms=29672913.298206
+Q27_PHASE req=0 phase=decode edge=end pos=1180 monotonic_ms=29672928.056259
+Q27_PHASE req=0 phase=decode edge=begin pos=1181 monotonic_ms=29672928.067991
+Q27_PHASE req=0 phase=decode edge=end pos=1181 monotonic_ms=29672942.778887
+Q27_PHASE req=0 phase=decode edge=begin pos=1182 monotonic_ms=29672942.789727
+Q27_PHASE req=0 phase=decode edge=end pos=1182 monotonic_ms=29672957.630573
+Q27_PHASE req=0 phase=decode edge=begin pos=1183 monotonic_ms=29672957.656811
+Q27_PHASE req=0 phase=decode edge=end pos=1183 monotonic_ms=29672972.452774
+Q27_SPEC rounds=160 accepted=0 per-round=0.000
+Q27_MS T8_decode_160         25.60 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1184 monotonic_ms=29672972.482699
+Q27_PHASE req=0 phase=decode edge=end pos=1184 monotonic_ms=29672988.256147
+Q27_PHASE req=0 phase=decode edge=begin pos=1185 monotonic_ms=29672988.267719
+Q27_PHASE req=0 phase=decode edge=end pos=1185 monotonic_ms=29673003.146765
+Q27_PHASE req=0 phase=decode edge=begin pos=1186 monotonic_ms=29673003.159228
+Q27_PHASE req=0 phase=decode edge=end pos=1186 monotonic_ms=29673017.940714
+Q27_PHASE req=0 phase=decode edge=begin pos=1187 monotonic_ms=29673017.961433
+Q27_PHASE req=0 phase=decode edge=end pos=1187 monotonic_ms=29673032.803801
+Q27_PHASE req=0 phase=decode edge=begin pos=1188 monotonic_ms=29673032.816264
+Q27_PHASE req=0 phase=decode edge=end pos=1188 monotonic_ms=29673047.668622
+Q27_PHASE req=0 phase=decode edge=begin pos=1189 monotonic_ms=29673047.680253
+Q27_PHASE req=0 phase=decode edge=end pos=1189 monotonic_ms=29673062.551595
+Q27_PHASE req=0 phase=decode edge=begin pos=1190 monotonic_ms=29673062.563447
+Q27_PHASE req=0 phase=decode edge=end pos=1190 monotonic_ms=29673077.375319
+Q27_PHASE req=0 phase=decode edge=begin pos=1191 monotonic_ms=29673077.400766
+Q27_PHASE req=0 phase=decode edge=end pos=1191 monotonic_ms=29673092.306282
+Q27_MS T8_decode_168         25.72 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1192 monotonic_ms=29673092.320608
+Q27_PHASE req=0 phase=decode edge=end pos=1192 monotonic_ms=29673107.200326
+Q27_PHASE req=0 phase=decode edge=begin pos=1193 monotonic_ms=29673107.212238
+Q27_PHASE req=0 phase=decode edge=end pos=1193 monotonic_ms=29673122.012910
+Q27_PHASE req=0 phase=decode edge=begin pos=1194 monotonic_ms=29673122.024882
+Q27_PHASE req=0 phase=decode edge=end pos=1194 monotonic_ms=29673137.906379
+Q27_PHASE req=0 phase=decode edge=begin pos=1195 monotonic_ms=29673137.918151
+Q27_PHASE req=0 phase=decode edge=end pos=1195 monotonic_ms=29673152.707682
+Q27_PHASE req=0 phase=decode edge=begin pos=1196 monotonic_ms=29673152.719163
+Q27_PHASE req=0 phase=decode edge=end pos=1196 monotonic_ms=29673167.579475
+Q27_PHASE req=0 phase=decode edge=begin pos=1197 monotonic_ms=29673167.593010
+Q27_PHASE req=0 phase=decode edge=end pos=1197 monotonic_ms=29673182.426412
+Q27_PHASE req=0 phase=decode edge=begin pos=1198 monotonic_ms=29673182.438224
+Q27_PHASE req=0 phase=decode edge=end pos=1198 monotonic_ms=29673197.297614
+Q27_PHASE req=0 phase=decode edge=begin pos=1199 monotonic_ms=29673197.309506
+Q27_PHASE req=0 phase=decode edge=end pos=1199 monotonic_ms=29673212.101983
+Q27_SPEC rounds=176 accepted=0 per-round=0.000
+Q27_MS T8_decode_176         25.84 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1200 monotonic_ms=29673212.118002
+Q27_PHASE req=0 phase=decode edge=end pos=1200 monotonic_ms=29673226.947858
+Q27_PHASE req=0 phase=decode edge=begin pos=1201 monotonic_ms=29673226.959720
+Q27_PHASE req=0 phase=decode edge=end pos=1201 monotonic_ms=29673241.832635
+Q27_PHASE req=0 phase=decode edge=begin pos=1202 monotonic_ms=29673241.844357
+Q27_PHASE req=0 phase=decode edge=end pos=1202 monotonic_ms=29673256.667279
+Q27_PHASE req=0 phase=decode edge=begin pos=1203 monotonic_ms=29673256.684551
+Q27_PHASE req=0 phase=decode edge=end pos=1203 monotonic_ms=29673271.551766
+Q27_PHASE req=0 phase=decode edge=begin pos=1204 monotonic_ms=29673271.563507
+Q27_PHASE req=0 phase=decode edge=end pos=1204 monotonic_ms=29673287.478467
+Q27_PHASE req=0 phase=decode edge=begin pos=1205 monotonic_ms=29673287.490659
+Q27_PHASE req=0 phase=decode edge=end pos=1205 monotonic_ms=29673302.368544
+Q27_PHASE req=0 phase=decode edge=begin pos=1206 monotonic_ms=29673302.380636
+Q27_PHASE req=0 phase=decode edge=end pos=1206 monotonic_ms=29673317.280431
+Q27_PHASE req=0 phase=decode edge=begin pos=1207 monotonic_ms=29673317.297602
+Q27_PHASE req=0 phase=decode edge=end pos=1207 monotonic_ms=29673332.158315
+Q27_MS T8_decode_184         25.96 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1208 monotonic_ms=29673332.176438
+Q27_PHASE req=0 phase=decode edge=end pos=1208 monotonic_ms=29673347.059001
+Q27_PHASE req=0 phase=decode edge=begin pos=1209 monotonic_ms=29673347.072126
+Q27_PHASE req=0 phase=decode edge=end pos=1209 monotonic_ms=29673361.959087
+Q27_PHASE req=0 phase=decode edge=begin pos=1210 monotonic_ms=29673361.975667
+Q27_PHASE req=0 phase=decode edge=end pos=1210 monotonic_ms=29673376.867407
+Q27_PHASE req=0 phase=decode edge=begin pos=1211 monotonic_ms=29673376.879029
+Q27_PHASE req=0 phase=decode edge=end pos=1211 monotonic_ms=29673391.785997
+Q27_PHASE req=0 phase=decode edge=begin pos=1212 monotonic_ms=29673391.797879
+Q27_PHASE req=0 phase=decode edge=end pos=1212 monotonic_ms=29673406.674761
+Q27_PHASE req=0 phase=decode edge=begin pos=1213 monotonic_ms=29673406.690640
+Q27_PHASE req=0 phase=decode edge=end pos=1213 monotonic_ms=29673421.610702
+Q27_PHASE req=0 phase=decode edge=begin pos=1214 monotonic_ms=29673421.622725
+Q27_PHASE req=0 phase=decode edge=end pos=1214 monotonic_ms=29673438.240342
+Q27_PHASE req=0 phase=decode edge=begin pos=1215 monotonic_ms=29673438.262663
+Q27_PHASE req=0 phase=decode edge=end pos=1215 monotonic_ms=29673453.100704
+Q27_SPEC rounds=192 accepted=0 per-round=0.000
+Q27_MS T8_decode_192         26.08 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1216 monotonic_ms=29673453.120700
+Q27_PHASE req=0 phase=decode edge=end pos=1216 monotonic_ms=29673467.881719
+Q27_PHASE req=0 phase=decode edge=begin pos=1217 monotonic_ms=29673467.893551
+Q27_PHASE req=0 phase=decode edge=end pos=1217 monotonic_ms=29673482.694273
+Q27_PHASE req=0 phase=decode edge=begin pos=1218 monotonic_ms=29673482.706195
+Q27_PHASE req=0 phase=decode edge=end pos=1218 monotonic_ms=29673497.571085
+Q27_PHASE req=0 phase=decode edge=begin pos=1219 monotonic_ms=29673497.582376
+Q27_PHASE req=0 phase=decode edge=end pos=1219 monotonic_ms=29673512.427810
+Q27_PHASE req=0 phase=decode edge=begin pos=1220 monotonic_ms=29673512.440524
+Q27_PHASE req=0 phase=decode edge=end pos=1220 monotonic_ms=29673527.311425
+Q27_PHASE req=0 phase=decode edge=begin pos=1221 monotonic_ms=29673527.323217
+Q27_PHASE req=0 phase=decode edge=end pos=1221 monotonic_ms=29673542.205880
+Q27_PHASE req=0 phase=decode edge=begin pos=1222 monotonic_ms=29673542.218423
+Q27_PHASE req=0 phase=decode edge=end pos=1222 monotonic_ms=29673557.143715
+Q27_PHASE req=0 phase=decode edge=begin pos=1223 monotonic_ms=29673557.155557
+Q27_PHASE req=0 phase=decode edge=end pos=1223 monotonic_ms=29673572.896234
+Q27_MS T8_decode_200         26.20 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1224 monotonic_ms=29673572.910591
+Q27_PHASE req=0 phase=decode edge=end pos=1224 monotonic_ms=29673587.793384
+Q27_PHASE req=0 phase=decode edge=begin pos=1225 monotonic_ms=29673587.805346
+Q27_PHASE req=0 phase=decode edge=end pos=1225 monotonic_ms=29673602.636684
+Q27_PHASE req=0 phase=decode edge=begin pos=1226 monotonic_ms=29673602.648146
+Q27_PHASE req=0 phase=decode edge=end pos=1226 monotonic_ms=29673617.490514
+Q27_PHASE req=0 phase=decode edge=begin pos=1227 monotonic_ms=29673617.507977
+Q27_PHASE req=0 phase=decode edge=end pos=1227 monotonic_ms=29673632.437737
+Q27_PHASE req=0 phase=decode edge=begin pos=1228 monotonic_ms=29673632.449358
+Q27_PHASE req=0 phase=decode edge=end pos=1228 monotonic_ms=29673647.311894
+Q27_PHASE req=0 phase=decode edge=begin pos=1229 monotonic_ms=29673647.333825
+Q27_PHASE req=0 phase=decode edge=end pos=1229 monotonic_ms=29673662.243998
+Q27_PHASE req=0 phase=decode edge=begin pos=1230 monotonic_ms=29673662.262763
+Q27_PHASE req=0 phase=decode edge=end pos=1230 monotonic_ms=29673677.139676
+Q27_PHASE req=0 phase=decode edge=begin pos=1231 monotonic_ms=29673677.156467
+Q27_PHASE req=0 phase=decode edge=end pos=1231 monotonic_ms=29673692.039550
+Q27_SPEC rounds=208 accepted=0 per-round=0.000
+Q27_MS T8_decode_208         26.32 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1232 monotonic_ms=29673692.053005
+Q27_PHASE req=0 phase=decode edge=end pos=1232 monotonic_ms=29673706.948462
+Q27_PHASE req=0 phase=decode edge=begin pos=1233 monotonic_ms=29673706.960114
+Q27_PHASE req=0 phase=decode edge=end pos=1233 monotonic_ms=29673722.750934
+Q27_PHASE req=0 phase=decode edge=begin pos=1234 monotonic_ms=29673722.766893
+Q27_PHASE req=0 phase=decode edge=end pos=1234 monotonic_ms=29673737.702715
+Q27_PHASE req=0 phase=decode edge=begin pos=1235 monotonic_ms=29673737.716590
+Q27_PHASE req=0 phase=decode edge=end pos=1235 monotonic_ms=29673752.630341
+Q27_PHASE req=0 phase=decode edge=begin pos=1236 monotonic_ms=29673752.645389
+Q27_PHASE req=0 phase=decode edge=end pos=1236 monotonic_ms=29673767.552737
+Q27_PHASE req=0 phase=decode edge=begin pos=1237 monotonic_ms=29673767.569268
+Q27_PHASE req=0 phase=decode edge=end pos=1237 monotonic_ms=29673782.466668
+Q27_PHASE req=0 phase=decode edge=begin pos=1238 monotonic_ms=29673782.483880
+Q27_PHASE req=0 phase=decode edge=end pos=1238 monotonic_ms=29673797.414251
+Q27_PHASE req=0 phase=decode edge=begin pos=1239 monotonic_ms=29673797.426324
+Q27_PHASE req=0 phase=decode edge=end pos=1239 monotonic_ms=29673812.326088
+Q27_MS T8_decode_216         26.44 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1240 monotonic_ms=29673812.345724
+Q27_PHASE req=0 phase=decode edge=end pos=1240 monotonic_ms=29673827.174959
+Q27_PHASE req=0 phase=decode edge=begin pos=1241 monotonic_ms=29673827.187432
+Q27_PHASE req=0 phase=decode edge=end pos=1241 monotonic_ms=29673841.999575
+Q27_PHASE req=0 phase=decode edge=begin pos=1242 monotonic_ms=29673842.018730
+Q27_PHASE req=0 phase=decode edge=end pos=1242 monotonic_ms=29673856.805646
+Q27_PHASE req=0 phase=decode edge=begin pos=1243 monotonic_ms=29673856.817348
+Q27_PHASE req=0 phase=decode edge=end pos=1243 monotonic_ms=29673872.596286
+Q27_PHASE req=0 phase=decode edge=begin pos=1244 monotonic_ms=29673872.608950
+Q27_PHASE req=0 phase=decode edge=end pos=1244 monotonic_ms=29673887.459123
+Q27_PHASE req=0 phase=decode edge=begin pos=1245 monotonic_ms=29673887.471756
+Q27_PHASE req=0 phase=decode edge=end pos=1245 monotonic_ms=29673902.268020
+Q27_PHASE req=0 phase=decode edge=begin pos=1246 monotonic_ms=29673902.280012
+Q27_PHASE req=0 phase=decode edge=end pos=1246 monotonic_ms=29673917.111611
+Q27_PHASE req=0 phase=decode edge=begin pos=1247 monotonic_ms=29673917.123432
+Q27_PHASE req=0 phase=decode edge=end pos=1247 monotonic_ms=29673931.938621
+Q27_SPEC rounds=224 accepted=0 per-round=0.000
+Q27_MS T8_decode_224         26.56 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1248 monotonic_ms=29673931.952096
+Q27_PHASE req=0 phase=decode edge=end pos=1248 monotonic_ms=29673946.750563
+Q27_PHASE req=0 phase=decode edge=begin pos=1249 monotonic_ms=29673946.762085
+Q27_PHASE req=0 phase=decode edge=end pos=1249 monotonic_ms=29673961.554932
+Q27_PHASE req=0 phase=decode edge=begin pos=1250 monotonic_ms=29673961.569208
+Q27_PHASE req=0 phase=decode edge=end pos=1250 monotonic_ms=29673976.412860
+Q27_PHASE req=0 phase=decode edge=begin pos=1251 monotonic_ms=29673976.424381
+Q27_PHASE req=0 phase=decode edge=end pos=1251 monotonic_ms=29673991.211788
+Q27_PHASE req=0 phase=decode edge=begin pos=1252 monotonic_ms=29673991.238818
+Q27_PHASE req=0 phase=decode edge=end pos=1252 monotonic_ms=29674006.018791
+Q27_PHASE req=0 phase=decode edge=begin pos=1253 monotonic_ms=29674006.033118
+Q27_PHASE req=0 phase=decode edge=end pos=1253 monotonic_ms=29674021.776941
+Q27_PHASE req=0 phase=decode edge=begin pos=1254 monotonic_ms=29674021.788733
+Q27_PHASE req=0 phase=decode edge=end pos=1254 monotonic_ms=29674036.567855
+Q27_PHASE req=0 phase=decode edge=begin pos=1255 monotonic_ms=29674036.579837
+Q27_PHASE req=0 phase=decode edge=end pos=1255 monotonic_ms=29674051.427305
+Q27_MS T8_decode_232         26.68 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1256 monotonic_ms=29674051.441782
+Q27_PHASE req=0 phase=decode edge=end pos=1256 monotonic_ms=29674066.282758
+Q27_PHASE req=0 phase=decode edge=begin pos=1257 monotonic_ms=29674066.294971
+Q27_PHASE req=0 phase=decode edge=end pos=1257 monotonic_ms=29674081.157597
+Q27_PHASE req=0 phase=decode edge=begin pos=1258 monotonic_ms=29674081.169569
+Q27_PHASE req=0 phase=decode edge=end pos=1258 monotonic_ms=29674096.050509
+Q27_PHASE req=0 phase=decode edge=begin pos=1259 monotonic_ms=29674096.062200
+Q27_PHASE req=0 phase=decode edge=end pos=1259 monotonic_ms=29674110.985038
+Q27_PHASE req=0 phase=decode edge=begin pos=1260 monotonic_ms=29674110.996809
+Q27_PHASE req=0 phase=decode edge=end pos=1260 monotonic_ms=29674125.900070
+Q27_PHASE req=0 phase=decode edge=begin pos=1261 monotonic_ms=29674125.911722
+Q27_PHASE req=0 phase=decode edge=end pos=1261 monotonic_ms=29674140.796990
+Q27_PHASE req=0 phase=decode edge=begin pos=1262 monotonic_ms=29674140.809012
+Q27_PHASE req=0 phase=decode edge=end pos=1262 monotonic_ms=29674156.576319
+Q27_PHASE req=0 phase=decode edge=begin pos=1263 monotonic_ms=29674156.588802
+Q27_PHASE req=0 phase=decode edge=end pos=1263 monotonic_ms=29674171.536615
+Q27_SPEC rounds=240 accepted=0 per-round=0.000
+Q27_MS T8_decode_240         26.80 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1264 monotonic_ms=29674171.550411
+Q27_PHASE req=0 phase=decode edge=end pos=1264 monotonic_ms=29674186.434477
+Q27_PHASE req=0 phase=decode edge=begin pos=1265 monotonic_ms=29674186.448182
+Q27_PHASE req=0 phase=decode edge=end pos=1265 monotonic_ms=29674201.401025
+Q27_PHASE req=0 phase=decode edge=begin pos=1266 monotonic_ms=29674201.412897
+Q27_PHASE req=0 phase=decode edge=end pos=1266 monotonic_ms=29674216.328480
+Q27_PHASE req=0 phase=decode edge=begin pos=1267 monotonic_ms=29674216.340683
+Q27_PHASE req=0 phase=decode edge=end pos=1267 monotonic_ms=29674231.263170
+Q27_PHASE req=0 phase=decode edge=begin pos=1268 monotonic_ms=29674231.274511
+Q27_PHASE req=0 phase=decode edge=end pos=1268 monotonic_ms=29674246.196637
+Q27_PHASE req=0 phase=decode edge=begin pos=1269 monotonic_ms=29674246.227924
+Q27_PHASE req=0 phase=decode edge=end pos=1269 monotonic_ms=29674261.124122
+Q27_PHASE req=0 phase=decode edge=begin pos=1270 monotonic_ms=29674261.135794
+Q27_PHASE req=0 phase=decode edge=end pos=1270 monotonic_ms=29674276.099998
+Q27_PHASE req=0 phase=decode edge=begin pos=1271 monotonic_ms=29674276.111329
+Q27_PHASE req=0 phase=decode edge=end pos=1271 monotonic_ms=29674290.965659
+Q27_MS T8_decode_248         26.92 s
+Q27_PHASE req=0 phase=decode edge=begin pos=1272 monotonic_ms=29674290.981448
+Q27_PHASE req=0 phase=decode edge=end pos=1272 monotonic_ms=29674306.739418
+Q27_PHASE req=0 phase=decode edge=begin pos=1273 monotonic_ms=29674306.753143
+Q27_PHASE req=0 phase=decode edge=end pos=1273 monotonic_ms=29674321.631368
+Q27_PHASE req=0 phase=decode edge=begin pos=1274 monotonic_ms=29674321.642920
+Q27_PHASE req=0 phase=decode edge=end pos=1274 monotonic_ms=29674336.564445
+Q27_PHASE req=0 phase=decode edge=begin pos=1275 monotonic_ms=29674336.579623
+Q27_PHASE req=0 phase=decode edge=end pos=1275 monotonic_ms=29674351.480089
+Q27_PHASE req=0 phase=decode edge=begin pos=1276 monotonic_ms=29674351.491660
+Q27_PHASE req=0 phase=decode edge=end pos=1276 monotonic_ms=29674366.406022
+Q27_PHASE req=0 phase=decode edge=begin pos=1277 monotonic_ms=29674366.417703
+Q27_PHASE req=0 phase=decode edge=end pos=1277 monotonic_ms=29674381.429785
+Q27_PHASE req=0 phase=decode edge=begin pos=1278 monotonic_ms=29674381.441447
+Q27_PHASE req=0 phase=decode edge=end pos=1278 monotonic_ms=29674396.456064
+Q27_HOST_STAGE_AB req=0 enabled=0 summed_host_wall_ms=0.000000
+Q27_XFER req=0 kind=peer bytes=4531138560 calls=196668 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=peer2d bytes=23758704 calls=256 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=same_device bytes=265641984 calls=771 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=h2d bytes=18319360 calls=766 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=d2h bytes=8 calls=2 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=h2h bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=unknown bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=host_staged bytes=0 calls=0 event_ms=0.000000 timing=0
+Q27_XFER req=0 kind=stream_wait bytes=0 calls=4079 event_ms=0.000000 timing=0
+Q27_MEMORY label=req0-pos1279 physical=0 allocator_live=14615575560 allocations=844 free=19087228928 total=34342961152 used=15255732224
+Q27_MEMORY label=req0-pos1279 physical=1 allocator_live=14859777032 allocations=842 free=18864930816 total=34342961152 used=15478030336
+Q27_MEMORY label=req0-pos1279 physical=2 allocator_live=17237693816 allocations=901 free=16467886080 total=34342961152 used=17875075072
+Q27_FINITE req=0 logical=1 pos=1279 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_FINITE req=0 logical=0 pos=1279 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_FINITE req=0 logical=2 pos=1279 state=0 conv=0 kvscale=0 logits_scratch=0 hidden=0
+Q27_MS T9_decode_end         27.04 s
+Q27_TOKENS 623 5129 60277 6326 11 279 2468 364 264 3134 393 80 516 3 369 23424 430 25 198 13682 1088 1272 90 1597 1463 24734 80 516 8 283 1088 35790 34521 1200 14717 72 28 16 92 46227 83 92 1088 4431 10269 516 24094 3369 580 5150 8 343 5150 14728 59 1200 14717 72 28 16 92 46227 83 92 1088 4431 10269 516 24094 3369 580 5150 8866 25273 198 1919 7225 26678 660 3555 6679 393 74 5150 3 321 2663 393 85 5150 3 303 279 81726 6297 13 198 9 256 2972 10327 10869 64700 393 46 7947 14646 11 1332 393 45 3 369 279 8240 2984 13 198 9 256 2972 44712 10869 64700 393 46 7947 61 17 14646 791 6000 13 271 794 27345 59930 198 30851 6326 9556 45888 279 6326 16456 539 24101 279 56768 9705 440 264 4416 2336 56014 16335 11189 49142 14646 1680 421 56014 4431 10269 24094 3369 580 8 1088 46451 1088 16335 10269 8 24094 3369 1088 16335 5781 8 12576 1061 5954 279 6326 2542 310 381 23424 4417 5979 44896 25 198 13682 1088 1272 90 1597 1463 24734 80 516 8 1088 46451 1088 35790 34521 16335 10269 516 8 24094 3369 1088 2282 7 1088 1200 14717 72 28 16 92 46227 83 92 1088 16335 5781 5150 8 343 5150 24094 3369 1088 1246 8866 34521 16335 10269 516 8 24094 3369 1088 2282 7 1088 1200 14717 72 28 16
+Q27_SPEC K=0 rounds=255 accepted_drafts=0 tokens_per_round=1.000 P(>=1)=0.000 P(>=2)=0.000 P(>=3)=0.000 committed_tokens=255  (committed tok/s = decode_tok_s)
+Q27_SPEC_T per round (ms, card 0): draft 0.000  draft-xchg 0.000  embed 0.016  layers 5.731  head-sync 9.360  head-xchg 0.000  tail 0.033  total 15.141
+Q27_TP_PERF cards=3 layers=64 prompt=1024 decode_tokens=255
+  per-card (ms/token):   wall   compute  collective  residual  collectives
+    card 0            15.144   15.083       0.003     0.057            1
+    card 1            15.146   15.079       0.009     0.058            1
+    card 2            15.142   15.082       0.004     0.056            1
+  Q27_COLLT_RUN card 0 ms/token: stage_wait 0.000 b1 0.000 reduce 0.000 b2 0.000 invN 0.000
+  Q27_COLLT_RUN card 1 ms/token: stage_wait 0.000 b1 0.000 reduce 0.000 b2 0.000 invN 0.000
+  Q27_COLLT_RUN card 2 ms/token: stage_wait 0.000 b1 0.000 reduce 0.000 b2 0.000 invN 0.000
+  CRITICAL PATH = card 1 (largest wall)
+    wall            15.146 ms/token
+    raw             66.024 tok/s
+    compute         15.079 ms/token
+    collective       0.009 ms/token
+    collectives          1 per token  (128 payload all-reduces + 1 head max)
+    residual         0.058 ms/token   (= wall - compute - collective, 0.4%)
+Q27_TP_TIMING prefill_ms=664.2 (1023 tokens)  decode_ms=3861.7 (255 tokens)  epi=0/0
+Q27_RNQ_FALLBACK total=0  (0 = the fused norm+quant ran everywhere)
+Q27_KV_FUSE mode=0 fused_calls=0  (expect 16/token when on)
+Q27_COLL_KCOPY on=1 kernel_copies=0  (expect ~127-129/token when on)
+Q27_COLL_DFLAG mode=1 flag_waits=765 skipped=0  (expect ~128/token/card waits when on)
+Q27_MS T10_run_done          27.04 s
+Q27_MS T11_exit              27.16 s
+Q27_SHARD_MAP peer_copies=196668 peer_copy_bytes=4531138560

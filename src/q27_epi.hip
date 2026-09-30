@@ -46,6 +46,22 @@ extern "C" int q27_i8g64_to_row_conv(q27_i8g_t* src, q27_i8r_t* dst, int gs, hip
     dst->w = src->w; dst->s = sgrp; dst->alpha = src->alpha; dst->rows = src->rows; dst->K = src->K; dst->ng = NG; dst->gs = GS;
     return 1;
 }
+// Same requantization, but into a CALLER-OWNED scale plane and always at full K (gs = K, ng = 1).
+// This is the layer-local counterpart of the persistent per-row MLP mirrors: the arena slot holds
+// the per-64 mirror, this turns it in place into the per-ROW form the rocBLAS int8 GEMMs consume
+// as ONE full-K GEMM per tensor. No allocation, so the arena is the only residency it needs.
+extern "C" int q27_i8g64_rowify(q27_i8g_t* src, q27_i8r_t* dst, float* sgrp, hipStream_t st)
+{
+    // GS=K below; the kernel walks 64-element source groups and masks the
+    // final thread iteration. It needs complete source groups, not K%1024.
+    if (!src || !src->w || !src->s || !dst || !sgrp || src->rows < 1 || src->K < 64 || (src->K % 64)) return 0;
+    const int GS = src->K;                       // per-ROW scales: one group per row
+    hipLaunchKernelGGL(q27_k_i8g64_to_grp, dim3((unsigned)src->rows), dim3(256), 0, st,
+                       (signed char*)src->w, src->s, GS, sgrp, src->K);
+    dst->w = src->w; dst->s = sgrp; dst->alpha = src->alpha; dst->rows = src->rows; dst->K = src->K;
+    dst->ng = 1; dst->gs = GS;
+    return 1;
+}
 
 // ---- helpers ------------------------------------------------------------------------------------------------
 __device__ __forceinline__ float q27_blockmax256(float v, float* red) {   // 256 threads; red[4]; two barriers
@@ -186,6 +202,32 @@ extern "C" int q27_requant_g64_tok(const signed char* xq, const float* xs, signe
     else return 0;
     return 1;
 }
+// ---- per-16 int8 -> per-token int8 (arbitrary K multiple of 16). The TP attention combine and the TP GDN
+// scan emit their mixer as PER-16 natural int8 (no g64 path), and q27_requant_g64_tok both reads per-64
+// scales and rejects K % 1024 != 0 -- so the 1536-wide TP o_proj/out_proj input needs this one new kernel.
+// One block per token; block max over K columns -> one per-token scale, matching q27_quant_group's rounding.
+__global__ __launch_bounds__(256) void q27_k_requant_g16_tok(const signed char* __restrict__ xq, const float* __restrict__ xs,
+                                                             signed char* __restrict__ yq, float* __restrict__ ys, int K, int xstride, int sstride)
+{
+    const int t = blockIdx.x;
+    xq += (size_t)t * xstride; xs += (size_t)t * sstride; yq += (size_t)t * K;
+    __shared__ float red[4];
+    float mx = 0.f;
+    for (int k = threadIdx.x; k < K; k += 256) mx = fmaxf(mx, fabsf((float)xq[k] * xs[k >> 4]));
+    mx = q27_blockmax256(mx, red);
+    const float sc = mx * (1.f / 127.f), qi = (sc > 0.f) ? 1.f / sc : 0.f;
+    if (threadIdx.x == 0) ys[t] = sc;
+    for (int k = threadIdx.x; k < K; k += 256) {
+        const int c = (int)rintf((float)xq[k] * xs[k >> 4] * qi);
+        yq[k] = (signed char)(c < -127 ? -127 : (c > 127 ? 127 : c));
+    }
+}
+extern "C" int q27_requant_g16_tok(const signed char* xq, const float* xs, signed char* yq, float* ys, int K, int xstride, int M, hipStream_t s)
+{
+    if (!xq || !xs || !yq || !ys || (K & 15) || K < 16 || M < 1 || (xstride & 15)) return 0;
+    hipLaunchKernelGGL(q27_k_requant_g16_tok, dim3((unsigned)M), dim3(256), 0, s, xq, xs, yq, ys, K, xstride, xstride >> 4);
+    return 1;
+}
 // ---- slab sum: y[t][n] = alpha * sum_g acc[g][t][n] * sw[n][g] * sx[t][g] ---------------------------------
 __device__ __forceinline__ float4 q27_slab4(const int* __restrict__ acc, size_t MN, int ldc, int t, int n0,
                                             const float* __restrict__ sw, int ng, const float* __restrict__ sx, float alpha)
@@ -265,6 +307,28 @@ extern "C" int q27_epi_f32r(const int* acc, int N, const float* srow, int ng, co
     hipLaunchKernelGGL(q27_k_epi_f32r, dim3((unsigned)((N / 4 + 255) / 256), (unsigned)M), dim3(256), 0, s, acc, N, M, srow, ng, stok, alpha, y, radd, rs);
     return 1;
 }
+// Same epilogue with a BF16 residual: the TP decode's residual stream is bf16 (the prefill's is
+// fp32), so the decode's int8 MLP needs this twin rather than an fp32 radd. rs carries the
+// partial-sum share (0.25 at ndev=4), so it must scale the residual exactly like the NVFP4 kernels do.
+__global__ __launch_bounds__(256) void q27_k_epi_f32r_bf(const int* __restrict__ acc, int N, int M, const float* __restrict__ srow, int ng,
+        const float* __restrict__ stok, float alpha, float* __restrict__ y, const unsigned short* __restrict__ radd, float rs)
+{
+    const int t = blockIdx.y, i = (blockIdx.x * 256 + threadIdx.x) << 2;
+    if (i >= N) return;
+    float4 o = q27_slab4(acc, (size_t)M * N, N, t, i, srow, ng, stok, alpha);
+    if (radd) { const unsigned short* r = radd + (size_t)t * N + i;
+        o.x += rs * q27_bf2f(r[0]); o.y += rs * q27_bf2f(r[1]);
+        o.z += rs * q27_bf2f(r[2]); o.w += rs * q27_bf2f(r[3]); }
+    *(float4*)(y + (size_t)t * N + i) = o;
+}
+extern "C" int q27_epi_f32r_bf(const int* acc, int N, const float* srow, int ng, const float* stok, float alpha,
+                               float* y, const unsigned short* radd, float rs, int M, hipStream_t s)
+{
+    if (!acc || !srow || !stok || !y || (N & 3) || M < 1 || ng < 1) return 0;
+    hipLaunchKernelGGL(q27_k_epi_f32r_bf, dim3((unsigned)((N / 4 + 255) / 256), (unsigned)M), dim3(256), 0, s,
+                       acc, N, M, srow, ng, stok, alpha, y, radd, rs);
+    return 1;
+}
 
 // ---- swiglu from two int32 slab sets -> per-(token,group) int8 (the down GEMM's input; N = 17 groups) ----------
 template <int NU, int IPG>   // NU output units of 1024 (N = NU * 1024); a group = IPG units
@@ -339,6 +403,28 @@ extern "C" int q27_epi_swiglu_tok(const int* ag, const int* au, int N, const flo
     else if (NU == 17 && (gs == 0 || gs == N) && ng == 1) hipLaunchKernelGGL((q27_k_epi_swiglu_tok1k<5>), dim3((unsigned)M), dim3(1024), 0, s, ag, au, N, M, sg, su, stok, alpha_g, alpha_u, gscale, xq, xs);   // 17408/4 = 4352 float4 = 4.25 per thread
     else if (NU == 17 && (gs == 0 || gs == N)) hipLaunchKernelGGL((q27_k_epi_swiglu_tok<17, 17>), dim3((unsigned)M), dim3(256), 0, s, ag, au, N, M, sg, su, ng, stok, alpha_g, alpha_u, gscale, xq, xs);
     else { std::fprintf(stderr, "q27_epi_swiglu_tok: unsupported N=%d gs=%d\n", N, gs); return 0; }
+    return 1;
+}
+// Per-TOKEN swiglu for a width that is not a multiple of 1024: the TP decode's intermediate is
+// INTER/ndev = 4352 per card, and the inner norm is per ROW (one fp32 scale per row, written to xs),
+// which is exactly what the rocBLAS down GEMM's epilogue wants. Same kernel as the 1K form -- PER=5
+// of 1024 threads covers any N <= 5120, and the kernel already guards idx < N/4 -- so this is an
+// entry point, not a second implementation.
+extern "C" int q27_epi_swiglu_tok_small(const int* ag, const int* au, int N, const float* sg, const float* su, int ng,
+                                        const float* stok, float alpha_g, float alpha_u, float gscale,
+                                        signed char* xq, float* xs, int M, hipStream_t s)
+{
+    // Q27_MLP_WSHARE (2026-09-18): N is the card's own MLP slice, which is no longer capped at
+    // INTER/ndev. The cap was 5120 while every caller's N was 4352 or 5120; the kernel is
+    // q27_k_epi_swiglu_tok1k<5>, whose PER=5 float4-per-thread loop covers idx < NU4 = N/4 for any
+    // N <= 5*1024*4 = 20480, with the tail masked by `if (idx < NU4)`. So the guard, not the
+    // kernel, was the limit. Measured 19:25:52: an 8192-row slice declined here and killed the boot.
+    if (!ag || !au || !sg || !su || !stok || !xq || !xs || N < 1 || M < 1 || ng != 1 || !(gscale > 0.f) || N > 20480) {
+        std::fprintf(stderr, "q27_epi_swiglu_tok_small: N=%d M=%d ng=%d gscale=%g\n", N, M, ng, (double)gscale);
+        return 0;
+    }
+    hipLaunchKernelGGL((q27_k_epi_swiglu_tok1k<5>), dim3((unsigned)M), dim3(1024), 0, s,
+                       ag, au, N, M, sg, su, stok, alpha_g, alpha_u, gscale, xq, xs);
     return 1;
 }
 

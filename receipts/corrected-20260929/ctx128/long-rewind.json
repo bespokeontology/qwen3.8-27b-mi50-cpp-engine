@@ -1,0 +1,94 @@
+{
+  "name": "long-rewind",
+  "expected": "violet953",
+  "answer": "violet953",
+  "passed": true,
+  "wall_seconds": 1.3954753220006824,
+  "ttft_seconds": 1.1944336929991841,
+  "usage": {
+    "prompt_tokens": 130873,
+    "completion_tokens": 5,
+    "total_tokens": 130878
+  },
+  "finish": "stop",
+  "metrics": [
+    {
+      "request": 31,
+      "prompt_tokens": 30,
+      "prefill_ms": 886.1,
+      "ttft_ms": 886.1,
+      "gen_tokens": 6,
+      "decode_ms_per_tok": 14.682,
+      "decode_tok_s": 68.11,
+      "rounds": 2,
+      "ms_per_round": 44.0461,
+      "tok_per_round": 3,
+      "acc_p1": 1,
+      "acc_p2": 1,
+      "dup": 0,
+      "arm": 0,
+      "coll_host": 0,
+      "coll_p2p": 264,
+      "coll_push": 0,
+      "coll_pull": 0,
+      "coll_sdma": 0,
+      "coll_ll": 264,
+      "epi": "16128/16128",
+      "nr_eff": 3,
+      "p2p_min": 1,
+      "pos_end": 130879,
+      "spec": 1,
+      "spec_k": 2,
+      "finish": "stop",
+      "tokhash": "8a45bd899a925913",
+      "bin": "e2e2a0b1",
+      "exl3_calls": 0,
+      "exl3_rows": 0,
+      "exl3_m1": 0,
+      "ex_o": 0,
+      "ex_op": 0,
+      "ex_qkv": 0,
+      "ex_z": 0
+    }
+  ],
+  "aggregate_native_prefill_ms": 886.1,
+  "fresh_prompt_tokens": 30,
+  "prefill_tok_s": 33.85622390249407,
+  "native_decode_tok_s": 68.11,
+  "finite_checks": [
+    [
+      31,
+      1,
+      130879,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      31,
+      0,
+      130879,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      31,
+      2,
+      130879,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "finite_passed": true,
+  "nonzero_rewinds": [
+    130843
+  ]
+}

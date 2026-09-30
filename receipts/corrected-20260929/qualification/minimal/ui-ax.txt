@@ -1,0 +1,22 @@
+Browser tab: 1, Title: "Qwen corrected K16 Harness Minimal — DeepSeek Harness", URL: "http://127.0.0.1:3081/".
+The following is a diff from the previous accessibility tree with ~ and + representing changed and added elements, respectively. Removed elements are summarized by ID range.
+Removed element IDs: 48
++		58 button (collapsed) Secondary Actions: Expand, Think The user is asking me to reply with exactly "2 + 2 = 4". This is a simple request. I should just output that string exactly.
++			59 image
++			60 image
++			61 text Think
++			62 text The user is asking me to reply with exactly "2 + 2 = 4". This is a simple request. I should just output that string exactly.
++		63 text 2 + 2 = 4
++		64 button Copy
++			65 image
++		66 checkbox Description: Good response, Value: 0
++			67 image
++		68 checkbox Description: Bad response, Value: 0
++			69 image
++		70 button Branch into a new conversation
++			71 image
++		72 text 18:00 Ran for 2s TTFT 2s 251 tok/s
++		73 pop up button (collapsed) Description: 0% of context used, Secondary Actions: Expand
+~		57 button (disabled) Send message
++		74 text 1 turns · 1 steps LLM 2.2s TTFT avg 2s · 251 tok/s Cache hit 0% Input 1.1K tok · Output 42 tok
+The focused UI element is 49 text entry area (settable)

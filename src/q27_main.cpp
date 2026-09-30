@@ -9,11 +9,32 @@
 // TP is the better single-stream LATENCY design (22.5 vs 52.6 ms projected) and is worth building
 // second; the pipeline plus token pipelining is the better THROUGHPUT design, which is the standing
 // objective. See the roofline discussion in README.md.
+#include <execinfo.h>
+#include <dlfcn.h>
+static void q27_memory_receipt(const char* label) {
+    static auto fn = (void(*)(const char*))dlsym(RTLD_DEFAULT,"q27_memory_report");
+    if(fn)fn(label);
+}
+static void q27_transfer_receipt(int req,bool begin) {
+    static auto first = (void(*)(int))dlsym(RTLD_DEFAULT,"q27_xfer_begin");
+    static auto last = (void(*)(int))dlsym(RTLD_DEFAULT,"q27_xfer_report");
+    if(begin){if(first)first(req);}else{if(last)last(req);}
+}
+
+#include <signal.h>
+#include <unistd.h>
 #include "q27.h"
+#include "q27_candidate_flags.h"
+#include "q27_pfblas.h"
 #include "q27_load.h"
+extern "C" void q27_finite_check(const void*,size_t,int,unsigned*,int,hipStream_t);
 #include "q27_dflash2.h"
 #include "q27_df2_run.h"
 #include "q27_nr.h"
+#include "q27_sr.h"   // Q27_TPSR: natural-order swiglu quantiser + block-scaled FP8 -> per-row int8 converters (src/q27_sr.hip)
+extern "C" int q27_proj_fp8b_nrs(const q27_fp8_t* w, const signed char* xq, int xst, const float* xs,
+                                 float* y, int ystride, const unsigned short* radd, int rstride,
+                                 float rs, int NR, hipStream_t s);   // q27_fp8.hip: block-scaled consumer with an explicit activation row stride
 #include "../include/q27_mtp_quant.h"
 #include "../tests/q27_gate.h"
 #include <cstdint>
@@ -47,16 +68,17 @@
     std::exit(1);} }while(0)
 
 // kernels supplied by the other translation units
+extern "C" void q27_vgate_read(float* mx, float* ref, int reset);   // attention-combine numerics gate (Q27_VGATE=1)
 extern "C" {
 void q27_gdn_conv(unsigned short* qkv, unsigned short* conv_state, const unsigned short* cw, hipStream_t s);
 void q27_gdn_step(const unsigned short* qkv_c, const unsigned short* z, const unsigned short* a,
                   const unsigned short* b, const unsigned short* A_log, const unsigned short* dt_bias,
                   const unsigned short* norm_w, float* S, unsigned short* out, hipStream_t s);
 void q27_attn_prep(const unsigned short* qkv_out, const unsigned short* q_norm_w,
-                   const unsigned short* k_norm_w, signed char* kcache, float* kscale, signed char* vcache, float* vscale,
+                   const unsigned short* k_norm_w, signed char* kcache, q27_kvs_t* kscale, signed char* vcache, q27_kvs_t* vscale,
                    unsigned short* q_out, int pos, int kvstride, int hoff0, hipStream_t s);
-void q27_attn_decode(const unsigned short* q, const signed char* kcache, const float* kscale,
-                     const signed char* vcache, const float* vscale, const unsigned short* q_proj_raw,
+void q27_attn_decode(const unsigned short* q, const signed char* kcache, const q27_kvs_t* kscale,
+                     const signed char* vcache, const q27_kvs_t* vscale, const unsigned short* q_proj_raw,
                      unsigned short* out, int pos, int kvstride, int hoff0, hipStream_t s);
 // Fused in_proj_a/in_proj_b GEMV: one launch for both, uint2 loads, every load issued before any
 // wait. Returns 1 if it ran, 0 if the shape is uncovered so the caller falls back to two scalar
@@ -206,9 +228,9 @@ int  q27_proj_fp8_bf16_2(const q27_fp8_t* wa, const q27_fp8_t* wb, const signed 
                          const float* xs, unsigned short* ya, unsigned short* yb, int neg,
                          hipStream_t s);
 int  q27_attn_chunk_tp(const unsigned short* qkv_t, int qstride, const unsigned short* q_norm_w, const unsigned short* k_norm_w,
-        signed char* kcache, float* kscale, signed char* vcache, float* vscale, float* qout_t, unsigned short* out_t, int ostride,
+        signed char* kcache, q27_kvs_t* kscale, signed char* vcache, q27_kvs_t* vscale, float* qout_t, unsigned short* out_t, int ostride,
         int pos0, int M, int ndev, signed char* Q_t, float* QS_t, float in_scale, int hpw, int attpf,
-        float* pob, float* pml, hipStream_t s);   // chunk attention
+        float* pob, float* pml, hipStream_t s, const q27_kvquad_t* quad = nullptr);   // chunk attention
 size_t q27_attn_chunk_scratch_bytes(int ndev, int chunk_max, size_t* ml_bytes);
 int q27_wide_down_b(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                     unsigned short* y, int ystride, int M, int ki, hipStream_t s);
@@ -233,6 +255,7 @@ struct Q8Scr {
     signed char* xqin = nullptr; float* xsin = nullptr;
     signed char* qkva8 = nullptr; float* qkvas = nullptr;
     float* qh = nullptr; float* pob = nullptr; float* pml = nullptr;
+    size_t pob_bytes = 0;              // Actual allocation capacity for bounded alternate attention.
     signed char* mixq_slots = nullptr; float* mixs_slots = nullptr;
     signed char* qkv8 = nullptr; float* qkvs = nullptr; signed char* z8 = nullptr; float* zs = nullptr;
     float* a32 = nullptr; float* b32 = nullptr;
@@ -246,6 +269,19 @@ struct Q8Scr {
     signed char* qkvc8 = nullptr; float* qkvcs = nullptr;   // conv output (position-parallel conv is out of place)
 };
 static std::vector<hipEvent_t> g_ls_evdone[Q27_MAX_DEVICES];   // per card: chunk-k done events (Q27_LS_Q8 schedule)
+// 2026-09-18 DIAGNOSTIC: the layer-split sweep dies here with a NULL/garbage hipEvent_t
+// (dmesg: "segfault at 10/18 ... in libamdhip64", i.e. a bad handle dereferenced INSIDE HIP,
+// not a bad return address). g_ls_evdone[src] is populated by card `src`'s OWN thread; this
+// read is from card g. Name the offender instead of faulting: an empty peer vector is a
+// missing barrier, an out-of-range pos is a jobpos/njobs disagreement, and a null entry is a
+// failed hipEventCreate. All three are silent today.
+#define Q27_LS_EVCHK(tag, card, idx) \
+    do { const size_t _n = g_ls_evdone[(card)].size(); \
+         if ((size_t)(idx) >= _n || g_ls_evdone[(card)][(size_t)(idx)] == nullptr) { \
+             std::fprintf(stderr, "Q27_LS_EVBAD %s: card %d reading peer %d event %d of %zu%s\n", \
+                          tag, g, (card), (int)(idx), _n, \
+                          ((size_t)(idx) < _n) ? " -- entry is NULL" : " -- INDEX OUT OF RANGE"); \
+             std::fflush(stderr); std::exit(1); } } while (0)
 // rows of a group of int8 mirrors when they are ONE contiguous buffer (stacked at load), else 0
 static int q27_cat_rows(const q27_i8r_t* const* w, int n) {
     if (!w || n < 1 || !w[0] || !w[0]->w) return 0;
@@ -258,6 +294,7 @@ struct Dev {
     hipStream_t stream = nullptr;
     hipStream_t hs[4] = {nullptr, nullptr, nullptr, nullptr};   // Q27_PF_HSTREAMS: the 8-position halves of a chunk on concurrent streams
     hipStream_t q8hi = nullptr, q8lo = nullptr;   // Q27_LS_Q8 schedule: stage A (latency-critical chain) high priority, MLP low priority
+    hipEvent_t ev_state_ready = nullptr;
     hipEvent_t  ev_fork = nullptr, ev_join[4] = {nullptr, nullptr, nullptr, nullptr};
     unsigned short* hidden = nullptr;      // [5120] BF16, the residual stream
     unsigned short* norm   = nullptr;      // [5120] BF16
@@ -273,6 +310,17 @@ struct Dev {
     unsigned short* ab  = nullptr;         // [48]    BF16
     unsigned short* bb  = nullptr;         // [48]    BF16
     unsigned short* mix6= nullptr;         // [6144]  BF16, mixer output before out_proj
+    // Q27_EXL3 scratch: [ x' fp16 M*in ][ fp32 accumulator M*out ]. Grown on
+    // demand rather than sized in dev_alloc_tp, because the EXL3 residency is
+    // attached AFTER dev_alloc runs -- a value latched at alloc time would be
+    // read before it was written (the failure mode that made the first rewind
+    // arm inert on 2026-09-19).
+    void*  exws = nullptr;
+    size_t exws_bytes = 0;
+    // The head is 248320 wide -- 14x the MLP intermediate -- so it gets its own
+    // buffer rather than inflating the per-projection one.
+    void*  exws_head = nullptr;
+    size_t exws_head_bytes = 0;
     // PER-SLOT state. A serial layer pipeline leaves 3 of 4 cards idle at every instant; the only
     // way to use the machine is to keep several sequences in flight, which makes the recurrent
     // state, the conv shift register, the KV cache and the residual all per-slot.
@@ -283,8 +331,8 @@ struct Dev {
     unsigned short* qh   = nullptr;        // [6144]  BF16 normed+roped query
     signed char* kc = nullptr;             // [slots][nlayer_full][ctx][1024] int8 (Q27_LS_Q8 KV ABI)
     signed char* vc = nullptr;
-    float* ks = nullptr;                   // [slots][nlayer_full][ctx][1024/16] fp32 per-16 scales
-    float* vs = nullptr;
+    q27_kvs_t* ks = nullptr;               // [slots][nlayer_full][ctx][1024/16] FP16 group maxima
+    q27_kvs_t* vs = nullptr;               // (KV scale ABI: mx/127 is reconstructed on read)
     void* pinned = nullptr;                // crossing staging
     unsigned short* hidden_slots = nullptr;// [slots][5120] BF16 residual, one per sequence
     unsigned short* emb_pin = nullptr; size_t emb_pin_cap = 0;   // pinned host staging for the sweep embedding (allocated at init: lazy pinning inside the sweep cost ~30 ms of barrier skew)
@@ -334,6 +382,7 @@ float*       mix_t = nullptr;          // [TSLOT][Q27_HID]            down outpu
     float* part_slots = nullptr;           // [8][Q27_HID] per-position partials (batched coll#1)
     float* qh_slots = nullptr;             // [chw][NQ*HDIM] chunk attention queries, fp32 (Q27_PF_ATT_CHUNK)
     float* attn_pob = nullptr;             // chunk attention split partials [CH][splits][NQ][HDIM] (per card, hipMalloc)
+    size_t attn_pob_bytes = 0;
     float* attn_pml = nullptr;             // [CH][splits][NQ][2]
     void* w16_scratch = nullptr;           // [2560][5120] fp16 pairs: one projection's weights, pre-converted per tile (Q27_PF_MK16)
     unsigned short* ab_tile = nullptr;     // [TSLOT][VH/ndev] GDN a, tile scan (Q27_PF_GDN_SCAN)
@@ -343,8 +392,58 @@ float*       mix_t = nullptr;          // [TSLOT][Q27_HID]            down outpu
     float* mixs_tile = nullptr;            // [TSLOT][(Z/ndev)/16]
     float* rnpart = nullptr;      // 5-float partial sums for the split rmsnorm
     size_t tp_s = 0, tp_conv = 0, tp_kv = 0;               // PER-LAYER strides of the shard state
+    // ---- PER-LAYER STATE PLACEMENT (what lets layer-split reach ctx=262144) ------------------
+    // Layer-split allocated EVERY layer full width on EVERY card (dev_alloc_tp is called with
+    // ndev=1) and then broadcast each owner's whole row to all four. That is 4x redundant by
+    // construction: a card computes full-width state only for the layers it OWNS -- its prefill
+    // attention reads every head of those -- and for every other layer the ONLY reader is TP
+    // decode, which addresses exactly one head-quarter (kvstride/hoff0). So non-owned layers are
+    // stored quarter-width and the export copies just that quarter. At ctx=262144 that is 4.70 GB
+    // of KV per card instead of 10.74 GB, which is the difference between fitting and not.
+    // In TP mode these are filled with the flat shard layout (off = fs*tp_kv, stride = KVROWS/ndev,
+    // hoff = 0), i.e. addressing identical to before this existed.
+    size_t kv_off[Q27_LAYERS] = {0};       // element offset of full-attn layer fs within kc / vc
+    size_t kvs_off[Q27_LAYERS] = {0};      // float offset of that layer within ks / vs
+    int    kv_rowstride[Q27_LAYERS] = {0}; // KV row stride in elements for that layer
+    int    kv_hoff[Q27_LAYERS] = {0};      // this card's head offset inside its OWN stored row
+    int    kv_hoff_peer[Q27_LAYERS] = {0};// and inside the OWNER's full-width row (export source)
+    size_t kv_bytes[Q27_LAYERS] = {0};     // bytes actually stored (export size)
+    size_t kvs_bytes[Q27_LAYERS] = {0};
+    size_t s_off[Q27_LAYERS] = {0};        // float offset of GDN layer gs within S
+    size_t s_qoff[Q27_LAYERS] = {0};       // this card's quarter offset inside that layer's S
+    size_t s_bytes[Q27_LAYERS] = {0};
+    size_t conv_off[Q27_LAYERS] = {0};     // element offset of GDN layer gs within conv
+    size_t s_bytes_total = 0, conv_bytes_total = 0;   // whole-allocation sizes, for the serve reset
+    // ---- Q27_LS_MLP_STAGE: layer-local int8 MLP arena --------------------------------------
+    // The fast MLP consumers (q27_wide_gu_i8g64 / the Tensile int8 GEMMs) need int8 per-64
+    // weights. Materialising those for all 16 owned layers is 271 MiB x 16 = 4.23 GiB and does
+    // not fit at ctx=262144, which is why Q27_LS_MLP_NV falls back to decoding NVFP4 inside every
+    // compute tile. But layer-split prefill walks its layers SEQUENTIALLY: only the CURRENT
+    // layer's gate/up/down have to exist in int8 at any instant. One reusable 271 MiB arena buys
+    // the fast consumer without the residency.
+    signed char* mlp8_w = nullptr;      // gate | up | down, int8 [rows][K]
+    float*       mlp8_s = nullptr;      // their per-64 fp32 group scales
+    // Q27_LS_MLP_RB: the same arena, requantized IN PLACE to the per-ROW form the rocBLAS/Tensile
+    // int8 GEMMs want (w [rows][K] unchanged, s replaced by one fp32 scale per row). The banked
+    // evidence for this row: the 1263-class engine ran the MLP through int8 mirrors + Tensile; the
+    // per-64 arena lost only because its consumer was the bespoke wide i8g64 kernel (2.3x slower),
+    // and the per-1024 arena lost because GS=1024 sliced down into 17 K=1024 GEMMs. Per-ROW weights
+    // keep K whole: gate/up/down each become ONE int8 GEMM per chunk, which is the fast shape.
+    float*       mlp8_rs = nullptr;     // one per-row fp32 scale per row per tensor (tiny)
+    q27_i8r_t    mlp8_gate_r{}, mlp8_up_r{}, mlp8_down_r{};
+    // FOUR SLOTS, NOT ONE. The Q8 ring walks its layers in blocks of Q27_LS_BLK=4, so a 1-layer
+    // arena misses on every revisit: 16 re-expansions per chunk, which is what made the first
+    // staging attempt a loss. Keying the arena by (L & 3) converts each layer once per block per
+    // chunk instead -- 4 expansions per chunk, ~40 GiB of extra traffic over a whole prefill.
+    static constexpr int MLP8_SLOTS = 4;
+    int          mlp8_layer[MLP8_SLOTS] = {-1, -1, -1, -1};   // layer held in each slot
+    q27_i8g_t    mlp8_gate{}, mlp8_up{}, mlp8_down{};
+    size_t conv_qoff[Q27_LAYERS] = {0};
+    size_t conv_bytes[Q27_LAYERS] = {0};
+    int    conv_wide[Q27_LAYERS] = {0};    // 1 = the stored conv block is full width (this card owns it)
+    int mtp_cap = 0;                       // positions the draft KV is currently sized for (Q27_MTP_PAGED)
     signed char* mtp_kc = nullptr;         // MTP draft layer's own KV slice (one tp_kv each)
-    float* mtp_ks = nullptr; float* mtp_vs = nullptr;
+    q27_kvs_t* mtp_ks = nullptr; q27_kvs_t* mtp_vs = nullptr;
     size_t tp_kvs = 0;                     // per-layer stride of the KV scale planes (= tp_kv/16)
     // ---- Q27_LS_Q8: quantized producer/consumer buffers (full width: the layer-split rank) ----
     signed char* qkva8 = nullptr;          // [chw][QROWS+2*KVROWS] int8 q/k/v producer output
@@ -363,9 +462,15 @@ float*       mix_t = nullptr;          // [TSLOT][Q27_HID]            down outpu
     unsigned short* nr_qkv = nullptr;   unsigned short* nr_zbuf = nullptr;
     unsigned short* nr_ab = nullptr;    unsigned short* nr_bb = nullptr;  unsigned short* nr_mix6 = nullptr;
     float* nr_pa = nullptr;  float* nr_pb = nullptr;  float* nr_mixer = nullptr;
+    int*   nr_acc = nullptr;   // Q27_DEC_MLP_I8: int32 accumulator for the decode's rocBLAS MLP GEMMs
     unsigned* nr_tok = nullptr;  float* nr_val = nullptr;   // one 64-B device buffer: tok[8] then val[8]
     float* nr_mail_h = nullptr; float* nr_mail_d = nullptr;   // pinned mailbox (2*NR <= 16 floats) the flag copy lands in
     float* nr_Ssnap = nullptr;  unsigned short* nr_csnap = nullptr;   // [3][n_gdn] state-shard / conv banks (lazy)
+    // Q27_REWIND_CK: request-boundary checkpoints of the WHOLE recurrent state, so a divergent
+    // window can rewind to a position instead of resetting to 0. Same two regions the reset
+    // memsets (d.S, d.conv) and the same D2D copy the speculation banks already use -- the KV
+    // cache needs nothing, it is position-indexed and is overwritten by the next prefill.
+    float* ck_S = nullptr;  unsigned short* ck_conv = nullptr;   // [q27_rewind_ck()] full (S, conv) banks
     hipStream_t s_cap = nullptr; hipEvent_t ev_cap = nullptr;   // DFlash2 tap capture: side stream, so the capture never stalls the next layer
     unsigned short* nr_taps = nullptr;    // [5][NRM][HID] bf16 residual taps after target layers 5/19/33/47/61 (DFlash2 conditioning)
     unsigned short* df2_pf_taps = nullptr; // [5][cap][HID] bf16 prompt-position taps (prefill capture -> prompt conditioning)
@@ -377,6 +482,32 @@ float*       mix_t = nullptr;          // [TSLOT][Q27_HID]            down outpu
     int pf_released = 0;   // prefill-sweep scratch (hidden_slots/pend_slots/emb_pin/inv_slots) freed at the first decode step; hidden_slots shrinks to the NR row buffer
     int nr_have_h = 0; int nr_mtp_base = 0;  long nr_drafts = 0, nr_hits = 0;  long nr_acc_hist[8] = {0,0,0,0,0,0,0,0};   // rounds with >= j accepted drafts
     double sp_t[8] = {0,0,0,0,0,0,0,0};   // per-phase wall (ms): draft, draft-xchg, embed, layers, head-sync, head-xchg, tail, total
+    // ---- Q27_LS_SR: single residency (src/q27_sr_main.inc) ----
+    hipEvent_t sr_ev[4] = {nullptr, nullptr, nullptr, nullptr};   // decode hop events: one per block visit per round
+    long sr_round = 0;                                            // rounds this card has run (hop-counter base)
+    int  sr_gdn_gs[Q27_LAYERS] = {0};  int sr_ngdn = 0;           // global gdn slot of each OWNED gdn layer, in layer order
+    int  sr_gdn_local[Q27_LAYERS] = {0};                          // global gdn slot -> local index (-1 if not owned)
+    signed char* sr_xqw = nullptr; float* sr_xsw = nullptr;       // [NRM][INTER] int8 + per-16 scales: o/out_proj input, swiglu output
+    float* sr_pd[4] = {nullptr, nullptr, nullptr, nullptr};       // [NRM][HID] fp32 down partials, one per K-slice
+    float* sr_part = nullptr;  float* sr_part2 = nullptr;         // [NRM][HID] fp32 mixer / MLP outputs (pending residual)
+    signed char* sr_pw[2] = {nullptr, nullptr}; float* sr_prs[2] = {nullptr, nullptr}; int sr_player[2] = {-1, -1};   // prefill ring: per-row projection mirrors
+    signed char* sr_mw[2] = {nullptr, nullptr}; float* sr_ms[2] = {nullptr, nullptr}; float* sr_mrs[2] = {nullptr, nullptr}; int sr_mlayer[2] = {-1, -1};   // prefill ring: MLP per-64 (+ per-row scales)
+    q27_layer_t sr_view[2];                                       // the layer handle the sweep reads: resident fields + this slot's mirrors
+    hipEvent_t sr_te[12] = {nullptr};                             // Q27_SR_TIME: timing events -- [v] block start, [8+v] block end, [4]/[5] draft, [6]/[7] head
+    double sr_ms_blk[4] = {0, 0, 0, 0}; double sr_ms_draft = 0, sr_ms_head = 0, sr_ms_wall = 0; long sr_rounds_t = 0;
+    hipEvent_t sr_ste[16 * 7] = {nullptr};                        // Q27_SR_TIME=2: per owned layer (local index 0..15), 7 stage boundaries
+    double sr_ms_st[6] = {0, 0, 0, 0, 0, 0};                      // norm+in-proj, attention/GDN, out-proj, post-norm+gate/up, swiglu+down, sum/add
+    int  sr_lidx = 0;                                             // local layer counter inside a round (0..15)
+    // ---- Q27_TPSR: transient per-ROW int8 MLP shard (gate|up rows, down K-slice) for the batched TP prefill's rocBLAS GEMMs ----
+    signed char* tpsr_mw = nullptr; float* tpsr_ms = nullptr;     // one layer: [2*INTER/ndev][HID] + [HID][INTER/ndev] int8, per-row fp32 scales
+    float* tpsr_nv_s64 = nullptr; // reusable donor NVFP4 -> int8/64 -> row conversion scales
+    int tpsr_mlayer = -1; int tpsr_primed = 0;                    // layer currently expanded; rocBLAS shapes tuned once
+    q27_i8r_t tpsr_g8r{}, tpsr_u8r{}, tpsr_d8r{};                 // the per-row views the GEMMs read
+    // ---- Q27_TPSR_PROJ_RB (prefill v2): transient per-ROW int8 projection shards for the rocBLAS GEMMs.
+    // Attention: q|k|v stacked [3584][HID] + o [HID][1536]. GDN: in_qkv|in_z stacked [4096][HID] + out [HID][1536].
+    signed char* tpsr_pw = nullptr; float* tpsr_ps = nullptr;
+    int tpsr_pmlayer = -1;
+    q27_i8r_t tpsr_q8r{}, tpsr_k8r{}, tpsr_v8r{}, tpsr_o8r{}, tpsr_iqkv8r{}, tpsr_iz8r{}, tpsr_op8r{};
 };
 
 static void dev_alloc(Dev& d, int id, int n_gdn, int n_full, int ctx, int slots) {
@@ -385,6 +516,7 @@ static void dev_alloc(Dev& d, int id, int n_gdn, int n_full, int ctx, int slots)
     CK(hipStreamCreate(&d.stream));
     for (int k = 0; k < 4; ++k) { CK(hipStreamCreateWithFlags(&d.hs[k], hipStreamNonBlocking)); CK(hipEventCreateWithFlags(&d.ev_join[k], hipEventDisableTiming)); }
     CK(hipEventCreateWithFlags(&d.ev_fork, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&d.ev_state_ready, hipEventDisableTiming));
     CK(hipStreamCreateWithFlags(&d.s_cap, hipStreamNonBlocking)); CK(hipEventCreateWithFlags(&d.ev_cap, hipEventDisableTiming));
     { int lo = 0, hi = 0; CK(hipDeviceGetStreamPriorityRange(&lo, &hi));
       CK(hipStreamCreateWithPriority(&d.q8hi, hipStreamNonBlocking, hi));
@@ -415,8 +547,12 @@ static void dev_alloc(Dev& d, int id, int n_gdn, int n_full, int ctx, int slots)
         A((void**)&d.conv, d.conv_stride*(size_t)slots*2);
     }
     if (n_full > 0) {
-        A((void**)&d.kc, d.kv_stride*(size_t)slots); A((void**)&d.ks, d.kv_stride/16*(size_t)slots*4);
-        A((void**)&d.vc, d.kv_stride*(size_t)slots); A((void**)&d.vs, d.kv_stride/16*(size_t)slots*4);
+        A((void**)&d.kc, d.kv_stride*(size_t)slots); A((void**)&d.ks, d.kv_stride/16*(size_t)slots*2);
+#if Q27_V4
+        A((void**)&d.vc, d.kv_stride/2*(size_t)slots); A((void**)&d.vs, d.kv_stride/32*(size_t)slots*2);
+#else
+        A((void**)&d.vc, d.kv_stride*(size_t)slots); A((void**)&d.vs, d.kv_stride/16*(size_t)slots*2);
+#endif
     }
     A((void**)&d.hidden_slots, (size_t)slots*Q27_HID*2);
     CK(hipHostMalloc(&d.pin_out, (size_t)slots*Q27_HID*2, hipHostMallocDefault));
@@ -475,9 +611,15 @@ static void run_layer(Dev& d, const q27_layer_t* L, int pos, int gdn_slot, int f
         PF(PF_PROJ_FP8, s, q27_proj_fp8(&L->v_proj, d.xq, d.xs, d.pa, s));
         q27_f2bf_vec(d.pa, d.qkva + Q27_QROWS + Q27_KVROWS, Q27_KVROWS, s);
         signed char* kc = d.kc + (size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS;
-        float* ks = d.ks + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 16;
+        q27_kvs_t* ks = d.ks + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 16;
+#if Q27_V4
+        // V4 planes are packed: half the bytes per row, one block max per 32 dims.
+        signed char* vc = d.vc + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 2;
+        q27_kvs_t* vs = d.vs + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 32;
+#else
         signed char* vc = d.vc + (size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS;
-        float* vs = d.vs + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 16;
+        q27_kvs_t* vs = d.vs + ((size_t)slot*d.kv_stride + (size_t)full_slot*ctx*Q27_KVROWS) / 16;
+#endif
         PF(PF_ATTN, s, { q27_attn_prep(d.qkva, L->q_norm, L->k_norm, kc, ks, vc, vs, d.qh, pos, Q27_KVROWS, 0, s);
                          q27_attn_decode(d.qh, kc, ks, vc, vs, d.qkva, d.mix6, pos, Q27_KVROWS, 0, s); });
         q27_quant_fp8(d.mix6, d.xq, d.xs, Q27_OROWS, L->o_proj.in_scale, s);
@@ -557,6 +699,26 @@ static bool   g_coll_nrbf16 = true;    // Q27_COLL_NRBF16=0 reverts: the NR-row 
 static int    g_nr_p2p     = 1;       // Q27_NR_P2P: 1 = bf16 store-kernel push + local reduce (default), 2 = peer-read pull, 3 = SDMA push, 0 = host-staged
 static int    g_nr_p2p_min = 4;       // Q27_NR_P2P_MIN: rows from which the GPU-resident collective is used (measured: wins at NR=8, ties at 4, loses at 2)
 static int    g_devid_tab[Q27_MAX_DEVICES] = {0};   // HIP device ordinal per card index (filled at the NR_P2P init; hipMemcpyPeerAsync needs ids)
+#define Q27_LL_SLOTS 4                          // Q27_NR_P2P=4: receive slots per (owner, source), indexed by site sequence & 3
+static int    g_ll_sdma    = 1;       // Q27_LL_SDMA: 1 = pack locally + copy-engine writes into the peers' uncached slots (default), 0 = shader stores
+static int    g_proj_seg   = 0;       // Q27_PROJ_SEG: q/k/v (attention) and in_qkv/in_z (GDN) int8-mirror projections in ONE launch per layer
+static int    g_ll_epi     = 0;       // Q27_LL_EPI: 1 = the site producers (int8-mirror o/out_proj, NVFP4 down) write the LL words in their epilogue (no pack kernel)
+static long   g_ll_epi_taken[Q27_MAX_DEVICES] = {0}, g_ll_epi_armed[Q27_MAX_DEVICES] = {0};   // receipt: sites whose producer packed the LL words / sites armed
+// ---- RUNTIME TRANSPORT RECEIPT (2026-09-17) -------------------------------------------------
+// WHAT THE CONFIGURATION SAID IS NOT WHAT THE ENGINE DID. `p2p_` is recomputed per pass as
+// (g_nr_p2p && NR >= g_nr_p2p_min), so a threshold, a row count and a mode interact to choose a
+// transport 128 times per round, and none of that is visible from the environment. These counters
+// are incremented INSIDE the two transport implementations themselves -- tp_allreduce_nr (host
+// staging) and nrp_site (GPU-resident) -- never at the decision point, so they report execution
+// and not intent. 64 layers x 2 sites means a decode request must show sites summing to
+// 128 x rounds; anything else is the receipt refusing to corroborate the arm.
+// Per-phase host-collective wall, accumulated per card over the process lifetime and differenced
+// per request. [0] stage_wait (blocks on the GPU finishing the preceding segment -> prices that
+// segment), [1] b1 skew, [2] reduce arithmetic, [3] b2 skew, [4] invN tail.
+static double g_collt[Q27_MAX_DEVICES][6] = {{0}};
+static long g_coll_host_sites[Q27_MAX_DEVICES] = {0};
+static long g_coll_p2p_sites [Q27_MAX_DEVICES][5] = {{0}};   // [mode]: 1 push, 2 pull, 3 SDMA, 4 LL (flag-in-data)
+static int  g_coll_nr_eff    [Q27_MAX_DEVICES] = {0};        // the row count the last site actually saw
 static bool   g_coll_side  = false;  // Q27_COLL_SIDE: stage the D2H off the main stream
 static bool   g_rn_split   = true;
 static bool   g_gdn_fq     = true;
@@ -572,6 +734,41 @@ static int    g_nr_fam     = 0;       // Q27_NR_FAM: bisect mask -> split-row ke
 static int    g_nr_att1    = 0;       // Q27_NR_ATT1=1: per-row attention launches (bisect)
 static int    g_nr_gdn1    = 0;       // Q27_NR_GDN1=1: per-row conv/step + memcpy snapshots (bisect)
 static int    g_nr_qb      = 1;       // Q27_NR_QB=0: per-row quantize launches (bisect)
+// Q27_NR_DUP: THE SHIPPED PATH HAS NO LEDGER, so price a stage the way the combine was priced --
+// run it TWICE and read d(wall)/d(stage). Every stage below stores (no accumulation into a shared
+// buffer across launches), so a duplicate recomputes the same bytes and the token stream is
+// unchanged; the decode tok/s delta is the stage's cost. Bitmask:
+//   1 = attention decode (+ combine), 2 = MLP gate/up + swiglu, 4 = lm_head,
+//   8 = fp8 projections (qkv / in_qkv / in_z via P_FP8_BF16), 16 = fp8 result projections
+//   64 = down_proj alone (P_DOWN). MEASURED IN-BOOT 2026-09-17; see the note at the call site --
+//   P_DOWN IS a pure store and the 08:21 "it accumulates" diagnosis below is retracted.
+//   (o_proj / out_proj via P_FP8_RES -- VALIDATE BY HASH: same two-output+alpha shape as P_DOWN),
+//   32 = the per-row quantize of the attention output and of z.
+// ANY arm whose tokhash moves is INVALID: that is how the whole-trio MLP duplicate was caught
+// (2026-09-17 08:21, text garbage from byte 9, so P_DOWN accumulates and is not idempotent).
+static int    g_nr_dup     = 0;
+// E4 (2026-09-17): PER-REQUEST ARM CONTROL. Q27_NR_DUP is read once at boot, so pricing N stages
+// cost N boots -- and this box scatters +-1.6% across boots against +-0.2% WITHIN one boot
+// (measured: same binary, same prompt 14360, same tokhash, ms_per_round 28.3143 / 28.2570 in one
+// boot, 27.8728 in the next). A per-stage attribution table built one-boot-per-arm therefore
+// carries 8x the noise of the effect it is trying to resolve. Re-reading the arm at the start of
+// every request collapses the whole table into ONE boot, where the floor is 0.2%.
+// The file holds two integers: "<nr_dup> <ab_arm>". Card 0 reads it between C.b1 and C.b2, the
+// same ordering the request itself uses, so every thread sees one value for the whole request.
+// It selects which already-compiled path runs; it does not originate a request. Measurement still
+// comes from a Harness turn and nothing else.
+static const char* g_ab_file = nullptr;
+static int    g_ab_arm     = 0;       // generic kernel-variant selector, reported as arm= on Q27_REQ
+static void q27_ab_reread() {
+    if (!g_ab_file) return;
+    FILE* f = std::fopen(g_ab_file, "r");
+    if (!f) return;
+    int dup = 0, arm = 0;
+    const int got = std::fscanf(f, "%d %d", &dup, &arm);
+    std::fclose(f);
+    if (got >= 1) g_nr_dup = dup;
+    if (got >= 2) g_ab_arm = arm;
+}
 static int    g_nr_ch      = 4;       // Q27_NR_CH=1..4: rows per chunk of the NR>4 verify (4-row form 39.5 ms vs 3-row 26.4 at 8K)
                                       // instead of hipEventSynchronize; 2 = FIRING CONTROL, no wait
 static std::atomic<long long> g_dflag_waits{0}, g_dflag_skips{0};
@@ -594,8 +791,11 @@ static void MS(const char* tag) {
     std::fprintf((g_text || early_text) ? stderr : stdout, "Q27_MS %-18s %8.2f s\n", tag, (tp_now() - g_t0_wall) / 1000.0);
     std::fflush(stdout);
 }
+static unsigned g_host_tail_mask = 0; // logical workers sharing a physical GPU may use host-submitted consumers
 static bool   g_tail_preenq = false;   // enqueue the post-barrier tail BEFORE the barrier
 static bool   g_preenq_ok    = false;  // device actually supports hipStreamWaitValue32
+static int    g_wait_kernel  = 0;      // Q27_WAIT_KERNEL: spin kernel (q27_wait_flag_eq) instead of hipStreamWaitValue32
+extern "C" void q27_wait_flag_eq(const unsigned* flag_dev, unsigned want, hipStream_t s);
 static bool   g_rn_dropy = true;    // skip the tail's normalised-vector store where nothing reads it
 static int    g_slow_null  = 0;     // extra EMPTY launches at the post-barrier point
 static int    g_slow_mixq  = 0;     // extra runs of the pre-barrier mixer fp8 quantizer
@@ -668,12 +868,27 @@ static int    g_pf_mlp14   = 0;   // Q27_PF_MLP14=5|6: gate+up on the int8 mirro
 static int    g_pf_mlp14d  = 0;   // Q27_PF_MLP14D=5|6: down likewise
 static int    g_pf_mk2r2   = 1;   // Q27_PF_MK2R2=1 (default, rung 3): tile projection m2r with the rebuilt reduction epilogue (bit-identical)
 static int    g_pf_m2f3    = 1;   // Q27_PF_M2F3=1 (default, rung 3): chunk out_proj m2f2 likewise
+// Q27_PF_KVP2P=1: peer-quarter KV (EXPERIMENTAL, DEFAULT OFF, CURRENTLY INCORRECT).
+// Distinct from Q27_PF_P2P below -- an earlier version of this reused THAT flag, which silently
+// turned on the cross-card collective as well; that collective's self-test fails on this box
+// ("peer access unavailable/failed; reverting to the host collective"), so the peer pointers this
+// path writes through were never mapped and the KV was corrupted. The model could not see its own
+// prompt. Do not enable until peer access self-tests clean AND this path is re-validated.
+static int    g_pf_kvp2p   = 0;
 static int    g_pf_p2p     = 0;   // Q27_PF_P2P=1: GPU-resident cross-card collective (peer reads in one
                                   // fused kernel; no D2H/host reduce/H2D). Requires Q27_PF_X4W>0.
 static int    g_pf_p2p_rn  = 1;   // Q27_PF_P2P_RN=0: keep collective #1 sites (red_rn_perm_b) on the host (bisect)
 static int    g_pf_p2p_mix = 1;   // Q27_PF_P2P_MIX=0: keep the mixer collective on the host (bisect)
 static bool   g_ls_q8      = true; // Q27_LS_Q8=1 (default): the quantized producer/consumer prefill graph (int8 KV, int8 GDN/attention handoffs, fp32 residual)
 static int    g_ls          = 0;  // Q27_LAYER_SPLIT=1: layer-split residency -- card g owns FULL layers
+static int    g_sr          = 0;  // Q27_LS_SR=1: SINGLE residency -- the layer-split copy is the only copy; decode runs sequentially through the cards (src/q27_sr_main.inc)
+static int    g_tpsr        = 0;  // Q27_TPSR=1: TENSOR-PARALLEL single residency (2026-09-17 night) -- Q27_LAYER_SPLIT=0, every card holds 1/ndev of every layer ONCE in 8-bit
+                                  // (block-scaled FP8 gate/up row shards + FP8 down K-slice, int8/64 mirrors of the fp8 projection shards), quarter KV; the shipped TP
+                                  // decode round reads the FP8 down slice through the natural-order swiglu; the batched TP prefill runs its MLP on rocBLAS int8 from a
+                                  // transient per-row shard converted once per layer per sweep, and conditions the MTP draft on the prompt like the layer-split sweep does.
+static int    g_tpsr_proj_rb = 0; // Q27_TPSR_PROJ_RB=1: prefill v2 -- the batched TP sweep's projections (q/k/v, o_proj, in_qkv/in_z, out_proj) on rocBLAS int8 from
+                                  // transient per-row mirrors, instead of the fp8 chunk kernels on the originals. Off by default; opt-in, fail-closed (tdie) at the seam.
+static int    g_sr_head     = -1; // Q27_LS_SR: the card that owns layer 63 -- final norm, lm_head, MTP draft and draft KV live there
                                   // [g*16,(g+1)*16); the prefill sweep is chunk-major per stage with per-chunk
                                   // handoff copies and NO intra-layer collectives. Decode keeps the TP layout.
 static int    g_pf_qkv3    = 0;   // Q27_PF_QKV3=1: q/k/v s1_b2 likewise (measured neutral at 4 waves; off)
@@ -703,13 +918,44 @@ static int    g_pf_att_b   = 0;   // Q27_PF_ATT_B=1: attention layers' chunk o_p
 // PROMPT POSITION (30 KB per position per card), and those arrays were a compile-time 1024, so any
 // longer prompt was refused. The prompt length is known before allocation, so size them to it.
 static int    g_pf_cap = Q27_PF_CAP;
+// ---- Q27_SERVE_GROW: in-place growth of the per-position prefill scratch ------------------------
+// g_pf_cap was sized once, at cold start, from whichever prompt arrived first -- in serve mode that
+// is routinely a ~130-token title request, so the engine sat at the floor and REFUSED every window
+// that later grew past it. A refusal costs the whole conversation: the server kills the engine, a
+// replacement cold-starts (~60 s) and re-prefills the entire history (34 s on a 17.8 k window,
+// measured, made worse by restart pollution). The slot buffers are pure per-window scratch, so they
+// can be freed and re-allocated in place; the KV cache, the recurrent state, the weights and
+// pos_cur are all separate allocations and survive. Growth goes through a bucket ladder, is capped
+// by the tightest card's free memory on all devices WITH a safety margin, and is announced.
+static std::atomic<int> g_pf_grow_seq{0};    // leader publishes, waiters observe
+static std::atomic<int> g_pf_grow_ok{0};
 static int    g_df2_draft = 0;   // Q27_DFLASH2: the integrated DFlash2 block-drafter path (declared early: dev_alloc_tp sizes the prompt tap buffers)
 // SERVE MODE (Q27_SERVE=1): the model stays resident and requests arrive on stdin.
 static bool   g_serve = false;
 static bool   g_eos_im_end = false;   // treat <|im_end|> (248046) as a stop token (default: on in serve mode)
 static inline bool q27_is_eos(unsigned t) { return t == 248044u || (g_eos_im_end && t == 248046u); }
-struct ReqState { std::vector<unsigned> ids; int maxn = 0; bool eof = false; };
+// pf_only: SWEEP THE IDS, GENERATE NOTHING. The serving path appends an oversized window in
+// arena-sized steps, and a step must land the prefix EXACTLY where the caller expects it: a step
+// that decodes (even one EOS token) appends tokens the caller never asked for, so the next step's
+// ids are swept at the wrong absolute positions AND the model's prefix stops being the prompt.
+// Measured before this existed: a 9,109-token window served as 8960 + 149 had the remainder swept
+// 19 positions late, behind 19 generated tokens, and the Harness turn came back with no answer.
+struct ReqState { std::vector<unsigned> ids; int maxn = 0; bool eof = false; bool pf_only = false;
+                  int rewind_pos = -1; };   // Q27_SERVE_REWIND (maxn == -3): absolute target position
 static ReqState g_req;
+// Q27_REWIND_CK: how many request-boundary (S, conv) checkpoints to keep. Each bank costs the
+// full recurrent state -- measured 64.6 MiB/card at ctx=262144 (S 63.0 + conv 1.6) -- so the
+// ring is bounded by the TIGHTEST card, not the 32. 0 disables and restores the old reset-only
+// behaviour exactly.
+// ORDER-INDEPENDENT ON PURPOSE. Device allocation runs long before the serve-loop init, so a
+// plain global set in that init reads 0 at the allocation site and the banks are silently never
+// allocated -- an inert arm that still logs the env var as requested. Caught by VRAM not moving.
+static int q27_rewind_ck(void) {
+    static int v = -1;
+    if (v < 0) { v = q27_env_int("Q27_REWIND_CK", 0); if (v < 0) v = 0; if (v > 16) v = 16; }
+    return v;
+}
+static int g_ck_pos[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };  // absolute position each bank holds; -1 = empty
 // TEXT MODE (Q27_TEXT=1): argv carries the user's text, stdin turns are text, output is streamed as
 // text. The tokenizer is the generic HF tokenizer.json engine in src/tok (PCRE2 pre-tokenizer);
 // the chat template is the Qwen3.5 text-only subset in q27_chat.h.
@@ -723,9 +969,27 @@ static std::vector<unsigned> q27_encode(const std::string& text) {
     for (std::int32_t t : g_tok->encode(text)) if (t >= 0 && t < Q27_VOCAB) ids.push_back((unsigned)t);
     return ids;
 }
+// STREAMING ON THE TOKEN WIRE (Q27_SERVE_STREAM=1, default ON in serve mode).
+// Serve mode printed Q27_TOKENS only AFTER the whole generation finished, so a client could not
+// show anything until the turn ended -- the Harness sat on "Deep diving..." and then dumped the
+// reasoning and the answer at once. Text mode streams per token but its line-based wire destroys
+// the newlines in file contents, diffs and shell output that tool results carry, so it is not an
+// option here. Emitting the token ID as it is produced gives the same streaming without touching
+// the bytes: the client decodes incrementally and the final Q27_TOKENS line still arrives
+// unchanged, so a non-streaming reader keeps working exactly as before.
+// Emission rides inside q27_emit(), which the decode loops call ONLY for committed tokens --
+// including the speculative path, where q27_main.cpp:6796 emits exactly sp_ncommit of them after
+// verify. So a rejected draft token can never reach the wire and nothing has to be retracted.
+static bool g_stream_ids = false;
+static void q27_emit_id(unsigned t) {
+    if (!g_stream_ids) return;
+    if (t == 248044u || t == 248045u || t == 248046u) return;   // chat specials are not content
+    std::printf("Q27_TOK %u\n", t); std::fflush(stdout);
+}
 // Stream one generated token as text (thread 0 only). The three chat specials are not printed;
 // everything else, including <think> tags when thinking is on, is shown as the model wrote it.
 static void q27_emit(unsigned t) {
+    q27_emit_id(t);
     if (!g_text || !g_tok) return;
     if (t == 248044u || t == 248045u || t == 248046u) return;
     const std::string piece = g_tok->decode_token((std::int32_t)t);
@@ -734,7 +998,7 @@ static void q27_emit(unsigned t) {
 // One request per line: "<maxn> <id> <id> ...". Blank lines are skipped; EOF ends serving. Ids are
 // range-checked against the vocabulary (an out-of-range id is a silent garbage prompt otherwise).
 static void serve_read_request(ReqState& R) {
-    R.ids.clear(); R.maxn = 0; R.eof = false;
+    R.ids.clear(); R.maxn = 0; R.eof = false; R.pf_only = false;
     std::string line;
     for (;;) {
         if (!std::getline(std::cin, line)) { R.eof = true; return; }
@@ -750,12 +1014,32 @@ static void serve_read_request(ReqState& R) {
     std::istringstream is(line);
     long long v; bool first = true;
     while (is >> v) {
-        if (first) { R.maxn = (int)v; first = false; continue; }
+        if (first) { R.maxn = (int)v; first = false;
+                     // maxn == -3 is REWIND and the NEXT field is an absolute POSITION, not a token
+                     // id. It must bypass the vocabulary range check below: ctx is 262144 while
+                     // Q27_VOCAB is 248320, so any position past the vocabulary would be silently
+                     // dropped and the rewind would land at 0 -- i.e. look exactly like the reset it
+                     // is meant to replace.
+                     if (R.maxn == -3) { long long pp = -1; if (is >> pp) R.rewind_pos = (int)pp; break; }
+                     continue; }
         if (v < 0 || v >= (long long)Q27_VOCAB) { std::fprintf(stderr, "Q27_REQ: id %lld out of range, dropped\n", v); continue; }
         R.ids.push_back((unsigned)v);
     }
-    if (R.maxn <= 0) R.maxn = 256;
+    // maxn == -1 is the RESET command, not a token budget. maxn == -2 is PREFILL-ONLY (the
+    // serving path's chunk step, see ReqState). Only a zero/absent budget defaults.
+    if (R.maxn == -2) { R.pf_only = true; R.maxn = 0; }
+    else if (R.maxn == 0) R.maxn = 256;
 }
+// EXECUTED-CALL PROOF FOR THE CROSS-CARD COLLECTIVE.
+// Q27_PF_P2P is a GPU-resident collective that replaces the host D2H/reduce/H2D rendezvous. It
+// has a startup self-test, but a self-test only proves peer access WORKS -- not that the prefill
+// actually took the peer path. That distinction is not academic here: the peer-enable check used
+// to treat hipErrorPeerAccessAlreadyEnabled as failure, so the flag silently demoted itself to
+// host staging on every run ever measured. An inert arm that looks like a measurement is exactly
+// what these counters exist to make impossible, so count both paths and print them.
+static std::atomic<long long> g_p2p_rn_calls{0};    // collective #1 on the GPU (red_rn_perm_b)
+static std::atomic<long long> g_p2p_mix_calls{0};   // collective #2 on the GPU (red_b, mixer)
+static std::atomic<long long> g_host_coll_calls{0}; // host-staged reduce (tp_reduce_bx)
 static std::atomic<long long> g_kv_fused{0};   // executed-call proof for the fused k|v path
 static bool   g_preenq_mlp = false; // pre-enqueue the whole MLP chain behind the flag-gated tail
 static bool   g_preenq_prologue = false; // pre-enqueue the NEXT layer's prologue behind its input norm
@@ -765,6 +1049,37 @@ static int    g_zcout_neg   = 0;       // negative control: keep the VRAM destin
 static int    g_coll_zcout  = 1;       // producers store the partial straight into pinned host memory
 static float* g_coll_acc   = nullptr; // device-visible pointer to the pinned reduced vector  // Q27_COLL_PROF=1: per-phase collective breakdown   // Q27_GDN_FQ=0 -> separate quantize launch   // Q27_RN_SPLIT=0 -> single-block rmsnorm
 
+// WHICH CARD STOPPED. TpBar is a counter, so "arrived 3" names a NUMBER, not a card, and the three
+// spinning threads are usually parked in the ring's ls_rec spin (which has no deadline) rather than
+// in the barrier at all. Each worker stamps the generation it is entering before every wait; on
+// timeout the handler prints all of them plus the ring's per-card job record, and the cells that
+// are behind name the card that never arrived and the job it stopped on. Relaxed stores on a cell
+// nobody reads on the fast path cost nothing measurable.
+static std::atomic<unsigned> g_tp_seen[Q27_MAX_DEVICES];
+static std::atomic<int>*     g_tp_lsrec = nullptr;      // points at the shared C.ls_rec once it exists
+static int                   g_tp_ndev_dbg = 0;
+static thread_local int      t_tp_card = -1;
+
+// ---- Q27_MLP_WSHARE (2026-09-18): the MLP rows each card owns -------------------------------
+// gate/up are column-parallel (a card owns rows [off,off+len) of the 17408-row intermediate) and
+// down_proj is row-parallel over the same 17408 K, so ONE vector describes all three. Uniform
+// Q27_INTER/ndev unless `Q27_MLP_WSHARE` says otherwise; parsed and validated once in q27.h.
+// This is the lever that turns the 32 GiB card's spare residency into authority for the 16s, and
+// it is the only place the MLP shard length is allowed to come from.
+static int  g_mlp_off[Q27_MAX_DEVICES] = {0};
+static int  g_mlp_len[Q27_MAX_DEVICES] = {0};
+static int  g_mlp_max = 0;
+static bool g_mlp_ready = false;
+static void mlp_wshare_init(int ndev) {
+    if (g_mlp_ready) return;
+    q27_mlp_wshare(g_mlp_off, g_mlp_len, ndev);
+    g_mlp_max = 0;
+    for (int g = 0; g < ndev; ++g) if (g_mlp_len[g] > g_mlp_max) g_mlp_max = g_mlp_len[g];
+    g_mlp_ready = true;
+}
+static inline int mlp_len(int card) { return g_mlp_ready ? g_mlp_len[card] : (Q27_INTER / 4); }
+// Layer-split prefill collapses the divisor to 1: the owner card holds the WHOLE MLP.
+static inline int mlp_len_div(int card, int div) { return div == 1 ? Q27_INTER : mlp_len(card); }
 struct TpBar {
     std::atomic<int>      cnt;
     std::atomic<unsigned> gen;
@@ -775,8 +1090,14 @@ struct TpBar {
     // control drives this path by construction. A spin count is not a timeout -- it is a duration
     // that changes with clock speed and contention. The clock is read once per 4096 spins so the
     // fast path (the barrier resolves in tens of microseconds) pays essentially nothing.
-    void wait() {
+    // idle=true: the peers are parked waiting for card 0 to receive the NEXT REQUEST, which is a
+    // human/Harness think-time wait, not a wedged card. Carrying the compute deadline here aborted
+    // a perfectly healthy engine 60 s after every reply ("FATAL TpBar ... arrived 3") and destroyed
+    // residency, so every turn paid a full model reload. Idle waits have no deadline and sleep
+    // instead of spinning, so three cards do not burn three cores between turns.
+    void wait(bool idle = false) {
         const unsigned g = gen.load(std::memory_order_acquire);
+        if (t_tp_card >= 0) g_tp_seen[t_tp_card].store(g, std::memory_order_relaxed);
         if (cnt.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
             cnt.store(0, std::memory_order_relaxed);
             gen.fetch_add(1, std::memory_order_release);
@@ -784,12 +1105,21 @@ struct TpBar {
             const double t0 = tp_now();
             unsigned spins = 0;
             while (gen.load(std::memory_order_acquire) == g) {
+                if (idle) { if ((++spins & 255u) == 0u) usleep(50); continue; }
                 if ((++spins & 4095u) == 0u && tp_now() - t0 > g_bar_deadline_ms) {
                     std::fprintf(stderr,
                         "FATAL TpBar: waited %.0f ms for %d participants at generation %u "
                         "(arrived %d). A peer thread is gone or a card has wedged; aborting rather "
                         "than holding the GPUs forever.\n",
                         tp_now() - t0, n, g, cnt.load(std::memory_order_relaxed));
+                    char who[256]; int wn = 0;
+                    for (int q = 0; q < g_tp_ndev_dbg && wn < 200; ++q)
+                        wn += std::snprintf(who + wn, sizeof(who) - (size_t)wn, " card%d:gen=%u,job=%d", q,
+                                            g_tp_seen[q].load(std::memory_order_relaxed),
+                                            g_tp_lsrec ? g_tp_lsrec[q].load(std::memory_order_relaxed) : -99);
+                    std::fprintf(stderr, "FATAL TpBar detail:%s  (a card whose gen is BEHIND %u never "
+                                         "reached this barrier; its job index says where the ring left it)\n",
+                                 who, g);
                     std::abort();
                 }
             }
@@ -960,6 +1290,15 @@ struct TpColl {
     hipEvent_t ev_nrp_rd[2][Q27_MAX_DEVICES] = {{nullptr}};
     unsigned short* nrp_recv[2][Q27_MAX_DEVICES][Q27_MAX_DEVICES] = {{{nullptr}}};   // v2 push: [slot][owner][source] bf16 rows, allocated on the owner
     unsigned short* nrp_stage[2][Q27_MAX_DEVICES] = {{nullptr}};   // v3 (Q27_NR_P2P=3): local bf16 staging rows, then hipMemcpyPeerAsync (SDMA) into the peers' slots
+    // Q27_NR_P2P=4 (LL, 2026-09-28): [slot][owner][source] 8-byte words {2 x bf16, seq}, allocated UNCACHED/fine-grained on the
+    // owner (its spin-reads bypass L2; the source's peer stores bypass its L2 too). No events, no host barrier: the sequence
+    // number inside every word is the only synchronization. nrp_err: 4 x u32 per card, pinned, written only on a spin timeout.
+    unsigned* nrp_ll[Q27_LL_SLOTS][Q27_MAX_DEVICES][Q27_MAX_DEVICES] = {{{nullptr}}};
+    unsigned* nrp_llstage[Q27_LL_SLOTS][Q27_MAX_DEVICES] = {{nullptr}};   // Q27_LL_SDMA: local coarse staging block (packed LL words) per slot
+    int       nrp_prepacked[Q27_MAX_DEVICES] = {0};    // Q27_LL_EPI: the producer already wrote this site's LL words (skip the pack kernel)
+    unsigned* nrp_err[Q27_MAX_DEVICES] = {nullptr};
+    unsigned* nrp_cnt[Q27_MAX_DEVICES] = {nullptr};      // Q27_LL_LB: 8 row counters per card (device memory, zero at rest)
+    unsigned  nrp_seq[Q27_MAX_DEVICES] = {0};     // per-card site sequence; every card runs the same site order (SPMD), so they agree
     hipEvent_t ev_mix[3][Q27_MAX_DEVICES] = {{nullptr}};
     hipEvent_t ev_mix_rd[3][Q27_MAX_DEVICES] = {{nullptr}};
     // PINNED, because the tails read it FROM THE DEVICE. A plain host array inside this struct
@@ -992,6 +1331,11 @@ struct TpColl {
     double   t_coll[Q27_MAX_DEVICES] = {0};
     double   t_comp[Q27_MAX_DEVICES] = {0};
     long long n_coll[Q27_MAX_DEVICES] = {0};
+    // ---- Q27_LS_SR: the sequential decode chain's publish counters and the two per-round exchanges ----
+    std::atomic<long> sr_pub[Q27_MAX_DEVICES];   // blocks this card has published (monotonic; base = 4 * rounds)
+    unsigned sr_dt[8] = {0u,0u,0u,0u,0u,0u,0u,0u};   // the head card's drafts for this round
+    unsigned sr_nx[8] = {0u,0u,0u,0u,0u,0u,0u,0u};   // the head card's verified tokens
+    int      sr_nacc = 0;
 };
 
 
@@ -1024,13 +1368,13 @@ static void tp_allreduce_bf16(TpColl& C, int g, unsigned short* dmixer, hipStrea
     unsigned short* hp = (unsigned short*)C.hp[g];
     CK(hipMemcpyAsync(hp, dmixer, B, hipMemcpyDeviceToHost, st));
     CK(hipStreamSynchronize(st));
-    if (g_coll_pf) { const int slice = C.n / C.ndev, off = g * slice;
+    if (g_coll_pf) { const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0), off = g * (C.n / C.ndev);
         for (int k = 0; k < C.ndev; ++k) { const unsigned short* p = (const unsigned short*)C.hp[k] + off;
             for (int i = 0; i < slice; i += 32) __builtin_prefetch(p + i); } }   // 32 halves = 64 B
     if (!tp_break_barrier() && g != g_bar_strand) C.b1.wait();
 
-    const int slice = C.n / C.ndev;
-    const int off   = g * slice;
+    const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: 5120 % 3 == 2 -> the last worker takes the remainder
+    const int off   = g * (C.n / C.ndev);
     unsigned short* __restrict o = (unsigned short*)C.acc + off;
     const unsigned short* __restrict a0 = (const unsigned short*)C.hp[0] + off;
     const unsigned short* __restrict a1 = (const unsigned short*)C.hp[1] + off;
@@ -1101,9 +1445,13 @@ static inline void tp_stage_wait(TpColl& C, int g, unsigned gen) {
     CK(hipEventSynchronize(C.ev_copy[g]));
 }
 
+struct Q27CollectivePoint { int req, pos, site; double enter, staged, arrived, reduced, published, returned; };
+static thread_local std::vector<Q27CollectivePoint> g_coll_points;
+static thread_local int g_timeline_req = 0, g_timeline_pos = 0;
+static thread_local bool g_timeline_sample = false;
 static void tp_allreduce(TpColl& C, int g, float* dmixer, hipStream_t st, bool copied = false) {
     const size_t B = (size_t)C.n * 4;
-    const bool prof = g_coll_prof;
+    const bool prof = g_coll_prof || g_timeline_sample;
     double p0 = prof ? tp_now() : 0.0, p1, p2, p3, p4;
     if (!g_coll_zcout && !copied) {   // `copied` = the caller already enqueued it behind the
         if (g_coll_side) {            // staged on a side stream: the main stream keeps its queue
@@ -1125,8 +1473,8 @@ static void tp_allreduce(TpColl& C, int g, float* dmixer, hipStream_t st, bool c
     // prefetch ISSUE cost is uniform pre-b1 work (~0.3 us); the DATA lands in slack for free.
     // If the pinned mapping turns out non-cacheable this is a no-op and the A/B shows it.
     if (g_coll_pf) {
-        const int slice = C.n / C.ndev;
-        const int off   = g * slice;
+        const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: last worker takes the remainder
+        const int off   = g * (C.n / C.ndev);
         for (int k = 0; k < C.ndev; ++k) {
             const float* p = C.hp[k] + off;
             for (int i = 0; i < slice; i += 16) __builtin_prefetch(p + i);   // 16 floats = 64 B line
@@ -1153,8 +1501,8 @@ static void tp_allreduce(TpColl& C, int g, float* dmixer, hipStream_t st, bool c
     // make the ARITHMETIC slow (also 6.7x). A probe that destroys correctness cannot time anything.
     // This form keeps b2, keeps values in range, and drops 3/4 of the reduction's memory traffic.
 
-    const int slice = C.n / C.ndev;
-    const int off   = g * slice;
+    const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: 5120 % 3 == 2 -> the last worker takes the remainder
+    const int off   = g * (C.n / C.ndev);
     float* __restrict o = C.acc + (size_t)off;
     if (C.ndev == 4) {
         const float* __restrict a0 = C.hp[0] + off;
@@ -1216,6 +1564,8 @@ static void tp_allreduce(TpColl& C, int g, float* dmixer, hipStream_t st, bool c
         CK(hipStreamSynchronize(st));
     }
     if (prof) C.c_h2d[g] += tp_now() - p4;
+    if (g_timeline_sample) g_coll_points.push_back({g_timeline_req,g_timeline_pos,
+        int(C.n_coll[g] % 129),p0,p1,p2,p3,p4,tp_now()});
 }
 
 // ---- Q27_SPEC: the NR-row collective (rows = consecutive positions of ONE sequence) ------------
@@ -1230,18 +1580,68 @@ static inline unsigned tp_stage_out_nr(TpColl& C, int g, const float* src, int N
     else               q27_copy_f4_flag_mb(g_coll_part[g], src, C.n * NR, C.done_d[g] + g, gen, C.cp_cnt[g], target, Q27_CP_NBLK, st);
     return gen;
 }
+// Q27_COLL_AVX2 (2026-09-28): the bf16 NR site reduce, 8 lanes wide. Measured scalar cost was
+// 0.5-0.8 ms/token (4-6 us/site at NR=1) sitting between b1 and b2 on every card, i.e. ALU-bound at
+// scalar speed, not transport-bound as the 09-18 note assumed for NR=3. The element values o[i] keep
+// the exact pairwise association (b0+b1)+(b2+b3); only the sum-of-squares accumulation order changes.
+#if !defined(__HIP_DEVICE_COMPILE__)
+#include <immintrin.h>
+__attribute__((target("avx2,fma")))
+static void tp_reduce4_bf16_avx2(const unsigned short* __restrict b0, const unsigned short* __restrict b1,
+                                 const unsigned short* __restrict b2, const unsigned short* __restrict b3,
+                                 float* __restrict o, int n, float* ss_out) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        #define Q27_BF16X8(p) _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(p))), 16))
+        const __m256 f0 = _mm256_add_ps(_mm256_add_ps(Q27_BF16X8(b0 + i), Q27_BF16X8(b1 + i)), _mm256_add_ps(Q27_BF16X8(b2 + i), Q27_BF16X8(b3 + i)));
+        const __m256 f1 = _mm256_add_ps(_mm256_add_ps(Q27_BF16X8(b0 + i + 8), Q27_BF16X8(b1 + i + 8)), _mm256_add_ps(Q27_BF16X8(b2 + i + 8), Q27_BF16X8(b3 + i + 8)));
+        #undef Q27_BF16X8
+        _mm256_storeu_ps(o + i, f0); _mm256_storeu_ps(o + i + 8, f1);
+        acc0 = _mm256_fmadd_ps(f0, f0, acc0); acc1 = _mm256_fmadd_ps(f1, f1, acc1);
+    }
+    float t[8]; _mm256_storeu_ps(t, _mm256_add_ps(acc0, acc1));
+    float s = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+    for (; i < n; ++i) {
+        const float v = (q27_h_bf2f(b0[i]) + q27_h_bf2f(b1[i])) + (q27_h_bf2f(b2[i]) + q27_h_bf2f(b3[i]));
+        o[i] = v; s = fmaf(v, v, s);
+    }
+    *ss_out = s;
+}
+static int tp_coll_avx2_on() {
+    static int v = -1;
+    if (v < 0) { v = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && q27_env_int("Q27_COLL_AVX2", 1)) ? 1 : 0; }
+    return v;
+}
+#else
+static int tp_coll_avx2_on() { return 0; }
+static void tp_reduce4_bf16_avx2(const unsigned short*, const unsigned short*, const unsigned short*, const unsigned short*, float*, int, float*) {}
+#endif
 static void tp_allreduce_nr(TpColl& C, int g, int NR) {
+    ++g_coll_host_sites[g]; g_coll_nr_eff[g] = NR;   // runtime receipt: this site took the HOST path
+    // PHASE DECOMPOSITION OF ONE HOST SITE (2026-09-17). Host-side wall is REAL here, unlike in the
+    // enqueue-only stretches between sites: this path blocks. The split is what decides whether the
+    // bf16 reduce is worth vectorising, and it is the only way to tell arithmetic from rendezvous:
+    //   [1] b1     -- cross-card arrival skew (cards waiting for the slowest peer to stage)
+    //   [2] reduce -- the host bf16->fp32 sum + sumsq over this card's 1/ndev slice  <-- AVX2 target
+    //   [3] b2     -- second barrier: everyone's slice reduced before the norms are combined
+    //   [4] invN   -- the rsqrt tail over ndev partial sumsqs
+    // tp_stage_wait ([0]) is bracketed at the CALL SITES, because it blocks on the GPU finishing the
+    // preceding segment and therefore prices that segment's execution, not the collective.
+    const double t_a = tp_now();
     C.b1.wait();
-    const int slice = C.n / C.ndev;
-    const int off   = g * slice;
+    const double t_b = tp_now();
+    const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: 5120 % 3 == 2 -> the last worker takes the remainder
+    const int off   = g * (C.n / C.ndev);
     for (int r = 0; r < NR; ++r) {
         const size_t ro = (size_t)r * C.n + off;
         float* __restrict o = C.acc + ro;
         float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-        if (C.ndev == 4) {
+        if (C.ndev == 4 || C.ndev == 3) {   // Q27_TP3: slot 3 is zero-filled by Q27_COLL_PAD, so the 4-slot sum is exact
             if (g_coll_nrbf16) {   // bf16 partials (packed by k_copy_bf16_flag_mb), summed in fp32, result fp32 in C.acc
                 const unsigned short* __restrict b0 = (const unsigned short*)C.hp[0] + ro;  const unsigned short* __restrict b1 = (const unsigned short*)C.hp[1] + ro;
                 const unsigned short* __restrict b2 = (const unsigned short*)C.hp[2] + ro;  const unsigned short* __restrict b3 = (const unsigned short*)C.hp[3] + ro;
+                if (tp_coll_avx2_on()) { tp_reduce4_bf16_avx2(b0, b1, b2, b3, o, slice, &s0); C.ssN[g][r] = s0; continue; }
                 for (int i = 0; i < slice; ++i) {
                     const float v = (q27_h_bf2f(b0[i]) + q27_h_bf2f(b1[i])) + (q27_h_bf2f(b2[i]) + q27_h_bf2f(b3[i]));
                     o[i] = v; s0 = fmaf(v, v, s0);
@@ -1271,12 +1671,20 @@ static void tp_allreduce_nr(TpColl& C, int g, int NR) {
         }
         C.ssN[g][r] = (s0 + s1) + (s2 + s3);
     }
+    const double t_c = tp_now();
     C.b2.wait();
+    const double t_d = tp_now();
     for (int r = 0; r < NR; ++r) {
         float tot = 0.f;
         for (int k = 0; k < C.ndev; ++k) tot += C.ssN[k][r];
         C.invN_h[g * 8 + r] = 1.0f / sqrtf(tot / (float)C.n + Q27_RMS_EPS);
     }
+    g_collt[g][1] += t_b - t_a;      // b1 skew
+    g_collt[g][2] += t_c - t_b;      // reduce arithmetic
+    g_collt[g][3] += t_d - t_c;      // b2 skew
+    g_collt[g][4] += tp_now() - t_d; // invN tail
+    if(g_timeline_sample)g_coll_points.push_back({g_timeline_req,g_timeline_pos,
+        int(C.n_coll[g] % 128),t_a,t_a,t_b,t_c,t_d,tp_now()});
 }
 
 // BATCHED ALL-REDUCE. Cch positions of the same layer share ONE rendezvous: the payload is
@@ -1292,8 +1700,8 @@ static void tp_allreduce_b(TpColl& C, int g, float* src, int Cch, hipStream_t st
     CK(hipStreamSynchronize(st));
     if (!tp_break_barrier() && g != g_bar_strand) C.b1.wait();
 
-    const int slice = C.n / C.ndev;
-    const int off   = g * slice;
+    const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: 5120 % 3 == 2 -> the last worker takes the remainder
+    const int off   = g * (C.n / C.ndev);
     const float* __restrict a0 = C.hp[0];
     const float* __restrict a1 = C.hp[1];
     const float* __restrict a2 = C.hp[2];
@@ -1344,14 +1752,100 @@ static void tp_allreduce_b(TpColl& C, int g, float* src, int Cch, hipStream_t st
 // tp_allreduce_b and leaves 1/rms per position in inv_hb2. Caller syncs ev_c2 first.
 // bc is the staging stride (positions per staging row). It is TpColl::BC for every chunk path; the
 // wide tile path passes Q27_PF_TSLOT because its collective covers a whole tile, not a chunk.
+// ---- SAFE CROSS-CARD COPY. 2026-09-18. -----------------------------------------------------
+// The layer-split ring handoff called hipMemcpyPeerAsync unconditionally and HIP dereferenced a
+// null inside it: SIGSEGV at 0x18, backtrace hipMemcpyPeerAsync <- run_tp's worker lambda.
+// hipMemcpyPeerAsync requires PEER ACCESS to be enabled for the (src,dst) pair. The engine enables
+// it in exactly two places and BOTH are gated -- the NR_P2P block additionally by `ndev == 4`, and
+// Q27_PF_P2P is off in the shipped recipe. So on any arm where neither gate fired, the ring handed
+// HIP a pair it had never mapped.
+// This does the peer copy when the pair is actually mapped and falls back to an ordinary
+// device-to-device async copy otherwise (the runtime stages that itself and needs no mapping).
+// It also refuses to call HIP with a null pointer or stream and says which one was null.
+static int q27_xcopy(void* dst, int ddev, const void* src, int sdev, size_t bytes,
+                     hipStream_t st, const char* tag) {
+    if (!dst || !src || !st) {
+        std::fprintf(stderr, "Q27_XCOPY %s: NULL arg (dst=%p src=%p stream=%p) d%d<-d%d %zu B\n",
+                     tag, dst, src, (void*)st, ddev, sdev, bytes);
+        std::fflush(stderr); return 0;
+    }
+    if (ddev == sdev) return hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, st) == hipSuccess;
+    static int peer_ok[Q27_MAX_DEVICES][Q27_MAX_DEVICES];
+    static std::atomic<int> probed{0};
+    static std::mutex probe_mu;
+    if (!probed.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(probe_mu);
+        if (!probed.load(std::memory_order_relaxed)) {
+            // CLAUSE 9: this helper touches other cards, so it MUST restore the caller's device on
+            // every exit path. Not doing so left the worker thread pointed at the wrong device and
+            // the next HIP call faulted inside the runtime.
+            int caller = 0; hipGetDevice(&caller);
+            int nd = 0; hipGetDeviceCount(&nd);
+            if (nd > Q27_MAX_DEVICES) nd = Q27_MAX_DEVICES;
+            for (int i = 0; i < nd; ++i) for (int j = 0; j < nd; ++j) {
+                if (i == j) { peer_ok[i][j] = 1; continue; }
+                int can = 0;
+                if (hipDeviceCanAccessPeer(&can, i, j) != hipSuccess || !can) { peer_ok[i][j] = 0;
+                    std::fprintf(stderr, "Q27_XCOPY probe: %d->%d canAccessPeer=%d => unmapped\n", i, j, can);
+                    continue; }
+                hipSetDevice(i);
+                hipError_t pe = hipDeviceEnablePeerAccess(j, 0);
+                peer_ok[i][j] = (pe == hipSuccess || pe == hipErrorPeerAccessAlreadyEnabled);
+                std::fprintf(stderr, "Q27_XCOPY probe: %d->%d can=%d enable=%s => %s\n", i, j, can,
+                             hipGetErrorName(pe), peer_ok[i][j] ? "MAPPED" : "unmapped");
+                (void)hipGetLastError();
+            }
+            hipSetDevice(caller);   // RESTORE, unconditionally
+            std::fprintf(stderr, "Q27_XCOPY: peer map probed, %d device(s), caller device %d restored\n", nd, caller);
+            std::fflush(stderr);
+            probed.store(1, std::memory_order_release);
+        }
+    }
+    if (ddev >= 0 && ddev < Q27_MAX_DEVICES && sdev >= 0 && sdev < Q27_MAX_DEVICES && peer_ok[ddev][sdev])
+        return hipMemcpyPeerAsync(dst, ddev, src, sdev, bytes, st) == hipSuccess;
+    // NO PEER MAPPING: stage through the host EXPLICITLY. hipMemcpyDeviceToDevice and even
+    // hipMemcpyDefault still fault across an unmapped pair on this runtime (SIGSEGV inside
+    // hipMemcpyAsync at +0x18). Two single-device copies need no peer mapping and no cross-device
+    // pointer resolution at all, so this cannot fault on an unmapped pair. It is synchronous and
+    // therefore slower -- correctness first; this is the fallback, not the fast path.
+    // CLAUSE 9: restore the caller's device on EVERY exit path.
+    {
+        int caller = 0; hipGetDevice(&caller);
+        // The caller queued the producer event on st. A synchronous copy on HIP's
+        // default stream does not honor a nonblocking stream's pending wait.
+        // Finish that dependency before the host reads the source allocation.
+        if (hipStreamSynchronize(st) != hipSuccess) {
+            std::fprintf(stderr, "Q27_XCOPY %s: handoff stream wait failed\n", tag);
+            return 0;
+        }
+        void* hbuf = nullptr;
+        if (hipHostMalloc(&hbuf, bytes, hipHostMallocDefault) != hipSuccess) {
+            std::fprintf(stderr, "Q27_XCOPY %s: host staging alloc of %zu B failed\n", tag, bytes);
+            std::fflush(stderr); hipSetDevice(caller); return 0;
+        }
+        int ok = 1;
+        if (hipSetDevice(sdev) != hipSuccess) ok = 0;
+        if (ok && hipMemcpy(hbuf, src, bytes, hipMemcpyDeviceToHost) != hipSuccess) ok = 0;
+        if (ok && hipSetDevice(ddev) != hipSuccess) ok = 0;
+        if (ok && hipMemcpy(dst, hbuf, bytes, hipMemcpyHostToDevice) != hipSuccess) ok = 0;
+        hipHostFree(hbuf);
+        hipSetDevice(caller);
+        if (!ok) { std::fprintf(stderr, "Q27_XCOPY %s: host-staged d%d<-d%d %zu B failed\n", tag, ddev, sdev, bytes); std::fflush(stderr); }
+        static int said = 0;
+        if (ok && !said) { said = 1; std::fprintf(stderr, "Q27_XCOPY: pair d%d<-d%d has no peer mapping; using host staging\n", ddev, sdev); std::fflush(stderr); }
+        return ok;
+    }
+}
+static void tp_reduce_bx_count() { g_host_coll_calls.fetch_add(1, std::memory_order_relaxed); }
 static void tp_reduce_bx(TpColl& C, int g, int Cch, float* const* hp, float* acc, float* ssb, float* inv_hb,
                          int bc = TpColl::BC) {
+    tp_reduce_bx_count();
     const bool tl = (C.ev_pre[0][g] != nullptr);
     const double q0 = tl ? tp_now() : 0.0;
     if (!tp_break_barrier() && g != g_bar_strand) C.b1.wait();
     const double q1 = tl ? tp_now() : 0.0;
-    const int slice = C.n / C.ndev;
-    const int off   = g * slice;
+    const int slice = C.n / C.ndev + ((g == C.ndev - 1) ? C.n % C.ndev : 0);   // Q27_TP3: 5120 % 3 == 2 -> the last worker takes the remainder
+    const int off   = g * (C.n / C.ndev);
     const float* __restrict a0 = hp[0];
     const float* __restrict a1 = hp[1];
     const float* __restrict a2 = hp[2];
@@ -1394,21 +1888,43 @@ static void tp_reduce_b2(TpColl& C, int g, int Cch) { tp_reduce_bx(C, g, Cch, C.
 
 // per-card scratch for TP. The residual/norm/activation buffers stay full width (they are a few
 // MB in total and every card holds the whole vector); only the STATE is shard-sized.
-static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
+// rndev = the REAL card count. ndev = the allocation width divisor, which layer-split sets to 1
+// so the scratch and the OWNED layers are full width. ls distinguishes the two regimes.
+static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx, int rndev, bool ls) {
     d.id = id; d.slots = 1;
     CK(hipSetDevice(id));
-    CK(hipStreamCreate(&d.stream));
+    // Avoid implicit default-stream dependencies between co-resident logical
+    // workers. Dependencies on this worker's own data are explicit.
+    CK(hipStreamCreateWithFlags(&d.stream, hipStreamNonBlocking));
     for (int k = 0; k < 4; ++k) { CK(hipStreamCreateWithFlags(&d.hs[k], hipStreamNonBlocking)); CK(hipEventCreateWithFlags(&d.ev_join[k], hipEventDisableTiming)); }
     CK(hipEventCreateWithFlags(&d.ev_fork, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&d.ev_state_ready, hipEventDisableTiming));
     CK(hipStreamCreateWithFlags(&d.s_cap, hipStreamNonBlocking)); CK(hipEventCreateWithFlags(&d.ev_cap, hipEventDisableTiming));
     { int lo = 0, hi = 0; CK(hipDeviceGetStreamPriorityRange(&lo, &hi));
       CK(hipStreamCreateWithPriority(&d.q8hi, hipStreamNonBlocking, hi));
       CK(hipStreamCreateWithPriority(&d.q8lo, hipStreamNonBlocking, lo)); }
     if (!q27_rb_init(d.id)) { std::fprintf(stderr, "rocBLAS init failed on device %d\n", d.id); std::exit(1); }
     const bool dbg_alloc = q27_env_flag("Q27_DEVALLOC_DBG", false);
-    auto A = [&](void** p, size_t b) { CK(hipMalloc(p, b)); CK(hipMemset(*p, 0, b));
-        if (dbg_alloc && b >= (size_t)32 * 1024 * 1024) { size_t fr = 0, tt = 0; CK(hipMemGetInfo(&fr, &tt));
-            std::fprintf(stderr, "Q27_DEVALLOC card %d bytes=%zu free_after=%.2f GiB\n", id, b, (double)fr / 1073741824.0); } };
+    // "Q27_HIP out of memory at q27_main.cpp:<this line>" names the SHARED lambda, so every
+    // allocation in this function reports the same file:line and identifies nothing. On failure
+    // say what was asked for and what was left -- that is the difference between a budget you can
+    // act on and a line number you cannot.
+    size_t a_total = 0;
+    auto A_impl = [&](void** p, size_t b, const char* name) {
+        const hipError_t e = hipMalloc(p, b);
+        if (e != hipSuccess) {
+            size_t fr = 0, tt = 0; hipMemGetInfo(&fr, &tt);
+            std::fprintf(stderr, "Q27_DEVALLOC_FAIL card %d requested=%zu (%.3f GiB) free=%.3f GiB "
+                                 "of %.3f GiB; granted so far=%.3f GiB\n",
+                         id, b, (double)b / 1073741824.0, (double)fr / 1073741824.0,
+                         (double)tt / 1073741824.0, (double)a_total / 1073741824.0);
+            std::fflush(stderr);
+            CK(e);
+        }
+        a_total += b;
+        CK(hipMemset(*p, 0, b));
+        if (dbg_alloc) std::fprintf(stderr,"Q27_ALLOC logical=%d ctx=%d name=%s bytes=%zu\n",id,ctx,name,b); };
+#define A(P,B) A_impl(P,B,#P)
     const size_t PA_ELEMS = (size_t)((Q27_INTER > Q27_VOCAB) ? Q27_INTER : Q27_VOCAB);
     A((void**)&d.hidden, Q27_HID * 2);      A((void**)&d.norm, Q27_HID * 2);
     A((void**)&d.mixer,  Q27_HID * 4);      A((void**)&d.xq, Q27_INTER);
@@ -1438,16 +1954,36 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
     const int  pf_div = pf_ls ? 1 : ndev;
     A((void**)&d.xq_slots, (size_t)Q27_PF_CH * Q27_HID);
     A((void**)&d.xs_slots, (size_t)Q27_PF_CH * (Q27_HID / 16) * 4);
-    A((void**)&d.pa_slots, (size_t)Q27_PF_CH * (Q27_VOCAB / ndev) * 4);   // the lm_head SHARD's rows
+    // The lm_head SHARD's rows. ndev is the ALLOCATION divisor, which layer-split sets to 1 so the
+    // scratch and the owned layers come out full width -- but Q27_VOCAB/1 is 4x the lm_head's actual
+    // row count (62080), and the batched head only ever writes Q27_PF_CH rows of it. Size by the REAL
+    // card count: 190 MB/card back at the 262K layer-split edge, where every card is the binding one.
+    // Only the card that OWNS the last layer runs the head in the layer-split sweep; every other card's
+    // pa_slots is 63 MB nobody writes. Ownership is derived exactly as q27_upload_ls and the sweep do.
+    // 2026-09-18: was an inline copy of the ownership modulo. It is now the oracle, so
+    // Q27_LS_OWN's uneven quotas move the head with the last layer instead of leaving
+    // pa_slots on a card that no longer owns it.
+    const bool pa_head = !ls || (q27_ls_owned(Q27_LAYERS - 1, id, rndev) != 0);
+    A((void**)&d.pa_slots, pa_head ? (size_t)Q27_PF_CH * (size_t)q27_tp_voc_max() * 4 : 16);
     A((void**)&d.xq1_slots, (size_t)pf_chw * Q27_HID);
     A((void**)&d.xs1_slots, (size_t)pf_chw * (Q27_HID / 16) * 4);
-    A((void**)&d.xq2_slots, (size_t)pf_chw * (Q27_INTER / pf_div));
-    A((void**)&d.xs2_slots, (size_t)pf_chw * ((Q27_INTER / pf_div) / 16) * 4);
+    A((void**)&d.xq2_slots, (size_t)pf_chw * mlp_len_div(id, pf_div));
+    A((void**)&d.xs2_slots, (size_t)pf_chw * (mlp_len_div(id, pf_div) / 16) * 4);
     A((void**)&d.mixq_slots, (size_t)pf_chw * (Q27_GDN_Z / pf_div));
     A((void**)&d.mixs_slots, (size_t)pf_chw * ((Q27_GDN_Z / pf_div) / 16) * 4);
-    A((void**)&d.pa_mlp, (size_t)pf_chw * (Q27_INTER / pf_div) * 4);
-    A((void**)&d.pb_mlp, (size_t)pf_chw * (Q27_INTER / pf_div) * 4);
+    A((void**)&d.pa_mlp, (size_t)pf_chw * mlp_len_div(id, pf_div) * 4);
+    A((void**)&d.pb_mlp, (size_t)pf_chw * mlp_len_div(id, pf_div) * 4);
     A((void**)&d.mixer_slots, (size_t)pf_chw * Q27_HID * 4);
+    if (g_tpsr && !ls) {   // Q27_TPSR: one layer's per-row int8 MLP shard (~67 MB at ndev=4) + its per-row scales
+        const size_t nr = (size_t)mlp_len(id);
+        A((void**)&d.tpsr_mw, 2 * nr * Q27_HID + (size_t)Q27_HID * nr);
+        A((void**)&d.tpsr_ms, (2 * nr + Q27_HID) * 4);
+        if (q27_env_flag("Q27_TPSR_NV", false))
+            A((void**)&d.tpsr_nv_s64, nr * Q27_HID / 64 * 4);
+        // prefill v2 projection transient: max(attn q|k|v+o, gdn in_qkv|in_z+out) int8 + per-row scales
+        A((void**)&d.tpsr_pw, ((size_t)(Q27_GDN_QKV + Q27_GDN_Z) / ndev) * Q27_HID + (size_t)Q27_HID * (Q27_OROWS / ndev));
+        A((void**)&d.tpsr_ps, ((size_t)(Q27_GDN_QKV + Q27_GDN_Z) / ndev + Q27_HID) * 4);
+    }
     A((void**)&d.mix2, (size_t)pf_chw * Q27_HID * 4);
     A((void**)&d.mix3, (size_t)pf_chw * Q27_HID * 4);
     A((void**)&d.mix4, (size_t)pf_chw * Q27_HID * 4);
@@ -1460,10 +1996,10 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
     if (g_pf_wide) {   // Q27_PF_WIDE: the tile-wide MLP chain (~17 MB), separate from every chunk buffer
         A((void**)&d.xq1_t, (size_t)Q27_PF_TSLOT * Q27_HID);
         A((void**)&d.xs1_t, (size_t)Q27_PF_TSLOT * (Q27_HID / 16) * 4);
-        A((void**)&d.pa_t,  (size_t)Q27_PF_TSLOT * (Q27_INTER / ndev) * 4);
-        A((void**)&d.pb_t,  (size_t)Q27_PF_TSLOT * (Q27_INTER / ndev) * 4);
-        A((void**)&d.xq2_t, (size_t)Q27_PF_TSLOT * (Q27_INTER / ndev));
-        A((void**)&d.xs2_t, (size_t)Q27_PF_TSLOT * ((Q27_INTER / ndev) / 16) * 4);
+        A((void**)&d.pa_t,  (size_t)Q27_PF_TSLOT * mlp_len(id) * 4);
+        A((void**)&d.pb_t,  (size_t)Q27_PF_TSLOT * mlp_len(id) * 4);
+        A((void**)&d.xq2_t, (size_t)Q27_PF_TSLOT * mlp_len(id));
+        A((void**)&d.xs2_t, (size_t)Q27_PF_TSLOT * (mlp_len(id) / 16) * 4);
         A((void**)&d.mix_t, (size_t)Q27_PF_TSLOT * Q27_HID * 4);
     }
     // Q27_PF_TSLOT positions per tile: the large-M prefill tile (PF_TILE) needs the norm /
@@ -1485,8 +2021,10 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
     A((void**)&d.a32,   (size_t)Q27_PF_SLOTS * Q27_GDN_VH * 4);
     A((void**)&d.b32,   (size_t)Q27_PF_SLOTS * Q27_GDN_VH * 4);
     A((void**)&d.hid32c,(size_t)pf_chw * Q27_HID * 4);
-    { size_t mlb = 0; const size_t ob = q27_attn_chunk_scratch_bytes(pf_div, pf_chw, &mlb); A((void**)&d.attn_pob, ob); A((void**)&d.attn_pml, mlb); }
-    A((void**)&d.w16_scratch, (size_t)(Q27_GDN_QKV / ndev) * Q27_HID * 2);
+    { size_t mlb = 0; const size_t ob = q27_attn_chunk_scratch_bytes(pf_div, pf_chw, &mlb); A((void**)&d.attn_pob, ob); A((void**)&d.attn_pml, mlb); d.attn_pob_bytes = ob; }
+    // Q27_PF_MK16 stages one projection's weights as fp16 pairs here; with the flag off (the default)
+    // nothing ever touches it, so do not spend 105 MB/card of the 262K layer-split budget on it.
+    A((void**)&d.w16_scratch, g_pf_mk16 ? (size_t)(Q27_GDN_QKV / ndev) * Q27_HID * 2 : 16);
     A((void**)&d.ab_tile, (size_t)Q27_PF_SLOTS * (Q27_GDN_VH / pf_div) * 2);
     A((void**)&d.bb_tile, (size_t)Q27_PF_SLOTS * (Q27_GDN_VH / pf_div) * 2);
     // mix_tile is written by the ATTENTION chunk path with M = Qch <= Q27_PF_CH, and by the GDN tile path
@@ -1500,16 +2038,29 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
         Q8Scr& s0 = d.q8s[0];
         s0.xqin = d.xqin_slots; s0.xsin = d.xsin_slots; s0.qkva8 = d.qkva8; s0.qkvas = d.qkvas; s0.qh = d.qh_slots;
         s0.pob = d.attn_pob; s0.pml = d.attn_pml; s0.mixq_slots = d.mixq_slots; s0.mixs_slots = d.mixs_slots;
+        s0.pob_bytes = d.attn_pob_bytes;
         s0.qkv8 = d.qkv8; s0.qkvs = d.qkvs; s0.z8 = d.z8; s0.zs = d.zs; s0.a32 = d.a32; s0.b32 = d.b32;
         s0.mixq_tile = d.mixq_tile; s0.mixs_tile = d.mixs_tile; s0.part = d.part_slots; s0.xq1 = d.xq1_slots; s0.xs1 = d.xs1_slots;
         s0.pa = d.pa_mlp; s0.pb = d.pb_mlp; s0.xq2 = d.xq2_slots; s0.xs2 = d.xs2_slots; s0.mixer = d.mixer_slots; s0.hid32c = d.hid32c;
+        // Q27_LS_ONE_SET: ONE chunk-scratch set instead of two. The second set exists so two ring
+        // jobs can be in flight; at ctx=262144 it costs 680 MB/card (pob 403 MB + acc 178 MB + the
+        // rest), and 680 MB is the difference between the layer-split product fitting on the head
+        // card -- which carries the full lm_head on top of everything else -- and not fitting. Set 1
+        // ALIASES set 0 rather than being dropped, so every existing `q8s[k & 1]` reference stays
+        // valid and the ring simply serializes: correct at any width, just without the overlap.
+        const bool ls_one = ls && q27_env_flag("Q27_LS_ONE_SET", false);
+        // NOTE: the alias happens AFTER the stage-3 loop below. Copying set 0 here would capture it
+        // while its rocBLAS scratch (acc/xqt/xst/...) is still null, and every odd ring chunk would
+        // then decline the input norm ("Q27_LS_Q8: input norm tok declined") the moment the rocBLAS
+        // path is live -- which is exactly the fast int8 Tensile configuration.
+        if (!ls_one) {
         Q8Scr& s1 = d.q8s[1];
         A((void**)&s1.xqin, (size_t)Q27_PF_SLOTS * Q27_HID);
         A((void**)&s1.xsin, (size_t)Q27_PF_SLOTS * (Q27_HID / 16) * 4);
         A((void**)&s1.qkva8, (size_t)pf_chw * (Q27_QROWS + 2 * Q27_KVROWS));
         A((void**)&s1.qkvas, (size_t)pf_chw * ((Q27_QROWS + 2 * Q27_KVROWS) / 16) * 4);
         A((void**)&s1.qh, (size_t)pf_chw * (Q27_OROWS / pf_div) * 4);
-        { size_t mlb = 0; const size_t ob = q27_attn_chunk_scratch_bytes(pf_div, pf_chw, &mlb); A((void**)&s1.pob, ob); A((void**)&s1.pml, mlb); }
+        { size_t mlb = 0; const size_t ob = q27_attn_chunk_scratch_bytes(pf_div, pf_chw, &mlb); A((void**)&s1.pob, ob); A((void**)&s1.pml, mlb); s1.pob_bytes = ob; }
         A((void**)&s1.mixq_slots, (size_t)pf_chw * (Q27_GDN_Z / pf_div));
         A((void**)&s1.mixs_slots, (size_t)pf_chw * ((Q27_GDN_Z / pf_div) / 16) * 4);
         A((void**)&s1.qkv8,  (size_t)pf_chw * Q27_GDN_QKV);
@@ -1523,42 +2074,216 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
         A((void**)&s1.part,  (size_t)pf_chw * Q27_HID * 4);
         A((void**)&s1.xq1,   (size_t)pf_chw * Q27_HID);
         A((void**)&s1.xs1,   (size_t)pf_chw * (Q27_HID / 16) * 4);
-        A((void**)&s1.pa,    (size_t)pf_chw * (Q27_INTER / pf_div) * 4);
-        A((void**)&s1.pb,    (size_t)pf_chw * (Q27_INTER / pf_div) * 4);
-        A((void**)&s1.xq2,   (size_t)pf_chw * (Q27_INTER / pf_div));
-        A((void**)&s1.xs2,   (size_t)pf_chw * ((Q27_INTER / pf_div) / 16) * 4);
+        A((void**)&s1.pa,    (size_t)pf_chw * mlp_len_div(id, pf_div) * 4);
+        A((void**)&s1.pb,    (size_t)pf_chw * mlp_len_div(id, pf_div) * 4);
+        A((void**)&s1.xq2,   (size_t)pf_chw * mlp_len_div(id, pf_div));
+        A((void**)&s1.xs2,   (size_t)pf_chw * (mlp_len_div(id, pf_div) / 16) * 4);
         A((void**)&s1.mixer, (size_t)pf_chw * Q27_HID * 4);
         A((void**)&s1.hid32c,(size_t)pf_chw * Q27_HID * 4);
-        for (int si = 0; si < 2; ++si) {   // stage 3 (rocBLAS) scratch, both sets
+        }
+        for (int si = 0; si < (ls_one ? 1 : 2); ++si) {   // stage 3 (rocBLAS) scratch, both sets
             Q8Scr& sx = d.q8s[si];
             A((void**)&sx.acc, (size_t)pf_chw * 2 * Q27_INTER * (Q27_HID / 1024) * 4); A((void**)&sx.xqt, (size_t)pf_chw * Q27_HID);   // int32 slabs: 2 matrices x K/1024 groups
             A((void**)&sx.xst, (size_t)pf_chw * (Q27_HID / 1024) * 4); A((void**)&sx.xst1, (size_t)pf_chw * (Q27_HID / 1024) * 4); A((void**)&sx.xst2, (size_t)pf_chw * (Q27_INTER / 1024) * 4);
             A((void**)&sx.mixq_t, (size_t)pf_chw * (Q27_GDN_Z > Q27_OROWS ? Q27_GDN_Z : Q27_OROWS)); A((void**)&sx.mixs_t, (size_t)pf_chw * ((Q27_GDN_Z > Q27_OROWS ? Q27_GDN_Z : Q27_OROWS) / 1024) * 4);
             A((void**)&sx.qkvc8, (size_t)pf_chw * Q27_GDN_QKV); A((void**)&sx.qkvcs, (size_t)pf_chw * (Q27_GDN_QKV / 16) * 4);
         }
+        // Set 1 ALIASES set 0, now that set 0 is fully populated: every existing q8s[k & 1]
+        // reference stays valid and the ring simply serializes instead of overlapping.
+        if (ls_one) d.q8s[1] = d.q8s[0];
+    }
+    // ALLOCATED BEFORE THE CTX-SCALED STATE, ON PURPOSE. Allocation order decides whether a
+    // buffer lands in HBM or GTT -- the engine already banks that "once the fp8 arena is released
+    // the banks/slots land in HBM instead of GTT (the p1k K=7 collapse)". Allocating this arena
+    // last put 271 MiB of MLP weights in host memory, and every GEMM then read them over PCIe:
+    // a 135-token prefill took 305 s and decode fell to 1.27 tok/s. It has to be HBM.
+    if (q27_env_int("Q27_LS_MLP_STAGE", 0)) {
+        // gate [INTER][HID] | up [INTER][HID] | down [HID][INTER], int8 + per-64 fp32 scales.
+        // Mode 1: gate|up|down (271 MiB). Mode 2: down ONLY (90 MiB).
+        // The headroom is NOT the 1.04 GiB that hipMemGetInfo reports as free -- measured, the
+        // driver collapses into continuous eviction somewhere between 0.78 and 1.04 GiB free
+        // (135-token prefill 89 s, decode 1.77 tok/s). 271 MiB does not fit inside that margin;
+        // 90 MiB plausibly does, and down is the projection most likely to dominate.
+        const int stage_mode = q27_env_int("Q27_LS_MLP_STAGE", 0);
+        const size_t wb = ((stage_mode == 2) ? (size_t)Q27_HID * Q27_INTER
+                                            : (size_t)Q27_INTER * Q27_HID * 2 + (size_t)Q27_HID * Q27_INTER)
+                          * (size_t)Dev::MLP8_SLOTS;
+        const size_t sb = ((stage_mode == 2) ? (size_t)Q27_HID * (Q27_INTER / 64)
+                                             : (size_t)Q27_INTER * (Q27_HID / 64) * 2 + (size_t)Q27_HID * (Q27_INTER / 64))
+                          * 4 * (size_t)Dev::MLP8_SLOTS;
+        if (hipMalloc((void**)&d.mlp8_w, wb) != hipSuccess || hipMalloc((void**)&d.mlp8_s, sb) != hipSuccess) {
+            std::fprintf(stderr, "Q27_LS_MLP_STAGE card %d: arena allocation failed (%.1f MiB); "
+                                 "falling back to in-kernel NVFP4\n", id, (double)(wb + sb) / 1048576.0);
+            d.mlp8_w = nullptr; d.mlp8_s = nullptr;
+        } else {
+            size_t fr = 0, tt = 0; CK(hipMemGetInfo(&fr, &tt));
+            std::fprintf(stderr, "Q27_LS_MLP_STAGE card %d: %.1f MiB layer-local int8 MLP arena, "
+                                 "free after %.2f GiB\n", id, (double)(wb + sb) / 1048576.0,
+                         (double)fr / 1073741824.0);
+        }
+        // Q27_LS_MLP_RB: the row-form scales. One float per row per tensor per slot, so this is
+        // 4 slots x (2*INTER + HID) floats = 624 KiB -- noise next to the 1.07 GiB of weights it
+        // describes, and it is what makes gate/up/down single full-K int8 GEMMs for Tensile.
+        if (q27_env_int("Q27_LS_MLP_RB", 0) && stage_mode != 2 && d.mlp8_w && d.mlp8_s) {
+            const size_t rs = (size_t)(2 * Q27_INTER + Q27_HID) * Dev::MLP8_SLOTS * sizeof(float);
+            if (hipMalloc((void**)&d.mlp8_rs, rs) != hipSuccess) {
+                std::fprintf(stderr, "Q27_LS_MLP_RB card %d: row-scale arena allocation failed (%.1f KiB); "
+                                     "falling back to in-kernel NVFP4\n", id, (double)rs / 1024.0);
+                d.mlp8_rs = nullptr;
+            } else {
+                size_t fr = 0, tt = 0; CK(hipMemGetInfo(&fr, &tt));
+                std::fprintf(stderr, "Q27_LS_MLP_RB card %d: %.1f MiB arena + %.1f KiB row scales, "
+                                     "free after %.2f GiB\n", id, (double)(wb + sb) / 1048576.0,
+                             (double)rs / 1024.0, (double)fr / 1073741824.0);
+            }
+        }
+        std::fflush(stderr);
     }
     // shard-sized recurrent state / KV cache: 48/ndev value heads, 1024/ndev KV rows per position
     const int n_gdn = Q27_LAYERS - Q27_LAYERS / 4, n_full = Q27_LAYERS / 4;   // 48 / 16
-    d.tp_s    = (size_t)(Q27_GDN_VH / ndev) * Q27_GDN_D * Q27_GDN_D;          // per layer
-    d.tp_conv = (size_t)(Q27_GDN_QKV / ndev) * Q27_GDN_CONV;                  // per layer
-    d.tp_kv   = (size_t)ctx * (Q27_KVROWS / ndev);                            // per layer
-    A((void**)&d.S,    d.tp_s    * (size_t)n_gdn  * 4);
-    A((void**)&d.conv, d.tp_conv * (size_t)n_gdn  * 2);
-    d.tp_kvs = d.tp_kv / 16;
-    A((void**)&d.kc,   d.tp_kv   * (size_t)n_full);
-    A((void**)&d.ks,   d.tp_kvs  * (size_t)n_full * 4);
-    A((void**)&d.vc,   d.tp_kv   * (size_t)n_full);
-    A((void**)&d.vs,   d.tp_kvs  * (size_t)n_full * 4);
+    // Q27_TP3: ndev here is the allocation divisor (1 under layer-split = full width); the
+    // worker's narrow shard sizes come from the plan table.
+    const q27_tp_shard_t* const TS = q27_tp_shard(id);
+    d.tp_s    = (size_t)(ndev == 1 ? Q27_GDN_VH : TS->VHL) * Q27_GDN_D * Q27_GDN_D;   // per layer
+    d.tp_conv = (size_t)(ndev == 1 ? Q27_GDN_QKV : TS->QKVL) * Q27_GDN_CONV;          // per layer
+    d.tp_kv   = (size_t)ctx * (ndev == 1 ? Q27_KVROWS : TS->KVL);                     // per layer
+    d.tp_kvs  = d.tp_kv / 16;
+    // OWNERSHIP, derived exactly as q27_upload_ls and the sweep derive it: same env vars, same
+    // defaults, same clamp. It MUST agree with both, or a card would address a layer it does not
+    // hold -- that agreement is the whole precondition for storing non-owned layers narrow.
+    const int ls_blk_A = q27_ls_blk_eff(rndev);   // Q27_TP3: quota-aware block size (same oracle as the loader)
+    (void)q27_env_int("Q27_LS_BAL", 0);   // read+applied by q27_ls_block_owner; kept for the boot-time env audit
+    // 2026-09-18: the oracle, not a fourth copy of the modulo. ls_bal_A is now unused here --
+    // Q27_LS_BAL is applied inside q27_ls_block_owner so the uneven-quota path cannot disagree.
+    auto owner_A = [&](int L) { return q27_ls_block_owner(L / ls_blk_A, rndev); };
+    const int KVL_R = TS->KVL;                     // the KV-head range TP decode reads (ragged under Q27_TP3)
+    const int KVH_OFF = Q27_HDIM * TS->kv_h0;      // its column offset inside a full-width row
+    size_t kc_el = 0, ks_fl = 0, s_fl = 0, cv_el = 0;
+    for (int L = 0; L < Q27_LAYERS; ++L) {
+        const bool own = !ls || owner_A(L) == id;
+        if (Q27_IS_FULL(L)) {
+            const int fs = L >> 2;
+            // Q27_PF_P2P: the owner's FULL-WIDTH copy of its own layers is the last duplicate in
+            // the KV. Every non-owned quarter of an owned layer already exists on the card that
+            // owns that head -- the owner keeps a second copy of all four quarters purely so its
+            // prefill attention can read them locally. With peer access enabled (it already is,
+            // hipDeviceEnablePeerAccess at ~3710) the sweep can read the three remote quarters
+            // straight out of the peers, and every card stores exactly the quarter TP decode
+            // reads. Measured at ctx=262144, LS_BLK=4: kc+vc+scales 4.375 -> 2.500 GiB/card.
+            static const bool p2pkv = q27_env_flag("Q27_PF_KVP2P", false);
+            // Q27_LS_SR: a layer this card does not own is not decoded here either, so it stores
+            // NOTHING -- the 12 head-quarters (1.27 GiB/card at 262K) were the TP decode's.
+            const int stride = (g_sr && !own) ? 0 : ((!ls || p2pkv) ? KVL_R : (own ? Q27_KVROWS : KVL_R));
+            d.kv_rowstride[fs] = stride;
+            d.kv_hoff[fs]      = (!ls || !own || p2pkv) ? 0 : KVH_OFF;
+            d.kv_hoff_peer[fs] = ls ? KVH_OFF : 0;      // always this card's heads in a full-width row
+            d.kv_off[fs]    = kc_el;
+            d.kvs_off[fs]   = ks_fl;
+            d.kv_bytes[fs]  = (size_t)ctx * stride;
+            d.kvs_bytes[fs] = (size_t)ctx * (stride / 16) * (int)sizeof(q27_kvs_t);
+            kc_el += (size_t)ctx * stride;
+            ks_fl += (size_t)ctx * (stride / 16);
+        } else {
+            const int gs = L - (L >> 2);
+            const size_t s_narrow = (size_t)TS->VHL * Q27_GDN_D * Q27_GDN_D, c_narrow = (size_t)TS->QKVL * Q27_GDN_CONV;
+            const size_t sw = (g_sr && !own) ? 0 : ((!ls || own) ? d.tp_s    : s_narrow);
+            const size_t cw = (g_sr && !own) ? 0 : ((!ls || own) ? d.tp_conv : c_narrow);
+            d.s_off[gs]      = s_fl;
+            d.conv_off[gs]   = cv_el;
+            d.s_qoff[gs]     = (!ls || !own) ? 0 : (size_t)TS->gv_h0 * Q27_GDN_D * Q27_GDN_D;
+            d.conv_qoff[gs]  = 0;   // conv is packed q|k|v: no contiguous quarter (unused)
+            d.conv_wide[gs]  = (ls && own) ? 1 : 0;
+            d.s_bytes[gs]    = sw * 4;
+            d.conv_bytes[gs] = cw * 2;
+            s_fl  += sw;
+            cv_el += cw;
+        }
+    }
+    A((void**)&d.S,    s_fl * 4);
+    A((void**)&d.conv, cv_el * 2);
+    d.s_bytes_total = s_fl * 4; d.conv_bytes_total = cv_el * 2;
+    // Q27_REWIND_CK banks of the WHOLE recurrent state. Priced before allocating (the
+    // affordability rule): the tightest card decides, and a bank is s_bytes_total +
+    // conv_bytes_total. Allocated here so a failure is reported by the same A() that names the
+    // request and the remaining free VRAM, not as a mystery OOM later.
+    if (q27_rewind_ck() > 0) {
+        A((void**)&d.ck_S,    (size_t)q27_rewind_ck() * d.s_bytes_total);
+        A((void**)&d.ck_conv, (size_t)q27_rewind_ck() * d.conv_bytes_total);
+        if (id == 0) std::fprintf(stderr, "Q27_REWIND_CK %d banks x %.1f MiB = %.2f GiB/card "
+                                          "(S %.1f + conv %.1f MiB)\n", q27_rewind_ck(),
+                     (double)(d.s_bytes_total + d.conv_bytes_total) / 1048576.0,
+                     (double)q27_rewind_ck() * (d.s_bytes_total + d.conv_bytes_total) / 1073741824.0,
+                     (double)d.s_bytes_total / 1048576.0, (double)d.conv_bytes_total / 1048576.0);
+    }
+    A((void**)&d.kc,   kc_el);
+    A((void**)&d.ks,   ks_fl * sizeof(q27_kvs_t));
+#if Q27_V4
+    A((void**)&d.vc,   kc_el / 2);                       // packed bitplanes: stride/2 bytes per row
+    A((void**)&d.vs,   ks_fl / 2 * sizeof(q27_kvs_t));   // one block max per 32 dims, not per 16
+#else
+    A((void**)&d.vc,   kc_el);
+    A((void**)&d.vs,   ks_fl * sizeof(q27_kvs_t));
+#endif
+    {   // BOUNDS, CHECKED AT ALLOCATION. kv_off[]/kvs_off[] are FULL-WIDTH offsets (they are K's),
+        // and V4 halves both V planes, so every V base must pass through Q27_VOFF/Q27_VSOFF. Eight
+        // call sites did not, and the engine's first dispatched prefill job walked off vc on a
+        // 130-token prompt (2026-09-16). A page fault names an address; this names the layer. The
+        // check is arithmetic on ~16 entries at boot and is identity-true in the V4=0 arm.
+        const size_t vcb = (size_t)Q27_VOFF(kc_el), vsb = (size_t)Q27_VSOFF(ks_fl) * sizeof(q27_kvs_t);
+        for (int fsb = 0; fsb < n_full; ++fsb) {
+            const size_t ve = (size_t)Q27_VOFF(d.kv_off[fsb]) + (size_t)Q27_VOFF(d.kv_bytes[fsb]);
+            const size_t se = ((size_t)Q27_VSOFF(d.kvs_off[fsb])
+                             + (size_t)Q27_VSOFF(d.kvs_bytes[fsb] / sizeof(q27_kvs_t))) * sizeof(q27_kvs_t);
+            if (ve > vcb || se > vsb) {
+                std::fprintf(stderr, "Q27_KVBOUNDS FATAL card %d full-layer %d: vc end %zu of %zu, "
+                                     "vs end %zu of %zu -- a V base is missing Q27_VOFF/Q27_VSOFF\n",
+                             id, fsb, ve, vcb, se, vsb);
+                std::fflush(stderr); std::exit(1);
+            }
+        }
+    }
+    if (q27_env_flag("Q27_KVPLACE", false))
+#if Q27_V4
+        std::fprintf(stderr, "Q27_KVPLACE card %d ls=%d kc=%.3f GiB vc=%.3f GiB ks=%.3f GiB vs=%.3f GiB "
+                             "S=%.1f MiB conv=%.1f MiB\n", id, (int)ls,
+                     (double)kc_el / 1073741824.0, (double)(kc_el / 2) / 1073741824.0,
+                     (double)(ks_fl * sizeof(q27_kvs_t)) / 1073741824.0,
+                     (double)(ks_fl / 2 * sizeof(q27_kvs_t)) / 1073741824.0,
+                     (double)(s_fl * 4) / 1048576.0, (double)(cv_el * 2) / 1048576.0);
+#else
+        std::fprintf(stderr, "Q27_KVPLACE card %d ls=%d kc/vc=%.3f GiB each ks/vs=%.3f GiB each "
+                             "S=%.1f MiB conv=%.1f MiB\n", id, (int)ls,
+                     (double)kc_el / 1073741824.0, (double)(ks_fl * sizeof(q27_kvs_t)) / 1073741824.0,
+                     (double)(s_fl * 4) / 1048576.0, (double)(cv_el * 2) / 1048576.0);
+#endif
     if (q27_env_flag("Q27_KCDBG", false)) std::fprintf(stderr, "Q27_KCDBG alloc id=%d ndev=%d ctx=%d tp_kv=%zu n_full=%d kc=%p\n", id, ndev, ctx, d.tp_kv, n_full, (const void*)d.kc);
     // MTP draft KV: the draft layer is REPLICATED and runs at FULL width, so its cache is a full
     // ctx*Q27_KVROWS per layer -- NOT the TP shard stride tp_kv, which is 4x smaller at ndev=4.
     // Carving it out of d.kc with the shard stride made the full-width attention kernel write past
     // the end of the allocation: a GPU page fault at the SAME address on every run, which is what
     // identified it (a staging-buffer bug would have moved when the staging allocation changed).
-    A((void**)&d.mtp_kc, (size_t)ctx * Q27_KVROWS);
-    A((void**)&d.mtp_ks, (size_t)ctx * (Q27_KVROWS / 16) * 4);
-    A((void**)&d.mtp_vc, (size_t)ctx * Q27_KVROWS);
-    A((void**)&d.mtp_vs, (size_t)ctx * (Q27_KVROWS / 16) * 4);
+    // GROW ON DEMAND. Sized for the full context this is 640 MiB per card at ctx=262144 -- and it
+    // is REPLICATED, so it is 640 MiB on all four. For a 9K turn ~97% of that is dead capacity:
+    // the draft only ever addresses positions that exist. Start small and grow as the conversation
+    // does (q27_mtp_kv_reserve). The 262144 capability is unchanged -- capacity is reached by
+    // growing, not by reserving it up front. No math change, no communication change, no change to
+    // the draft's full-width replication.
+    d.mtp_cap = q27_env_int("Q27_MTP_KV_CAP0", 16384);
+    if (d.mtp_cap > ctx) d.mtp_cap = ctx;
+    if (d.mtp_cap < 1024) d.mtp_cap = 1024;
+    if (!q27_env_int("Q27_MTP_PAGED", 1)) d.mtp_cap = ctx;      // =0 restores the up-front reservation
+    if (g_sr && !pa_head) d.mtp_cap = 0;   // Q27_LS_SR: the draft layer and its KV live on the head card only
+    if (d.mtp_cap > 0) {
+    A((void**)&d.mtp_kc, (size_t)d.mtp_cap * Q27_KVROWS);
+    A((void**)&d.mtp_ks, (size_t)d.mtp_cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t));
+#if Q27_V4
+    A((void**)&d.mtp_vc, (size_t)d.mtp_cap * (Q27_KVROWS / 2));
+    A((void**)&d.mtp_vs, (size_t)d.mtp_cap * (Q27_KVROWS / 32) * sizeof(q27_kvs_t));
+#else
+    A((void**)&d.mtp_vc, (size_t)d.mtp_cap * Q27_KVROWS);
+    A((void**)&d.mtp_vs, (size_t)d.mtp_cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t));
+#endif
+    }   // d.mtp_cap > 0
     if (q27_env_flag("Q27_SPEC", true)) {   // Q27_SPEC (shipped default on): NR-row verify buffers, full width (fits any TP degree)
         const size_t NRM = 8;   // Q27_SPEC: scratch holds K+1 <= 8 verify rows (the NR kernels run chunks of <= 4)
         A((void**)&d.nr_norm, NRM * Q27_HID * 2);
@@ -1571,6 +2296,7 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
         A((void**)&d.nr_ab,   NRM * Q27_GDN_VH * 2);  A((void**)&d.nr_bb, NRM * Q27_GDN_VH * 2);
         A((void**)&d.nr_mix6, NRM * Q27_GDN_Z * 2);
         A((void**)&d.nr_pa,   NRM * PA_ELEMS * 4);    A((void**)&d.nr_pb, NRM * PA_ELEMS * 4);
+        A((void**)&d.nr_acc,  NRM * Q27_HID * 4);
         A((void**)&d.nr_mixer, NRM * Q27_HID * 4);
         A((void**)&d.nr_tok, 64); d.nr_val = (float*)(d.nr_tok + 8);
         CK(hipHostMalloc((void**)&d.nr_mail_h, 64, hipHostMallocDefault)); std::memset(d.nr_mail_h, 0, 64);
@@ -1581,6 +2307,193 @@ static void dev_alloc_tp(Dev& d, int id, int ndev, int ctx) {
                            if (hipHostMalloc((void**)&d.df2_pf_taps_h, (size_t)5 * (size_t)g_pf_cap * Q27_HID * 2, hipHostMallocDefault) != hipSuccess) d.df2_pf_taps_h = nullptr; }
         CK(hipHostMalloc((void**)&d.nr_ebounce, (size_t)32 * Q27_HID * 2, hipHostMallocDefault));
     }
+#undef A
+
+}
+
+// EXPORT ONE FULL-ATTENTION LAYER'S KV FROM ITS OWNER TO A CARD THAT DOES NOT OWN IT.
+// The owner ran layer-split prefill on this layer and holds it FULL WIDTH: rows of Q27_KVROWS
+// with this card's heads at kv_hoff. The destination stores only the head-quarter TP decode
+// reads, contiguous at stride KVROWS/ndev. So this is a strided 2D transfer of the quarter over
+// the npos positions the sweep actually produced -- not the whole row, and not the whole ctx.
+// Both of those were in the original: it copied every head to every card for every layer, and
+// the post-sweep path copied all ctx positions rather than the prefix.
+static void q27_export_kv_quarter(Dev& dst, Dev& src, int fs, int beg, int end, hipStream_t st) {
+    if (!q27_env_flag("Q27_KV_DELTA", false)) beg = 0;
+    const int npos = end - beg;
+    if (npos <= 0) return;
+    const int w  = dst.kv_rowstride[fs];             // destination row = the quarter
+    const int sw = src.kv_rowstride[fs];             // source row = the owner's full width
+    const int hoff = dst.kv_hoff_peer[fs];        // this card's heads inside the owner's row
+    CK(hipMemcpy2DAsync(dst.kc + (dst.kv_off[fs] + (size_t)beg * w), (size_t)w,
+                        src.kc + (src.kv_off[fs] + (size_t)beg * sw) + hoff, (size_t)sw,
+                        (size_t)w, (size_t)npos, hipMemcpyDeviceToDevice, st));
+#if Q27_V4
+    // V4: half a byte per dim and one max per 32 dims, so both the row stride and the head offset
+    // halve; the K copies above and the K scales below are untouched.
+    CK(hipMemcpy2DAsync(dst.vc + (dst.kv_off[fs] + (size_t)beg * w) / 2, (size_t)(w / 2),
+                        src.vc + (src.kv_off[fs] + (size_t)beg * sw) / 2 + hoff / 2, (size_t)(sw / 2),
+                        (size_t)(w / 2), (size_t)npos, hipMemcpyDeviceToDevice, st));
+#else
+    CK(hipMemcpy2DAsync(dst.vc + (dst.kv_off[fs] + (size_t)beg * w), (size_t)w,
+                        src.vc + (src.kv_off[fs] + (size_t)beg * sw) + hoff, (size_t)sw,
+                        (size_t)w, (size_t)npos, hipMemcpyDeviceToDevice, st));
+#endif
+    CK(hipMemcpy2DAsync(dst.ks + (dst.kvs_off[fs] + (size_t)beg * (w / 16)), (size_t)(w / 16) * sizeof(q27_kvs_t),
+                        src.ks + (src.kvs_off[fs] + (size_t)beg * (sw / 16)) + hoff / 16, (size_t)(sw / 16) * sizeof(q27_kvs_t),
+                        (size_t)(w / 16) * sizeof(q27_kvs_t), (size_t)npos, hipMemcpyDeviceToDevice, st));
+#if Q27_V4
+    CK(hipMemcpy2DAsync(dst.vs + (dst.kvs_off[fs] + (size_t)beg * (w / 16)) / 2, (size_t)(w / 32) * sizeof(q27_kvs_t),
+                        src.vs + (src.kvs_off[fs] + (size_t)beg * (sw / 16)) / 2 + hoff / 32, (size_t)(sw / 32) * sizeof(q27_kvs_t),
+                        (size_t)(w / 32) * sizeof(q27_kvs_t), (size_t)npos, hipMemcpyDeviceToDevice, st));
+#else
+    CK(hipMemcpy2DAsync(dst.vs + (dst.kvs_off[fs] + (size_t)beg * (w / 16)), (size_t)(w / 16) * sizeof(q27_kvs_t),
+                        src.vs + (src.kvs_off[fs] + (size_t)beg * (sw / 16)) + hoff / 16, (size_t)(sw / 16) * sizeof(q27_kvs_t),
+                        (size_t)(w / 16) * sizeof(q27_kvs_t), (size_t)npos, hipMemcpyDeviceToDevice, st));
+#endif
+}
+
+// Conv state is packed q|k|v, not four contiguous worker quarters. Each channel
+// has CONV BF16 history values. Preserve the three segment boundaries in both directions.
+static void q27_copy_conv_quarter(Dev& owner, Dev& shard, int gs, int worker,
+                                  int ndev, bool gather, hipStream_t st) {
+    const int widths[3] = {Q27_GDN_KH * Q27_GDN_D, Q27_GDN_KH * Q27_GDN_D,
+                           Q27_GDN_VH * Q27_GDN_D};
+    // Q27_TP3: the worker's key-head range inside each packed segment (q, k: 128 channels per key
+    // head; v: 384), from the plan table rather than an equal split.
+    const q27_tp_shard_t* const W = q27_tp_shard(worker);
+    const size_t seg_off[3] = {(size_t)Q27_GDN_D * W->gk_h0, (size_t)Q27_GDN_D * W->gk_h0, (size_t)3 * Q27_GDN_D * W->gk_h0};
+    const size_t seg_len[3] = {(size_t)Q27_GDN_D * W->gk_hn, (size_t)Q27_GDN_D * W->gk_hn, (size_t)3 * Q27_GDN_D * W->gk_hn};
+    (void)ndev;
+    size_t full = 0, narrow = 0;
+    for (int i = 0; i < 3; ++i) {
+        const int n = widths[i];
+        const size_t count = seg_len[i] * Q27_GDN_CONV;
+        auto* op = owner.conv + owner.conv_off[gs] + full + seg_off[i] * Q27_GDN_CONV;
+        auto* sp = shard.conv + shard.conv_off[gs] + narrow;
+        if (gather) CK(hipMemcpyPeerAsync(op, owner.id, sp, shard.id, count * 2, st));
+        else CK(hipMemcpyPeerAsync(sp, shard.id, op, owner.id, count * 2, st));
+        full += (size_t)n * Q27_GDN_CONV; narrow += count;
+    }
+}
+
+// Refresh only newly decoded KV positions in the full layer owner's cache.
+static void q27_gather_kv_quarter(Dev& dst, Dev& src, int fs, int beg, int end, hipStream_t st) {
+    if (end <= beg) return;
+    const size_t dw = dst.kv_rowstride[fs], sw = src.kv_rowstride[fs];
+    const size_t hoff = src.kv_hoff_peer[fs], height = end - beg;
+    CK(hipMemcpy2DAsync(dst.kc + dst.kv_off[fs] + (size_t)beg*dw + hoff, dw,
+        src.kc + src.kv_off[fs] + (size_t)beg*sw, sw, sw, height, hipMemcpyDeviceToDevice, st));
+    CK(hipMemcpy2DAsync(dst.vc + Q27_VOFF(dst.kv_off[fs] + (size_t)beg*dw + hoff), Q27_VOFF(dw),
+        src.vc + Q27_VOFF(src.kv_off[fs] + (size_t)beg*sw), Q27_VOFF(sw), Q27_VOFF(sw), height, hipMemcpyDeviceToDevice, st));
+    CK(hipMemcpy2DAsync(dst.ks + dst.kvs_off[fs] + ((size_t)beg*dw + hoff)/16, dw/16*sizeof(q27_kvs_t),
+        src.ks + src.kvs_off[fs] + (size_t)beg*sw/16, sw/16*sizeof(q27_kvs_t), sw/16*sizeof(q27_kvs_t), height, hipMemcpyDeviceToDevice, st));
+    CK(hipMemcpy2DAsync(dst.vs + Q27_VSOFF(dst.kvs_off[fs] + ((size_t)beg*dw + hoff)/16), Q27_VSOFF(dw/16)*sizeof(q27_kvs_t),
+        src.vs + Q27_VSOFF(src.kvs_off[fs] + (size_t)beg*sw/16), Q27_VSOFF(sw/16)*sizeof(q27_kvs_t), Q27_VSOFF(sw/16)*sizeof(q27_kvs_t), height, hipMemcpyDeviceToDevice, st));
+}
+
+// GROW THE DRAFT KV TO COVER `need` POSITIONS.
+// Called at the sweep boundary, where the stream is quiescent for this card and every consumer
+// re-reads d.mtp_* (nothing caches the pointers across a request). Doubling keeps the number of
+// grows logarithmic; the live prefix is copied so already-written draft KV survives. Returns
+// false only if the device cannot satisfy the larger allocation, in which case the caller keeps
+// the smaller one and the engine refuses the window as it would have before.
+static bool q27_mtp_kv_reserve(Dev& d, int need, int ctx) {
+    if (need <= d.mtp_cap) return true;
+    // GROW TO WHAT THE WINDOW NEEDS, NOT TO THE NEXT ROUND NUMBER. The draft KV is addressed by
+    // ABSOLUTE position (the conditioning kernels write row p0 with no mask), so the capacity never
+    // had to be a power of two -- doubling was a habit, and at depth it was the whole problem: from
+    // 131,072 the next power of two is 262,144, so a conversation at 138,199 asked for 671 MB when
+    // 3 MB of extra capacity was what it needed (measured 2026-09-16; that refusal is why
+    // speculation died and decode sat at 21 tok/s where it was 46-55). Stepping by a fixed 16,384
+    // fixed the first case but still overshot the top: at 248,793 positions it asked for the
+    // 262,144 buffer (671 MB) and was refused by SEVEN MEGABYTES against 0.21 GiB free plus
+    // 545 MB of reclaimable old cache. Now the target is the need itself plus a small slack, which
+    // is also the smallest allocation the window can be served from.
+    const int step = 1024;                     // slack over the need, rounded up to 256 below
+    int cap = d.mtp_cap;
+    if (cap < need) {
+        long long want = (long long)need + step;
+        if (want > ctx) want = ctx;
+        cap = (int)((want + 255LL) & ~255LL);
+        if (cap < need) cap = ctx;
+    }
+    if (cap < need) return false;
+    CK(hipSetDevice(d.id));
+#if Q27_V4
+    // The replicated draft KV follows the target planes: V halves and its maxes go per-32 dims.
+    const size_t wb = (size_t)cap * (Q27_KVROWS / 2), sb = (size_t)cap * (Q27_KVROWS / 32) * sizeof(q27_kvs_t), kwb = (size_t)cap * Q27_KVROWS, ksb = (size_t)cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t);   // K IS NOT HALVED
+    const size_t owb = (size_t)d.mtp_cap * (Q27_KVROWS / 2), osb = (size_t)d.mtp_cap * (Q27_KVROWS / 32) * sizeof(q27_kvs_t), okwb = (size_t)d.mtp_cap * Q27_KVROWS, oksb = (size_t)d.mtp_cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t);
+#else
+    const size_t wb = (size_t)cap * Q27_KVROWS, sb = (size_t)cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t), kwb = wb, ksb = sb;
+    const size_t owb = (size_t)d.mtp_cap * Q27_KVROWS, osb = (size_t)d.mtp_cap * (Q27_KVROWS / 16) * sizeof(q27_kvs_t), okwb = owb, oksb = osb;
+#endif
+    signed char *kc = nullptr, *vc = nullptr; q27_kvs_t *ks = nullptr, *vs = nullptr;
+    auto alloc_new = [&]() -> bool {
+        if (hipMalloc((void**)&kc, kwb) != hipSuccess) { kc = nullptr; return false; }
+        if (hipMalloc((void**)&vc, wb) != hipSuccess) { hipFree(kc); kc = vc = nullptr; return false; }
+        if (hipMalloc((void**)&ks, ksb) != hipSuccess) { hipFree(kc); hipFree(vc); kc = vc = nullptr; return false; }
+        if (hipMalloc((void**)&vs, sb) != hipSuccess) { hipFree(kc); hipFree(vc); hipFree(ks); kc = vc = nullptr; ks = nullptr; return false; }
+        return true;
+    };
+    if (!alloc_new()) {
+        // FREE BEFORE ALLOCATE. The copy below needs source and destination alive at once, so the
+        // direct path's true peak is OLD + NEW -- while this function's caller prices only NEW
+        // ("THE PEAK IS THE WHOLE NEW BUFFER, NOT THE DIFFERENCE"), which is true only if the old
+        // buffers are released first. Stage the old cache through the host so they can be: the peak
+        // becomes max(old, new) plus pageable host memory, and the caller's price becomes correct.
+        const size_t tot = okwb + owb + oksb + osb;
+        std::vector<signed char> stage(tot);
+        signed char* sp = stage.data();
+        if (hipMemcpyAsync(sp,          d.mtp_kc, okwb, hipMemcpyDeviceToHost, d.stream) != hipSuccess ||
+            hipMemcpyAsync(sp + okwb,   d.mtp_vc, owb, hipMemcpyDeviceToHost, d.stream) != hipSuccess ||
+            hipMemcpyAsync(sp + okwb + owb, d.mtp_ks, oksb, hipMemcpyDeviceToHost, d.stream) != hipSuccess ||
+            hipMemcpyAsync(sp + okwb + owb + oksb, d.mtp_vs, osb, hipMemcpyDeviceToHost, d.stream) != hipSuccess) {
+            return false;                                     // the old cache is still intact
+        }
+        CK(hipStreamSynchronize(d.stream));
+        CK(hipFree(d.mtp_kc)); CK(hipFree(d.mtp_vc)); CK(hipFree(d.mtp_ks)); CK(hipFree(d.mtp_vs));
+        d.mtp_kc = nullptr; d.mtp_vc = nullptr; d.mtp_ks = nullptr; d.mtp_vs = nullptr;
+        const int lost = d.mtp_cap; d.mtp_cap = 0;             // if the new alloc fails there is no
+                                                              // draft cache: within_cap reports 0
+        if (!alloc_new()) return false;
+        CK(hipMemsetAsync(kc, 0, kwb, d.stream)); CK(hipMemsetAsync(vc, 0, wb, d.stream));
+        CK(hipMemsetAsync(ks, 0, ksb, d.stream)); CK(hipMemsetAsync(vs, 0, sb, d.stream));
+        CK(hipMemcpyAsync(kc, sp,          okwb, hipMemcpyHostToDevice, d.stream));
+        CK(hipMemcpyAsync(vc, sp + okwb,   owb, hipMemcpyHostToDevice, d.stream));
+        CK(hipMemcpyAsync(ks, sp + okwb + owb, oksb, hipMemcpyHostToDevice, d.stream));
+        CK(hipMemcpyAsync(vs, sp + okwb + owb + oksb, osb, hipMemcpyHostToDevice, d.stream));
+        CK(hipStreamSynchronize(d.stream));
+        d.mtp_kc = kc; d.mtp_vc = vc; d.mtp_ks = ks; d.mtp_vs = vs;
+        d.mtp_cap = cap;
+        std::fprintf(stderr, "Q27_MTP_HOSTSTAGE card %d: draft KV %d -> %d positions; old cache "
+                             "staged through the host so the peak is the NEW buffer, not old+new\n",
+                     d.id, lost, cap);
+        std::fflush(stderr);
+        return true;
+    }
+    CK(hipMemsetAsync(kc, 0, kwb, d.stream)); CK(hipMemsetAsync(vc, 0, wb, d.stream));
+    CK(hipMemsetAsync(ks, 0, ksb, d.stream)); CK(hipMemsetAsync(vs, 0, sb, d.stream));
+    CK(hipMemcpyAsync(kc, d.mtp_kc, okwb, hipMemcpyDeviceToDevice, d.stream));
+    CK(hipMemcpyAsync(vc, d.mtp_vc, owb, hipMemcpyDeviceToDevice, d.stream));
+    CK(hipMemcpyAsync(ks, d.mtp_ks, oksb, hipMemcpyDeviceToDevice, d.stream));
+    CK(hipMemcpyAsync(vs, d.mtp_vs, osb, hipMemcpyDeviceToDevice, d.stream));
+    CK(hipStreamSynchronize(d.stream));
+    signed char* okc = d.mtp_kc; signed char* ovc = d.mtp_vc; q27_kvs_t* oks = d.mtp_ks; q27_kvs_t* ovs = d.mtp_vs;
+    CK(hipFree(d.mtp_kc)); CK(hipFree(d.mtp_vc)); CK(hipFree(d.mtp_ks)); CK(hipFree(d.mtp_vs));
+    d.mtp_kc = kc; d.mtp_vc = vc; d.mtp_ks = ks; d.mtp_vs = vs;
+    const int old = d.mtp_cap; d.mtp_cap = cap;
+    if (d.id == 0) {
+        // Log the POINTER TRANSITION, not just the sizes: it is the proof that the realloc+copy
+        // actually happened rather than some dormant branch reporting a plan it never executed.
+        std::fprintf(stderr, "Q27_MTP_PAGED card %d: draft KV %d -> %d positions (%.0f -> %.0f MiB) "
+                             "kc %p->%p vc %p->%p ks %p->%p vs %p->%p\n",
+                     d.id, old, cap, (double)(okwb + owb + oksb + osb) / 1048576.0,
+                     (double)(kwb + wb + ksb + sb) / 1048576.0,
+                     (void*)okc, (void*)kc, (void*)ovc, (void*)vc, (void*)oks, (void*)ks, (void*)ovs, (void*)vs);
+        std::fflush(stderr);
+    }
+    return true;
 }
 
 // Prefill-sweep scratch, allocated LAST (after the mirrors, the fp8 free, mtp_init and the spec
@@ -1614,12 +2527,53 @@ static void dev_alloc_pfslots(Dev& d) {
 // geometry covers.
 enum { TPF_NORM, TPF_QUANT, TPF_PROJ_FP8, TPF_FP8_QKV, TPF_FP8_Z, TPF_FP8_O,
         TPF_PROJ_NVFP4, TPF_DOWN, TPF_ATTN,
-       TPF_GDN_STEP, TPF_GDN_CONV, TPF_GDN_GEMV, TPF_ELEM, TPF_N };
+       TPF_GDN_STEP, TPF_GDN_CONV, TPF_GDN_GEMV, TPF_ELEM,
+       TPF_DR_PRE, TPF_DR_FC, TPF_DR_QKV, TPF_DR_ATTN, TPF_DR_O, TPF_DR_MLP, TPF_DR_HEAD,   // draft pass (2026-09-28)
+       TPF_TR_MLP, TPF_TR_ATTN, TPF_TR_GDN, TPF_TR_CONS,                                   // trunk NR path stages
+       TPF_LL_PUSH, TPF_LL_RED,                                                              // Q27_NR_P2P=4 site halves (2026-09-28)
+       TPF_N };
 static const char* TPF_NAME[TPF_N] = { "rmsnorm", "quantize", "proj_fp8",
                                        "fp8_in_qkv", "fp8_in_z", "fp8_out_proj", "proj_nvfp4",
                                        "down_proj(K=4352)", "attention",
-                                       "gdn_step", "gdn_conv", "gdn_gemv", "elementwise" };
+                                       "gdn_step", "gdn_conv", "gdn_gemv", "elementwise",
+                                       "draft_pre", "draft_fc", "draft_qkv", "draft_attn", "draft_o", "draft_mlp", "draft_head",
+                                       "trunk_mlp", "trunk_attn", "trunk_gdn", "trunk_consumer", "ll_push", "ll_spin_reduce" };
 static double g_tpf[Q27_MAX_DEVICES][TPF_N] = {{0}};
+// ---- Q27_PF_PROFILE (2026-09-28): prefill-sweep attribution per OUTER CHUNK. The sweep's existing tr(L, ph) phase hook
+// records one hipEvent on the compute stream per phase boundary (no sync); at the chunk end (stream idle) consecutive events
+// are differenced: full layer 0->1 qkv proj, 1->2 attention, 2->3 o_proj, 3->next-layer-0/job-end MLP; GDN layer 0->5
+// in_qkv/z proj, 5->6 a/b, 6->7 conv, 7->8 scan, 8->9 out_proj, 9->next MLP; job-end->next-job-0 = the ring boundary
+// (input wait + P2P copy + host lateness); export phase bracketed on its own stream. ATTRIBUTION ONLY, no drains.
+struct PfProf {
+    static const int CAP = 16384;
+    hipEvent_t ev[CAP]; short L[CAP]; short ph[CAP]; int n = 0; bool made = false; long dropped = 0;
+    void ensure() { if (made) return; for (int i = 0; i < CAP; ++i) CK(hipEventCreateWithFlags(&ev[i], 0)); made = true; }
+    void mark(hipStream_t s, int l, int p) { if (n >= CAP) { ++dropped; return; } ensure(); CK(hipEventRecord(ev[n], s)); L[n] = (short)l; ph[n] = (short)p; ++n; }
+};
+static PfProf g_pfp[Q27_MAX_DEVICES];
+static int g_pf_profile = -1;
+static inline int pf_profile_on() { if (g_pf_profile < 0) g_pf_profile = q27_env_int("Q27_PF_PROFILE", 0); return g_pf_profile; }
+static void pf_profile_report(int g, int sw_beg, int sw_end) {   // call with the card's streams idle
+    PfProf& P = g_pfp[g]; if (P.n < 2) { P.n = 0; return; }
+    enum { B_QKV, B_ATTN, B_O, B_MLP, B_GPROJ, B_AB, B_CONV, B_SCAN, B_OUT, B_GAP, B_EXPORT, B_OTHER, B_N };
+    static const char* NM[B_N] = { "proj_qkv", "attention", "o_proj", "mlp", "gdn_proj", "gdn_ab", "gdn_conv", "gdn_scan", "out_proj", "ring_gap", "export", "other" };
+    double acc[B_N] = {0}; long cnt[B_N] = {0};
+    for (int i = 1; i < P.n; ++i) {
+        float ms = 0.f; if (hipEventElapsedTime(&ms, P.ev[i - 1], P.ev[i]) != hipSuccess) continue;
+        const int a = P.ph[i - 1], b = P.ph[i]; int k = B_OTHER;
+        if (b == 1) k = B_QKV; else if (b == 2) k = B_ATTN; else if (b == 3) k = B_O;
+        else if (b == 5) k = B_GPROJ; else if (b == 6) k = B_AB; else if (b == 7) k = B_CONV; else if (b == 8) k = B_SCAN; else if (b == 9) k = B_OUT;
+        else if (b == 0 && (a == 3 || a == 9)) k = B_MLP; else if (b == 99 && (a == 3 || a == 9)) k = B_MLP;
+        else if (b == 0 && a == 99) k = B_GAP; else if (b == 97 && a == 98) k = B_EXPORT;
+        acc[k] += ms; ++cnt[k];
+    }
+    float wall = 0.f; hipEventElapsedTime(&wall, P.ev[0], P.ev[P.n - 1]);
+    double busy = 0; for (int k = 0; k < B_N; ++k) if (k != B_GAP) busy += acc[k];
+    std::fprintf(stderr, "Q27_PF_PROFILE card=%d chunk=[%d,%d) events=%d dropped=%ld wall_ms=%.1f busy_ms=%.1f", g, sw_beg, sw_end, P.n, P.dropped, wall, busy);
+    for (int k = 0; k < B_N; ++k) if (cnt[k]) std::fprintf(stderr, " %s=%.1f/%ld", NM[k], acc[k], cnt[k]);
+    std::fprintf(stderr, "\n"); std::fflush(stderr);
+    P.n = 0; P.dropped = 0;
+}
 static bool   g_tp_profile = false;
 // Q27_TP_LEAD=1 (implies Q27_TP_PROFILE): per stage, how far AHEAD of the GPU the host was when it
 // submitted. lead = (GPU time at which the stage's beg marker completed, from a token-start
@@ -1701,6 +2655,195 @@ static TpEv g_tpev[Q27_MAX_DEVICES];
 // being its own launch. Residual 1 folds into post_norm the same way. That deletes all 128
 // q27_add_inplace launches per token; the caller applies the final pending add before final_norm.
 static thread_local bool g_pf_sweep = false;   // prefill sweep: preenq machinery OFF
+// The first plain decode pass makes all kernel modules resident before any
+// host-published wait is enqueued. HIP first-use loading may synchronize a
+// device, which cannot finish behind a flag this same host has yet to publish.
+static thread_local bool g_plain_warmed = false;
+static thread_local bool g_nr_warmed = false;
+// ---- Q27_TPSR: expand this layer's block-scaled FP8 MLP shards into the card's transient per-ROW int8
+// shard (out of place, ~67 MB of HBM traffic) and stamp the three q27_i8r_t views the rocBLAS prefill
+// GEMMs read. Called once per layer at the batched sweep's layer head, on the compute stream, so it is
+// stream-ordered before the first chunk's MLP and after the previous layer's last one. Per-row scale of
+// the down K-slice is slice-local: the GEMM's int32 partial is scaled on this card before collective #2
+// sums the four partials, so slice-local rows are the right units (the decode's K-view precedent). ----
+static bool tpsr_mlp_view(Dev& d, const q27_layer_t* L, hipStream_t s) {
+    if (!L) return false;
+    if (d.tpsr_mlayer == L->layer && d.tpsr_g8r.w) return true;
+    if (q27_env_flag("Q27_TPSR_NV", false)) {
+        if (!d.tpsr_mw || !d.tpsr_ms || !d.tpsr_nv_s64) return false;
+        const q27_nvfp4_t* src[3] = {&L->gate, &L->up, &L->down};
+        q27_i8r_t* dst[3] = {&d.tpsr_g8r, &d.tpsr_u8r, &d.tpsr_d8r};
+        signed char* w = d.tpsr_mw; float* sc = d.tpsr_ms;
+        for (int i = 0; i < 3; ++i) {
+            q27_i8g_t g64{};
+            if (!src[i]->w || !q27_nvfp4_to_i8g64_into(src[i], &g64, w, d.tpsr_nv_s64, s) ||
+                !q27_i8g64_rowify(&g64, dst[i], sc, s)) return false;
+            w += (size_t)src[i]->rows * src[i]->K; sc += src[i]->rows;
+        }
+        d.tpsr_mlayer = L->layer; return true;
+    }
+    if (!d.tpsr_mw || !d.tpsr_ms || !L->f8_gate.w || !L->f8_up.w || !L->f8_down.w || !L->f8_gate.bs || !L->f8_down.bs) return false;
+    const int nr = L->f8_gate.rows, K = L->f8_gate.K, dr = L->f8_down.rows, dk = L->f8_down.K;
+    if (L->f8_up.rows != nr || L->f8_up.K != K) return false;
+    signed char* wg = d.tpsr_mw; signed char* wu = wg + (size_t)nr * K; signed char* wd = wu + (size_t)nr * K;
+    float* sg = d.tpsr_ms; float* su = sg + nr; float* sd = su + nr;
+    if (!q27_sr_fp8bs_to_i8row(&L->f8_gate, wg, (size_t)K, sg, s) ||
+        !q27_sr_fp8bs_to_i8row(&L->f8_up,   wu, (size_t)K, su, s) ||
+        !q27_sr_fp8bs_to_i8row(&L->f8_down, wd, (size_t)dk, sd, s)) { d.tpsr_mlayer = -1; return false; }
+    auto mk = [](q27_i8r_t* r, signed char* w, float* sc, float alpha, int rows, int Kk) {
+        *r = q27_i8r_t{}; r->w = w; r->s = sc; r->alpha = alpha; r->rows = rows; r->K = Kk; r->ng = 1; r->gs = Kk; };
+    mk(&d.tpsr_g8r, wg, sg, L->f8_gate.in_scale * L->f8_gate.wscale, nr, K);
+    mk(&d.tpsr_u8r, wu, su, L->f8_up.in_scale   * L->f8_up.wscale,   nr, K);
+    mk(&d.tpsr_d8r, wd, sd, L->f8_down.in_scale * L->f8_down.wscale, dr, dk);
+    d.tpsr_mlayer = L->layer;
+    return true;
+}
+
+// ---- Q27_TPSR_PROJ_RB (prefill v2): expand this layer's int8 per-64 projection MIRRORS into the card's
+// transient per-ROW int8 stack (out of place) and stamp the q27_i8r_t views the rocBLAS GEMMs read. Same
+// once-per-layer-per-sweep discipline as tpsr_mlp_view; the sweep is layer-major so the conversion is
+// amortised over every chunk. Attention layers stack q|k|v and carry o; GDN layers stack in_qkv|in_z and
+// carry out_proj. alpha = mirror alpha = in_scale*wscale (no *256: that is the fp8 kernels' e4m3 artefact).
+static bool tpsr_proj_view(Dev& d, const q27_layer_t* L, int is_full, hipStream_t s) {
+    if (!L) return false;
+    if (d.tpsr_pmlayer == L->layer) return is_full ? (d.tpsr_q8r.w != nullptr) : (d.tpsr_iqkv8r.w != nullptr);
+    if (!d.tpsr_pw || !d.tpsr_ps) return false;
+    auto mk = [](q27_i8r_t* r, const signed char* w, const float* sc, float alpha, int rows, int Kk) {
+        *r = q27_i8r_t{}; r->w = w; r->s = sc; r->alpha = alpha; r->rows = rows; r->K = Kk; r->ng = 1; r->gs = Kk; };
+    d.tpsr_q8r = d.tpsr_k8r = d.tpsr_v8r = d.tpsr_o8r = d.tpsr_iqkv8r = d.tpsr_iz8r = d.tpsr_op8r = q27_i8r_t{};
+    d.tpsr_pmlayer = L->layer;
+    if (is_full) {
+        const q27_i8g_t* mq = q27_fp8_i8g(&L->q_proj);
+        const q27_i8g_t* mk_ = q27_fp8_i8g(&L->k_proj);
+        const q27_i8g_t* mv = q27_fp8_i8g(&L->v_proj);
+        const q27_i8g_t* mo = q27_fp8_i8g(&L->o_proj);
+        if (!mq || !mk_ || !mv || !mo || !mq->w || !mk_->w || !mv->w || !mo->w) { d.tpsr_pmlayer = -1; return false; }
+        const int QLb = mq->rows, KVLb = mk_->rows, HID = mq->K, OLb = mo->K;
+        signed char* wq = d.tpsr_pw; signed char* wk = wq + (size_t)QLb * HID; signed char* wv = wk + (size_t)KVLb * HID;
+        signed char* wo = d.tpsr_pw + (size_t)(QLb + 2 * KVLb) * HID;
+        float* sq = d.tpsr_ps; float* sk = sq + QLb; float* sv = sk + KVLb; float* so = d.tpsr_ps + (QLb + 2 * KVLb);
+        if (!q27_sr_i8g64_to_i8row(mq, wq, (size_t)HID, sq, s) ||
+            !q27_sr_i8g64_to_i8row(mk_, wk, (size_t)HID, sk, s) ||
+            !q27_sr_i8g64_to_i8row(mv, wv, (size_t)HID, sv, s) ||
+            !q27_sr_i8g64_to_i8row(mo, wo, (size_t)OLb, so, s)) { d.tpsr_pmlayer = -1; return false; }
+        mk(&d.tpsr_q8r, wq, sq, mq->alpha, QLb, HID);
+        mk(&d.tpsr_k8r, wk, sk, mk_->alpha, KVLb, HID);
+        mk(&d.tpsr_v8r, wv, sv, mv->alpha, KVLb, HID);
+        mk(&d.tpsr_o8r, wo, so, mo->alpha, mo->rows, OLb);
+    } else {
+        const q27_i8g_t* miq = q27_fp8_i8g(&L->in_qkv);
+        const q27_i8g_t* miz = q27_fp8_i8g(&L->in_z);
+        const q27_i8g_t* mop = q27_fp8_i8g(&L->out_proj);
+        if (!miq || !miz || !mop || !miq->w || !miz->w || !mop->w) { d.tpsr_pmlayer = -1; return false; }
+        const int QKVLb = miq->rows, ZLb = miz->rows, HID = miq->K, OPLb = mop->K;
+        signed char* wiq = d.tpsr_pw; signed char* wiz = wiq + (size_t)QKVLb * HID;
+        signed char* wop = d.tpsr_pw + (size_t)(QKVLb + ZLb) * HID;
+        float* siq = d.tpsr_ps; float* siz = siq + QKVLb; float* sop = d.tpsr_ps + (QKVLb + ZLb);
+        if (!q27_sr_i8g64_to_i8row(miq, wiq, (size_t)HID, siq, s) ||
+            !q27_sr_i8g64_to_i8row(miz, wiz, (size_t)HID, siz, s) ||
+            !q27_sr_i8g64_to_i8row(mop, wop, (size_t)OPLb, sop, s)) { d.tpsr_pmlayer = -1; return false; }
+        mk(&d.tpsr_iqkv8r, wiq, siq, miq->alpha, QKVLb, HID);
+        mk(&d.tpsr_iz8r, wiz, siz, miz->alpha, ZLb, HID);
+        mk(&d.tpsr_op8r, wop, sop, mop->alpha, mop->rows, OPLb);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Q27_EXL3 dispatch. A live trellis handle wins over every other format at the
+// site; a null one leaves the incumbent branch byte-for-byte untouched, which
+// is what keeps the 8-bit arm intact while this is brought up.
+//
+// EXL3 takes the bf16 NORM VECTOR, not the quantized activation every other
+// format here consumes: it rotates its own input (suh then blockwise H128), so
+// there is no in_scale and nothing to pre-quantize. The weight bytes it reads
+// are the checkpoint bytes -- in*out*K/8 per call, decoded in LDS, never
+// materialized.
+extern std::atomic<unsigned long long> g_exl3_calls, g_exl3_rows, g_exl3_calls_m1;
+// PER-SITE M=1 CENSUS. 95.5%% of prefill EXL3 calls are M=1 (983,044 of 1,029,124 on a
+// 15360-token prompt = one per position per layer) and they carry only 7.7%% of the rows.
+// Which SITE issues them decides the fix, so each per-position site is counted by name.
+static int g_exl3_dup_o = 0;   // Q27_EXL3_DUP_O: extra idempotent repeats of the o_proj stage
+static std::atomic<unsigned long long> g_ex_site_o{0}, g_ex_site_op{0}, g_ex_site_qkv{0}, g_ex_site_z{0};
+
+static void* exl3_ws(Dev& d, int in, int out, int M) {
+    (void)in; (void)out;                       // fixed layout at the widest projection
+    const size_t need = q27_exl3_ws_bytes(Q27_EXL3_WMAX, Q27_EXL3_WMAX, M);
+    if (need > d.exws_bytes) {
+        if (d.exws) (void)hipFree(d.exws);
+        if (hipMalloc(&d.exws, need) != hipSuccess) { d.exws = nullptr; d.exws_bytes = 0; return nullptr; }
+        d.exws_bytes = need;
+    }
+    return d.exws;
+}
+static std::atomic<unsigned long long> g_exl3_n{0};
+static inline void exl3_note(const char* who, int M) {
+    const unsigned long long n = g_exl3_n.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0 || n == 1000 || n == 100000)
+        std::fprintf(stderr, "Q27_EXL3_RUN #%llu %s M=%d\n", (unsigned long long)n, who, M), std::fflush(stderr);
+}
+
+static void* exl3_head_ws(Dev& d, int out, int M) {
+    const size_t need = ((size_t)Q27_EXL3_WMAX * M * 2 + 255 & ~(size_t)255) + (size_t)out * M * 4 + 4096;
+    if (need > d.exws_head_bytes) {
+        if (d.exws_head) (void)hipFree(d.exws_head);
+        if (hipMalloc(&d.exws_head, need) != hipSuccess) { d.exws_head = nullptr; d.exws_head_bytes = 0; return nullptr; }
+        d.exws_head_bytes = need;
+    }
+    return d.exws_head;
+}
+// EXL3 lm_head. Same call shape as q27_proj_nvfp4 on the head, except it takes
+// the bf16 NORM the quantize right above it consumes -- EXL3 rotates its own
+// input, so the quantize is simply not part of this path.
+static inline bool exl3_head(Dev& d, const q27_globals_t* G, const unsigned short* xbf,
+                             float* y, int M, hipStream_t s) {
+    if (!G || !G->ex_head.live() || !xbf) return false;
+    void* ws = exl3_head_ws(d, G->ex_head.out, M);
+    if (!ws) return false;
+    const bool ok = q27_exl3_proj_f32(&G->ex_head, xbf, y, M, ws, s);
+    if (ok) exl3_note("lm_head", M);
+    return ok;
+}
+
+// bf16 out (activation) and fp32 out (partial). Both return false when the
+// handle is dead so the caller falls through to the incumbent path.
+// PROOF OF USE. A dispatcher that silently falls back to the incumbent format
+// is indistinguishable from one that ran EXL3 -- same log, same shape of output
+// -- so every EXL3 site announces itself the first time it fires. Without this
+// a "measurement of EXL3" can easily be a measurement of NVFP4.
+
+static inline bool exl3_bf16(Dev& d, const q27_exl3_t& w, const unsigned short* x,
+                             unsigned short* y, int M, hipStream_t s, int ldx = 0, int ldy = 0) {
+    if (!w.live()) return false;
+    void* ws = exl3_ws(d, w.in, w.out, M);
+    const bool ok = ws && q27_exl3_proj_bf16(&w, x, y, M, ws, s, ldx, ldy);
+    if (ok) exl3_note("proj_bf16", M);
+    return ok;
+}
+static inline bool exl3_f32(Dev& d, const q27_exl3_t& w, const unsigned short* x,
+                            float* y, int M, hipStream_t s, int ldx = 0, int ldy = 0) {
+    if (!w.live()) return false;
+    void* ws = exl3_ws(d, w.in, w.out, M);
+    const bool ok = ws && q27_exl3_proj_f32(&w, x, y, M, ws, s, ldx, ldy);
+    if (ok) exl3_note("proj_f32", M);
+    return ok;
+}
+// The EXL3 MLP for a row band: gate/up -> natural bf16 swiglu -> down. The
+// activation lives in the EXL3 workspace because every incumbent swiglu emits a
+// QUANTIZED activation, which is exactly what EXL3 does not want.
+static inline bool exl3_mlp(Dev& d, const q27_layer_t* L, const unsigned short* xnorm, int ldx,
+                            float* pa, float* pb, int ld_ab, float* part, int ldpart,
+                            int IL, int M, hipStream_t s) {
+    if (!L->ex_gate.live() || !L->ex_up.live() || !L->ex_down.live()) return false;
+    if (!exl3_f32(d, L->ex_gate, xnorm, pa, M, s, ldx, ld_ab)) return false;
+    if (!exl3_f32(d, L->ex_up,   xnorm, pb, M, s, ldx, ld_ab)) return false;
+    void* ws = exl3_ws(d, L->ex_down.in, L->ex_down.out, M);
+    if (!ws) return false;
+    unsigned short* act = q27_exl3_ws_act(ws, L->ex_down.in, M, L->ex_down.out);
+    if (!q27_exl3_swiglu_bf16(pa, pb, act, IL, M, ld_ab, IL, s)) return false;
+    return exl3_f32(d, L->ex_down, act, part, M, s, IL, ldpart);
+}
+
 static void run_layer_tp(Dev& d, const q27_layer_t* L, int pos, int gsraw, int fsraw, int ctx,
                          int g, int ndev, TpColl& C, double* mark, const void* pending,
                          const q27_layer_t* Lnext = nullptr, int slot = 0,
@@ -1717,14 +2860,19 @@ static void run_layer_tp(Dev& d, const q27_layer_t* L, int pos, int gsraw, int f
                          const float* invin2 = nullptr,
                          signed char* mixq_out = nullptr, float* mixs_out = nullptr) {
     hipStream_t s = d.stream;
+    const float rshare = 1.0f / (float)ndev;   // Q27_TP3: each worker folds 1/ndev of the residual into its partial (was a hard-coded 0.25f)
     unsigned short* hid = d.hidden_slots + (size_t)slot * Q27_HID;
     // The caller passes the RAW layer-type counters; masking here keeps the rest of the body
     // unchanged and lets the pe2 pre-enqueue compute Lnext's slot indices exactly as the caller
     // would after its own increment.
     const int gslot = L->is_full ? 0 : gsraw;
     const int fslot = L->is_full ? fsraw : 0;
-    const int QL  = Q27_QROWS / ndev, KVL = Q27_KVROWS / ndev, OL = Q27_OROWS / ndev;
-    const int QKVL = Q27_GDN_QKV / ndev, ZL = Q27_GDN_Z / ndev, IL = Q27_INTER / ndev;
+    const q27_tp_shard_t* const T = q27_tp_shard(g);   // Q27_TP3: this worker's shard geometry
+    const int QL  = T->QL, KVL = T->KVL, OL = T->OL;
+    const int QKVL = T->QKVL, ZL = T->ZL, IL = mlp_len(d.id);
+    // Q27_TPSR: the MLP is the block-scaled FP8 shard (gate/up rows + down K-slice) -- natural-order
+    // activations, so the post-norm quantises in natural order and the NVFP4 chain below is bypassed.
+    const bool f8mlp = (L->f8_gate.w && L->f8_up.w && L->f8_down.w && L->f8_gate.bs && L->f8_up.bs && L->f8_down.bs);
 
     // Destination of the three PARTIAL projections. Under zero-copy-out this is card g's pinned
     // reduction slot, so the only bytes crossing PCIe are the final epilogue stores -- the weights,
@@ -1772,6 +2920,10 @@ static void run_layer_tp(Dev& d, const q27_layer_t* L, int pos, int gsraw, int f
         TPF(TPF_NORM, s, {
             if (pe1_done) { /* already enqueued before the barrier */ }
             else if (g_rn_hostss) {
+                if (f8mlp) q27_rmsnorm_hostss_fp8(p_acc, L->post_norm, hid,   // Q27_TPSR: natural order for the FP8 gate/up
+                                        g_rn_dropy ? nullptr : d.norm, xq_t, xs_t,
+                                        Q27_HID, 1, L->f8_gate.in_scale, p_inv, s);
+                else
                 q27_rmsnorm_hostss_perm(p_acc, L->post_norm, hid,
                                         g_rn_dropy ? nullptr : d.norm, xq_t, xs_t,
                                         Q27_HID, 1, L->gate.in_scale, p_inv, s);
@@ -1861,8 +3013,10 @@ pf_skip_norm:
         // supplies the same slot; until this line it re-ran all three per position into d.qkva and
         // the attention read the slot (the default-build trace: 48 dead K=5120 launches/position).
         if (pfmode != 2 && !(g_pf_noredo && pfmode == 4 && qkvaslot)) {
+        const unsigned short* nrmp_a = normout ? normout : d.norm;
         TPF(TPF_PROJ_FP8, s, {
-            if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->q4, d.xq, d.xs, d.qkva, s);
+            if (exl3_bf16(d, Lx->ex_q, nrmp_a, d.qkva, 1, s)) { g_ex_site_qkv.fetch_add(1, std::memory_order_relaxed); }
+            else if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->q4, d.xq, d.xs, d.qkva, s);
             else if (!q27_proj_fp8_bf16(&Lx->q_proj, d.xq, d.xs, d.qkva, s)) {
                 q27_proj_fp8(&Lx->q_proj, d.xq, d.xs, d.pa, s);
                 q27_f2bf_vec(d.pa, d.qkva, QL, s);
@@ -1870,7 +3024,10 @@ pf_skip_norm:
         // Q27_KV_FUSE: k_proj and v_proj are 256-row shards whose launches cost ~25 us each
         // in-engine against 5.5 us of work; one launch for both removes 16 launches/token.
         bool kv_done = false;
-        if (g_kv_fuse && !g_fp8x4)
+        if (Lx->ex_k.live() && Lx->ex_v.live())
+            kv_done = exl3_bf16(d, Lx->ex_k, nrmp_a, d.qkva + QL, 1, s) &&
+                      exl3_bf16(d, Lx->ex_v, nrmp_a, d.qkva + QL + KVL, 1, s);
+        if (!kv_done && g_kv_fuse && !g_fp8x4)
             TPF(TPF_PROJ_FP8, s, {
                 kv_done = q27_proj_fp8_bf16_2(&Lx->k_proj, &Lx->v_proj, d.xq, d.xs,
                                               d.qkva + QL, d.qkva + QL + KVL,
@@ -1891,22 +3048,26 @@ pf_skip_norm:
             } });
         }
         }
-        signed char* kc = d.kc + (size_t)fsx * d.tp_kv;  float* ks = d.ks + (size_t)fsx * d.tp_kvs;
-        signed char* vc = d.vc + (size_t)fsx * d.tp_kv;  float* vs = d.vs + (size_t)fsx * d.tp_kvs;
-        // layer-split residency stores every layer FULL-width on every card: decode addresses its own
-        // KV head inside the 1024-wide rows (stride Q27_KVROWS, offset g*KVL); TP residency is sharded.
-        const int kvstride = g_ls ? Q27_KVROWS : KVL;             // KVL = KVROWS/ndev
-        const int hoff0    = g_ls ? g * KVL : 0;
-        TPF(TPF_ATTN, s, q27_attn_prep_tp(qkvaslot ? qkvaslot : d.qkva, Lx->q_norm, Lx->k_norm, kc, ks, vc, vs, d.qh, pos, ndev, kvstride, hoff0, s));
+        signed char* kc = d.kc + d.kv_off[fsx];   q27_kvs_t* ks = d.ks + d.kvs_off[fsx];
+        signed char* vc = d.vc + Q27_VOFF(d.kv_off[fsx]);   q27_kvs_t* vs = d.vs + Q27_VSOFF(d.kvs_off[fsx]);
+        // A layer is stored full width only on the card that OWNS it (its prefill reads every
+        // head); every other card holds just the head-quarter decode reads. Stride and head offset
+        // are therefore per LAYER, not per residency mode. TP fills these with KVL / 0.
+        const int kvstride = d.kv_rowstride[fsx];
+        const int hoff0    = d.kv_hoff[fsx];
+        TPF(TPF_ATTN, s, q27_attn_prep_tp(qkvaslot ? qkvaslot : d.qkva, Lx->q_norm, Lx->k_norm, kc, ks, vc, vs, d.qh, pos, T->attn_g, kvstride, hoff0, s));
         int attn_fq = 0;
         // q_proj_raw is the q_proj block of the qkv buffer: decode reads the output GATE
         // from it at [h*512+256+d]. In pfmode 2 the projections landed in the per-position
         // qkvaslot, and d.qkva is untouched (zeros -> sigmoid(0)=0.5 scaled the attention).
-        TPF(TPF_ATTN, s, attn_fq = q27_attn_decode_tp(d.qh, kc, ks, vc, vs, qkvaslot ? qkvaslot : d.qkva, d.mix6, pos, ndev, kvstride, hoff0,
+        TPF(TPF_ATTN, s, attn_fq = q27_attn_decode_tp(d.qh, kc, ks, vc, vs, qkvaslot ? qkvaslot : d.qkva, d.mix6, pos, T->attn_g, kvstride, hoff0,
                         (g_gdn_fq && !g_fp8x4) ? d.xq : nullptr, (g_gdn_fq && !g_fp8x4) ? d.xs : nullptr,
                         (g_gdn_fq && !g_fp8x4) ? Lx->o_proj.in_scale : 0.0f, s));
         // Q27_PF_ATT_B (prefill, mode 4): quantize the attention mixer into this position's CHUNK
         // slot and return; the caller runs ONE o_proj over the chunk into part_slots.
+        if (Lx->ex_o.live()) { static std::atomic<int> t1{0}; if (t1.fetch_add(1) == 0)
+            std::fprintf(stderr, "Q27_OTRACE full-attn o_proj: pfmode=%d mixq_out=%p attn_fq=%d fp8x4=%d layer=%d\n",
+                         pfmode, (void*)mixq_out, (int)attn_fq, (int)g_fp8x4, Lx->layer), std::fflush(stderr); }
         if (mixq_out && pfmode == 4 && !attn_fq && !g_fp8x4) {
             TPF(TPF_QUANT, s, q27_quant_fp8(d.mix6, mixq_out, mixs_out, OL, Lx->o_proj.in_scale, s));
             return;
@@ -1923,16 +3084,24 @@ pf_skip_norm:
                         q27_quant_fp8(d.mix6, d.xq, d.xs, OL, Lx->o_proj.in_scale, s);
                 } });
         TPF(TPF_PROJ_FP8, s, {
-            if (g_fp8x4) {
-                q27_nvfp4_set_res((rad && g_rn_epi) ? rad : nullptr, 0.25f);
+            if (exl3_f32(d, Lx->ex_o, d.mix6, part, 1, s)) { g_ex_site_o.fetch_add(1, std::memory_order_relaxed);
+                // Q27_EXL3_DUP_O=1: price THIS stage as d(wall). The projection writes `part`
+                // outright (the residual share is a separate pass below), so running it twice is
+                // idempotent and the wall delta is the stage's recoverable cost -- per
+                // recoverable-wall-not-profiled-ms. 983,040 of 1,029,124 prefill EXL3 calls are
+                // this site; the question is whether that is TIME or just COUNT.
+                for (int rp = 0; rp < g_exl3_dup_o; ++rp) (void)exl3_f32(d, Lx->ex_o, d.mix6, part, 1, s);
+                if (rad) q27_add_res_share(part, hid, rshare, Q27_HID, s);
+            } else if (g_fp8x4) {
+                q27_nvfp4_set_res((rad && g_rn_epi) ? rad : nullptr, rshare);
                 q27_proj_nvfp4(&Lx->o4, d.xq, d.xs, part, s);
                 q27_nvfp4_set_res(nullptr, 0.f);
-                if (rad && !g_rn_epi) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+                if (rad && !g_rn_epi) q27_add_res_share(part, hid, rshare, Q27_HID, s);
             } else if (!g_coll_bf16 || !q27_proj_fp8_bf16(&Lx->o_proj, d.xq, d.xs,
                                                    (unsigned short*)d.mixer, s)) {
-                if (!rad || !g_rn_epi || !q27_proj_fp8_res(&Lx->o_proj, d.xq, d.xs, part, rad, 0.25f, s)) {
+                if (!rad || !g_rn_epi || !q27_proj_fp8_res(&Lx->o_proj, d.xq, d.xs, part, rad, rshare, s)) {
                     q27_proj_fp8(&Lx->o_proj, d.xq, d.xs, part, s);
-                    if (rad) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+                    if (rad) q27_add_res_share(part, hid, rshare, Q27_HID, s);
                 }
             }
         });   // PARTIAL, 1536 cols
@@ -1948,27 +3117,33 @@ pf_skip_norm:
         // (the 128-token trace: 96 dead launches x 16.7 us per position, ~18% of GPU busy).
         if (pfmode != 3 && !(g_pf_noredo && qkvin && zbin)) {
         TPF(TPF_FP8_QKV, s, {
-            if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->iqkv4, d.xq, d.xs, d.qkv, s);
+            if (Lx->ex_iqkv[0].live()) {   // q | k | v, three handles, written at their offsets
+                int off = 0;
+                for (int r = 0; r < 3; ++r) { exl3_bf16(d, Lx->ex_iqkv[r], nrmp, d.qkv + off, 1, s); off += Lx->ex_iqkv[r].out; }
+                g_ex_site_qkv.fetch_add(3, std::memory_order_relaxed);
+            }
+            else if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->iqkv4, d.xq, d.xs, d.qkv, s);
             else if (!q27_proj_fp8_bf16(&Lx->in_qkv, d.xq, d.xs, d.qkv, s)) {
                 q27_proj_fp8(&Lx->in_qkv, d.xq, d.xs, d.pa, s);
                 q27_f2bf_vec(d.pa, d.qkv, QKVL, s);
             } });
         TPF(TPF_FP8_Z, s, {
-            if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->iz4, d.xq, d.xs, d.zbuf, s);
+            if (exl3_bf16(d, Lx->ex_iz, nrmp, d.zbuf, 1, s)) { g_ex_site_z.fetch_add(1, std::memory_order_relaxed); }
+            else if (g_fp8x4) q27_proj_nvfp4_bf16(&Lx->iz4, d.xq, d.xs, d.zbuf, s);
             else if (!q27_proj_fp8_bf16(&Lx->in_z, d.xq, d.xs, d.zbuf, s)) {
                 q27_proj_fp8(&Lx->in_z, d.xq, d.xs, d.pb, s);
                 q27_f2bf_vec(d.pb, d.zbuf, ZL, s);
             } });
         }
         // Only this card's value heads. Was Q27_GDN_VH (all 48) on every card: 4x redundant.
-        const int VHL = Q27_GDN_VH / ndev;
+        const int VHL = T->VHL;
         TPF(TPF_GDN_GEMV, s, {
             if (!q27_bf16_gemv2(Lx->in_a, Lx->in_b, nrmp, d.ab, d.bb, VHL, Q27_HID, s)) {
                 q27_bf16_gemv(Lx->in_a, nrmp, d.ab, VHL, Q27_HID, s);
                 q27_bf16_gemv(Lx->in_b, nrmp, d.bb, VHL, Q27_HID, s);
             }
         });
-        TPF(TPF_GDN_CONV, s, q27_gdn_conv_tp(qkvp, d.conv + (size_t)gsx * d.tp_conv, g_ls ? 1 : 0, Lx->conv1d, g, ndev, s));
+        TPF(TPF_GDN_CONV, s, q27_gdn_conv_tp_r(qkvp, d.conv + d.conv_off[gsx], d.conv_wide[gsx], Lx->conv1d, T->gk_h0, T->gk_hn, s));
         // Quantize fused into the step's phase-4 epilogue: d.mix6 was consumed by nothing else.
         // Q27_PF_GDN_FQ (prefill mode 6 with the chunk out_proj): the step's fused quantize epilogue
         // writes the mixer straight into this position's chunk slot; no separate quantize launch.
@@ -1979,17 +3154,23 @@ pf_skip_norm:
         TPF(TPF_GDN_STEP, s,
             g_dsplit
               ? q27_gdn_step_tp_ds(qkvp, zbp, d.ab, d.bb, Lx->A_log, Lx->dt_bias, Lx->gdn_norm,
-                        d.S + (size_t)gsx * d.tp_s + (g_ls ? (size_t)g * (Q27_GDN_VH / ndev) * Q27_GDN_D * Q27_GDN_D : 0), d.mix6, g, ndev, d.gdn_scr,
+                        d.S + d.s_off[gsx] + d.s_qoff[gsx], d.mix6, g, ndev, d.gdn_scr,
                         pos * Q27_LAYERS + Lx->layer, fq_q, fq_qs, fq_is, s)
-              : q27_gdn_step_tp(qkvp, zbp, d.ab, d.bb, Lx->A_log, Lx->dt_bias, Lx->gdn_norm,
-                        d.S + (size_t)gsx * d.tp_s + (g_ls ? (size_t)g * (Q27_GDN_VH / ndev) * Q27_GDN_D * Q27_GDN_D : 0), d.mix6, g, ndev, fq_q, fq_qs, fq_is, s));
+              : q27_gdn_step_tp_r(qkvp, zbp, d.ab, d.bb, Lx->A_log, Lx->dt_bias, Lx->gdn_norm,
+                        d.S + d.s_off[gsx] + d.s_qoff[gsx], d.mix6, T->gk_h0, T->gk_hn, fq_q, fq_qs, fq_is, s));
         if (fq_slot) return;
         // Q27_PF_OPROJ_B (prefill, mode 6): quantize the mixer into this position's CHUNK slot and
         // return; the caller runs ONE out_proj over the chunk (q27_proj_fp8_m2_res) into part_slots.
         if (mixq_out && pfmode == 6 && !g_gdn_fq && !g_fp8x4) {
+            { static std::atomic<int> o1{0}; if (o1.fetch_add(1) == 0)
+                std::fprintf(stderr, "Q27_OPROJ_TRACE chunk-quantize arm TAKEN (pfmode=6) ex_op.live=%d out_proj.w=%p\n",
+                             (int)Lx->ex_op.live(), (void*)Lx->out_proj.w), std::fflush(stderr); }
             TPF(TPF_QUANT, s, q27_quant_fp8(d.mix6, mixq_out, mixs_out, ZL, Lx->out_proj.in_scale, s));
             return;
         }
+        { static std::atomic<int> o2{0}; if (o2.fetch_add(1) == 0)
+            std::fprintf(stderr, "Q27_OPROJ_TRACE PER-POSITION arm (pfmode=%d mixq_out=%p gdn_fq=%d fp8x4=%d) ex_op.live=%d\n",
+                         pfmode, (void*)mixq_out, (int)g_gdn_fq, (int)g_fp8x4, (int)Lx->ex_op.live()), std::fflush(stderr); }
         if (!g_gdn_fq)
             TPF(TPF_QUANT, s, {
                 if (g_fp8x4) {
@@ -2002,16 +3183,20 @@ pf_skip_norm:
                         q27_quant_fp8(d.mix6, d.xq, d.xs, ZL, Lx->out_proj.in_scale, s);
                 } });
         TPF(TPF_FP8_O, s, {
-            if (g_fp8x4) {
-                q27_nvfp4_set_res((rad && g_rn_epi) ? rad : nullptr, 0.25f);
+            if (exl3_f32(d, Lx->ex_op, d.mix6, part, 1, s)) { g_ex_site_op.fetch_add(1, std::memory_order_relaxed);
+                // EXL3 writes the partial directly; the residual share rides the
+                // same epilogue the fp8 fallback below uses.
+                if (rad) q27_add_res_share(part, hid, rshare, Q27_HID, s);
+            } else if (g_fp8x4) {
+                q27_nvfp4_set_res((rad && g_rn_epi) ? rad : nullptr, rshare);
                 q27_proj_nvfp4(&Lx->op4, d.xq, d.xs, part, s);
                 q27_nvfp4_set_res(nullptr, 0.f);
-                if (rad && !g_rn_epi) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+                if (rad && !g_rn_epi) q27_add_res_share(part, hid, rshare, Q27_HID, s);
             } else if (!g_coll_bf16 || !q27_proj_fp8_bf16(&Lx->out_proj, d.xq, d.xs,
                                                    (unsigned short*)d.mixer, s)) {
-                if (!rad || !g_rn_epi || !q27_proj_fp8_res(&Lx->out_proj, d.xq, d.xs, part, rad, 0.25f, s)) {
+                if (!rad || !g_rn_epi || !q27_proj_fp8_res(&Lx->out_proj, d.xq, d.xs, part, rad, rshare, s)) {
                     q27_proj_fp8(&Lx->out_proj, d.xq, d.xs, part, s);
-                    if (rad) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+                    if (rad) q27_add_res_share(part, hid, rshare, Q27_HID, s);
                 }
             }
         }); // PARTIAL, 1536 cols
@@ -2027,9 +3212,10 @@ pf_skip_norm:
     // ONLY the copy: a full hipStreamSynchronize would also wait on the tail we just queued,
     // which cannot run until the host sets the flag -- deadlock.
     const bool pe1 = g_tail_preenq && g_preenq_ok && g_rn_hostss && !g_coll_bf16 && !g_coll_zcout
-                     && !g_pf_sweep;
+                     && !g_pf_sweep && g_plain_warmed && !(g_host_tail_mask & (1u << g));
     const bool fd1 = (g_coll_fusedrain || pe1) && !g_coll_bf16 && !g_coll_zcout;
-    const bool mlp_pre = pe1 && g_preenq_mlp;   // the whole MLP chain rides behind the flag-gated tail
+    const bool mlp_pre = (!L->ex_gate.live()) && (pe1 && g_preenq_mlp && !f8mlp);   // EXL3 does the MLP in the branch below; the pre-enqueued copy would
+                                 // run it a SECOND time, and on dropped NVFP4 weights.   // the whole MLP chain rides behind the flag-gated tail (NVFP4 chain only)
     bool mlp_fused = false;
     unsigned cg1 = 0;
     if (fd1 && !g_fd_neg && !(pro_in && g_preenq_prologue))   // copy skipped only when it rode pre-barrier
@@ -2040,6 +3226,10 @@ pf_skip_norm:
         if (!(g_coll_dflag && cg1)) CK(hipEventRecord(C.ev_copy[g], s));
         gn1 = ++C.gen[g];
         CK(hipStreamWaitValue32(s, (void*)(C.flag_d + g), gn1, hipStreamWaitValueEq, 0xffffffffu));
+        if (f8mlp) q27_rmsnorm_hostss_fp8(g_coll_acc, L->post_norm, hid,   // Q27_TPSR: natural order
+                                g_rn_dropy ? nullptr : d.norm, d.xq, d.xs,
+                                Q27_HID, 1, L->f8_gate.in_scale, C.inv_d + g, s);
+        else
         q27_rmsnorm_hostss_perm(g_coll_acc, L->post_norm, hid,
                                 g_rn_dropy ? nullptr : d.norm, d.xq, d.xs,
                                 Q27_HID, 1, L->gate.in_scale, C.inv_d + g, s);
@@ -2064,10 +3254,10 @@ pf_skip_norm:
                     }
                 } });
             TPF(TPF_DOWN, s, {
-                if (rad && g_rn_epi) q27_nvfp4_set_res(rad, 0.25f);
+                if (rad && g_rn_epi) q27_nvfp4_set_res(rad, rshare);
                 q27_proj_nvfp4(&L->down, d.xq, d.xs, part, s);              // PARTIAL, K=4352
                 q27_nvfp4_set_res(nullptr, 0.f);
-                if (rad && !g_rn_epi) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+                if (rad && !g_rn_epi) q27_add_res_share(part, hid, rshare, Q27_HID, s);
             });
         }
         tp_stage_wait(C, g, cg1);
@@ -2089,6 +3279,42 @@ pf_skip_norm:
     // (and its 1/rms) instead of the single-slot g_coll_acc / C.inv_d.
     tail_fn(pe1, g_coll_acc, C.inv_d + g);
     if (stop) return;               // the batched sweep takes over: gu/swiglu/down/coll#2 outside
+    // ---- Q27_EXL3 (M=1): gate/up straight off the bf16 post-norm, natural-order
+    // swiglu, down into the partial. No quantize step anywhere in the chain --
+    // EXL3 rotates its own input at each projection, so the int8/fp8 activation
+    // currency (and its in_scale) simply does not appear.
+    if (L->ex_gate.live() && L->ex_up.live() && L->ex_down.live()) {
+        // DIAGNOSTIC 2026-09-19. The post-attention norm that fills d.norm -- the ONLY
+        // input this chain has -- is written by a kernel that refuses to launch unless
+        // in_scale > 0, and both call sites DISCARD its return value. With the NVFP4
+        // MLP dropped, L->gate.in_scale is 0, so d.norm would keep the PRE-attention
+        // norm the prologue left there. Print what the scale actually is.
+        { static std::atomic<int> once{0};
+          if (once.fetch_add(1) == 0)
+            std::fprintf(stderr, "Q27_EXL3_MLPDIAG L=%d gate.in_scale=%.6g f8_gate.in_scale=%.6g "
+                                 "pe1=%d rn_hostss=%d rn_dropy=%d f8mlp=%d\n",
+                         L->layer, (double)L->gate.in_scale, (double)L->f8_gate.in_scale,
+                         (int)pe1, (int)g_rn_hostss, (int)g_rn_dropy, (int)f8mlp), std::fflush(stderr); }
+        if (!exl3_f32(d, L->ex_gate, d.norm, d.pa, 1, s) ||
+            !exl3_f32(d, L->ex_up,   d.norm, d.pb, 1, s)) {
+            std::fprintf(stderr, "Q27_EXL3: gate/up declined (M=1, L=%d in=%d out=%d K=%d)\n",
+                         L->layer, L->ex_gate.in, L->ex_gate.out, L->ex_gate.K); std::abort(); }
+        q27_swiglu(d.pa, d.pb, d.act, IL, s);      // natural order, bf16: EXL3 down rotates it itself
+        if (!exl3_f32(d, L->ex_down, d.act, part, 1, s)) {
+            std::fprintf(stderr, "Q27_EXL3: down declined (M=1, L=%d)\n", L->layer); std::abort(); }
+        if (rad) q27_add_res_share(part, hid, rshare, Q27_HID, s);
+    } else
+    if (f8mlp) {   // ---- Q27_TPSR (M=1): FP8 gate/up row shard, natural swiglu, FP8 down K-slice with the residual share ----
+        if (!q27_proj_fp8b_nr(&L->f8_gate, d.xq, d.xs, d.pa, IL, nullptr, 0, 0.f, 1, s) ||
+            !q27_proj_fp8b_nr(&L->f8_up,   d.xq, d.xs, d.pb, IL, nullptr, 0, 0.f, 1, s)) {
+            std::fprintf(stderr, "Q27_TPSR: FP8 gate/up declined (M=1, L=%d rows=%d K=%d)\n", L->layer, L->f8_gate.rows, L->f8_gate.K); std::abort(); }
+        if (!q27_sr_swiglu_quant_nat_b(d.pa, d.pb, d.xq, d.xs, IL, L->f8_down.in_scale, 1, s)) {
+            std::fprintf(stderr, "Q27_TPSR: natural swiglu declined (M=1, L=%d)\n", L->layer); std::abort(); }
+        if (!q27_proj_fp8b_nrs(&L->f8_down, d.xq, IL, d.xs, part, Q27_HID,
+                               (rad && g_rn_epi) ? rad : nullptr, Q27_HID, rshare, 1, s)) {
+            std::fprintf(stderr, "Q27_TPSR: FP8 down slice declined (M=1, L=%d rows=%d K=%d)\n", L->layer, L->f8_down.rows, L->f8_down.K); std::abort(); }
+        if (rad && !g_rn_epi) q27_add_res_share(part, hid, rshare, Q27_HID, s);
+    } else
     if (!mlp_pre) {
     TPF(TPF_PROJ_NVFP4, s, {
         mlp_fused = q27_mlp_gu_swiglu_q(&L->gate, &L->up, d.xq, d.xs,
@@ -2113,17 +3339,17 @@ pf_skip_norm:
             }
         } });
     TPF(TPF_DOWN, s, {
-        if (rad && g_rn_epi) q27_nvfp4_set_res(rad, 0.25f);
+        if (rad && g_rn_epi) q27_nvfp4_set_res(rad, rshare);
         q27_proj_nvfp4(&L->down, d.xq, d.xs, part, s);                          // PARTIAL, K=4352
         q27_nvfp4_set_res(nullptr, 0.f);
-        if (rad && !g_rn_epi) q27_add_res_share(part, hid, 0.25f, Q27_HID, s);
+        if (rad && !g_rn_epi) q27_add_res_share(part, hid, rshare, Q27_HID, s);
     });
     }   // !mlp_pre
     // Same transformation across the layer boundary: the consumer of ALL-REDUCE #2 is the NEXT
     // layer's input norm, so pre-enqueueing it needs that layer's weights, which is why Lnext is
     // threaded in. The next layer skips its own launch via C.pre_in[g].
     const bool pe2 = g_tail_preenq && g_preenq_ok && g_rn_hostss && !g_coll_bf16 && !g_coll_zcout
-                     && Lnext != nullptr && !g_pf_sweep;
+                     && Lnext != nullptr && !g_pf_sweep && g_plain_warmed && !(g_host_tail_mask & (1u << g));
     const bool fd2 = (g_coll_fusedrain || pe2) && !g_coll_bf16 && !g_coll_zcout;
     unsigned cg2 = 0;
     if (fd2 && !g_fd_neg) cg2 = tp_stage_out(C, g, d.mixer, s);
@@ -2186,28 +3412,67 @@ pf_skip_norm:
 // conv/scan recurrence continues from the state chunk c-1 left in place; the snapshot bank
 // pointers just offset by c0 rows. NR <= 4 runs exactly one chunk (bit-identical to the old path).
 // ---- Q27_NR_P2P helpers: the other three card indices in ascending order, and one collective site's transport ----
+static int g_nrp_ndev = 4;   // set at the NR_P2P init; 3 cards use a two-peer table with -1 in the third slot
 static inline const int* nrp_peers(int g) {
     static const int T[4][3] = { {1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2} };
-    return T[g & 3];
+    static const int T3[3][3] = { {1, 2, -1}, {0, 2, -1}, {0, 1, -1} };
+    return (g_nrp_ndev == 3) ? T3[g % 3] : T[g & 3];
 }
+// the receive-slot pointer for peer index j (null past the last peer), so the 4-card call sites work unchanged at 3 cards
+#define NRP_RECV(slot, owner, pk, j) (((pk)[j] >= 0) ? C.nrp_recv[slot][owner][(pk)[j]] : nullptr)
 // v2 (g_nr_p2p == 1): wait until every peer has finished reading what this card pushed into their slot last time,
 // push this card's fp32 partial rows as bf16 into the three peers' receive slots (posted stores), record "done",
 // order the enqueue with a host barrier (so every card's record precedes any card's wait), then wait on the
 // peers' done events. v1 (g_nr_p2p == 2): the peers read this card's partial in place; only done/wait here.
 static inline void nrp_site(TpColl& C, int g, int ndev, int slot, hipStream_t s, const float* part, int NR, int mode) {
+    // runtime receipt: this site took the GPU-RESIDENT path, and which of the three transports
+    ++g_coll_p2p_sites[g][(mode >= 1 && mode <= 4) ? mode : 0]; g_coll_nr_eff[g] = NR;
+    if (mode == 4) {   // LL: one push kernel into the peers' slot for this sequence number; nothing else crosses the cards
+        (void)slot;
+        const unsigned seq = ++C.nrp_seq[g];
+        const int sl = (int)(seq & (Q27_LL_SLOTS - 1));
+        int pk[3] = {-1, -1, -1}, np = 0; for (int k = 0; k < ndev; ++k) if (k != g) pk[np++] = k;
+        int okp = 0;
+        if (g_ll_sdma) {
+            TPF(TPF_LL_PUSH, s, {
+                if (C.nrp_prepacked[g]) { okp = 1; C.nrp_prepacked[g] = 0; }   // Q27_LL_EPI: the producer's epilogue packed this site
+                else okp = q27_pack_ll(part, C.nrp_llstage[sl][g], Q27_HID, NR, seq, s);
+                for (int j = 0; j < np; ++j)
+                    CK(hipMemcpyPeerAsync(C.nrp_ll[sl][pk[j]][g], g_devid_tab[pk[j]], C.nrp_llstage[sl][g], g_devid_tab[g], (size_t)NR * Q27_HID * 4, s));
+            });
+        } else {
+            TPF(TPF_LL_PUSH, s, okp = q27_push_ll(part, C.nrp_ll[sl][pk[0]][g], C.nrp_ll[sl][pk[1]][g], (np > 2) ? C.nrp_ll[sl][pk[2]][g] : nullptr, Q27_HID, NR, seq, s));
+        }
+        if (!okp) { std::fprintf(stderr, "Q27_NR_P2P=4: push declined\n"); std::abort(); }
+        return;
+    }
     if (mode != 2) {
         for (int k = 0; k < ndev; ++k) if (k != g) CK(hipStreamWaitEvent(s, C.ev_nrp_rd[slot][k], 0));
         const int* pk = nrp_peers(g);
         if (mode == 3) {   // pack locally, then three SDMA copies into the peers' slots (stream-ordered on s)
             q27_f2bf_vec(part, C.nrp_stage[slot][g], (size_t)NR * Q27_HID, s);
-            for (int j = 0; j < 3; ++j)
+            for (int j = 0; j < 3 && pk[j] >= 0; ++j)
                 CK(hipMemcpyPeerAsync(C.nrp_recv[slot][pk[j]][g], g_devid_tab[pk[j]], C.nrp_stage[slot][g], g_devid_tab[g], (size_t)NR * Q27_HID * 2, s));
-        } else if (!q27_push_bf16_3(part, C.nrp_recv[slot][pk[0]][g], C.nrp_recv[slot][pk[1]][g], C.nrp_recv[slot][pk[2]][g], NR * Q27_HID, s)) {
+        } else if (!q27_push_bf16_3(part, C.nrp_recv[slot][pk[0]][g], C.nrp_recv[slot][pk[1]][g], (pk[2] >= 0) ? C.nrp_recv[slot][pk[2]][g] : nullptr, NR * Q27_HID, s)) {
             std::fprintf(stderr, "Q27_NR_P2P: push declined\n"); std::abort(); }
     }
     CK(hipEventRecord(C.ev_nrp_done[slot][g], s));
     if (slot == 0) C.b1.wait(); else C.b2.wait();          // host order only: no GPU idle behind it
     for (int k = 0; k < ndev; ++k) if (k != g) CK(hipStreamWaitEvent(s, C.ev_nrp_done[slot][k], 0));
+}
+
+// Q27_NR_P2P=4: the consumer half of an LL site -- spin on this card's receive slots for the current sequence number, then
+// reduce own + received in card order (+ the norm/quant tail per mode). Runs on the SAME stream right behind the push.
+static inline int nrp_ll_reduce(TpColl& C, int g, int ndev, int mode, const float* own, const unsigned short* wgt, unsigned short* hid,
+                                unsigned short* y, signed char* xq, float* xs, int plus_one, float in_scale, int NR, hipStream_t s, bool trunk = false) {
+    const unsigned seq = C.nrp_seq[g];
+    const int sl = (int)(seq & (Q27_LL_SLOTS - 1));
+    int pk[3] = {-1, -1, -1}, np = 0; for (int k = 0; k < ndev; ++k) if (k != g) pk[np++] = k;
+    int ok = 0;
+    const auto reduce = trunk ? q27_red_rn_nr_ll_trunk : q27_red_rn_nr_ll;
+    TPF(TPF_LL_RED, s, ok = reduce(mode, own, g, ndev, C.nrp_ll[sl][g][pk[0]], C.nrp_ll[sl][g][pk[1]], (np > 2) ? C.nrp_ll[sl][g][pk[2]] : nullptr, seq,
+                                             C.nrp_red[g], C.nrp_ssp[g], wgt, hid, y, xq, xs, Q27_HID, plus_one, in_scale, NR, C.nrp_err[g], C.nrp_cnt[g], s));
+    return ok;
 }
 
 // ---- DFlash2 conditioning diagnostic state ----
@@ -2225,7 +3490,7 @@ static int df2_reduce_cb(void* u, int g, const float* own, float* red, float* ss
     TpColl* C = (TpColl*)u;
     nrp_site(*C, g, C->ndev, 0, s, own, NR, 1);   // bf16 push + host barrier + wait peers' done
     const int* pk = nrp_peers(g);
-    if (!q27_red_rn_nr_local(2, own, g, C->nrp_recv[0][g][pk[0]], C->nrp_recv[0][g][pk[1]], C->nrp_recv[0][g][pk[2]],
+    if (!q27_red_rn_nr_local(2, own, g, C->nrp_recv[0][g][pk[0]], C->nrp_recv[0][g][pk[1]], (pk[2] >= 0) ? C->nrp_recv[0][g][pk[2]] : nullptr,
                              red, ssp, nullptr, nullptr, nullptr, nullptr, nullptr, Q27_HID, 0, 0.f, NR, s)) return 0;
     CK(hipEventRecord(C->ev_nrp_rd[0][g], s));   // peers' next push must wait for this read
     return 1;
@@ -2268,20 +3533,39 @@ template <class F>
 static inline void nr_chunks(int NR, F&& f) {
     for (int c0 = 0; c0 < NR; c0 += g_nr_ch) f(c0, (NR - c0 < g_nr_ch) ? (NR - c0) : g_nr_ch);
 }
+// The pre-enqueued consumer's wait on the host-published flag: CP barrier-value packet (shipped)
+// or, under Q27_WAIT_KERNEL=1, a spinning wave that only stalls its own stream.
+static inline void tp_flag_wait(hipStream_t s, TpColl& C, int g, unsigned gn) {
+    if (g_wait_kernel) q27_wait_flag_eq((const unsigned*)(C.flag_d + g), gn, s);
+    else CK(hipStreamWaitValue32(s, (void*)(C.flag_d + g), gn, hipStreamWaitValueEq, 0xffffffffu));
+}
 static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int gsraw, int fsraw,
                             int g, int ndev, TpColl& C, double* mark, bool first,
                             const q27_layer_t* Lnext, const q27_globals_t* G) {
     hipStream_t s = d.stream;
+    const float rshare = 1.0f / (float)ndev;   // Q27_TP3: residual share per worker
+    const bool prequeue = g_nr_warmed && !(g_host_tail_mask & (1u << g));
     const int HID = Q27_HID;
     const int gslot = L->is_full ? 0 : gsraw, fslot = L->is_full ? fsraw : 0;
-    const int QL = Q27_QROWS / ndev, KVL = Q27_KVROWS / ndev, OL = Q27_OROWS / ndev;
-    const int QKVL = Q27_GDN_QKV / ndev, ZL = Q27_GDN_Z / ndev, IL = Q27_INTER / ndev, VHL = Q27_GDN_VH / ndev;
-    const int QS = QL + 2 * KVL;                                                  // qkva row stride
-    const int MIXL = (Q27_GDN_Z > Q27_OROWS ? Q27_GDN_Z : Q27_OROWS) / ndev;      // mixer row stride
+    // Q27_TP3 (2026-09-28): this worker's shard geometry comes from the plan table (uniform at
+    // ndev 1/2/4, ragged whole-KV-group / whole-key-head ranges at ndev 3).
+    const q27_tp_shard_t* const T = q27_tp_shard(g);
+    const int QL = T->QL, KVL = T->KVL, OL = T->OL;
+    const int QKVL = T->QKVL, ZL = T->ZL, IL = mlp_len(d.id), VHL = T->VHL;
+    const int QS = T->QS;                                                         // qkva row stride
+    const int MIXL = T->MIXL;                                                     // mixer row stride
     const int n_gdn = Q27_LAYERS - Q27_LAYERS / 4;
     const size_t sshard = (size_t)VHL * Q27_GDN_D * Q27_GDN_D;
+    (void)ndev;
     unsigned short* const hid = d.hidden_slots;                                   // rows 0..NR-1, stride HID
     const int p2p_ = (g_nr_p2p && NR >= g_nr_p2p_min) ? g_nr_p2p : 0;   // transport for this pass (row-count conditional)
+    // Q27_LL_EPI: arm the producer-epilogue LL pack for the NEXT site (sequence C.nrp_seq[g]+1, its slot) for the chunk starting at row c0
+    auto ll_arm = [&](int c0) {
+        if (p2p_ != 4 || !g_ll_epi) return;
+        const unsigned seq = C.nrp_seq[g] + 1u; const int sl = (int)(seq & (Q27_LL_SLOTS - 1));
+        q27_ll_hint_arm(C.nrp_llstage[sl][g] + (size_t)c0 * Q27_HID, seq);
+    };
+    auto ll_settle = [&]() { if (p2p_ == 4 && g_ll_epi) { ++g_ll_epi_armed[g]; if (q27_ll_hint_done()) { C.nrp_prepacked[g] = 1; ++g_ll_epi_taken[g]; } else { C.nrp_prepacked[g] = 0; } } };
     float* const part  = p2p_ ? C.nrp_part[0][g] : d.nr_mixer;                  // [NR][HID] partial payload, site 1 (peer-visible slot 0 under Q27_NR_P2P)
     float* const part2 = p2p_ ? C.nrp_part[1][g] : d.nr_mixer;                  // site 2 (slot 1)
     const float in_s = L->is_full ? L->q_proj.in_scale : L->in_qkv.in_scale;
@@ -2313,75 +3597,172 @@ static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int 
     }
     C.pre_in[g] = 0;
 
-    auto enq_pro = [&](const q27_layer_t* Lx, int fsx, int gsx) {
+    auto enq_pro_impl = [&](const q27_layer_t* Lx, int fsx, int gsx) {
         if (Lx->is_full) {
             nr_chunks(NR, [&](int c0, int cn) {
+                if (Lx->ex_q.live() && Lx->ex_k.live() && Lx->ex_v.live()) {
+                    exl3_bf16(d, Lx->ex_q, d.nr_norm + (size_t)c0 * HID, d.nr_qkva + (size_t)c0 * QS,            cn, s, HID, QS);
+                    exl3_bf16(d, Lx->ex_k, d.nr_norm + (size_t)c0 * HID, d.nr_qkva + (size_t)c0 * QS + QL,       cn, s, HID, QS);
+                    exl3_bf16(d, Lx->ex_v, d.nr_norm + (size_t)c0 * HID, d.nr_qkva + (size_t)c0 * QS + QL + KVL, cn, s, HID, QS);
+                } else {
+                const q27_fp8_t* sw[3] = { &Lx->q_proj, &Lx->k_proj, &Lx->v_proj };
+                unsigned short* sy[3] = { d.nr_qkva + (size_t)c0 * QS, d.nr_qkva + (size_t)c0 * QS + QL, d.nr_qkva + (size_t)c0 * QS + QL + KVL };
+                const int sst[3] = { QS, QS, QS };
+                if (!(g_proj_seg && q27_proj_i8g_bf16_seg(sw, sy, sst, 3, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), cn, s))) {   // Q27_PROJ_SEG: one launch
                 P_FP8_BF16(&Lx->q_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS,            QS, cn, s);
                 P_FP8_BF16(&Lx->k_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS + QL,       QS, cn, s);
                 P_FP8_BF16(&Lx->v_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS + QL + KVL, QS, cn, s);
+                }
+                }
+                if (g_nr_dup & 8) {   // duplicate: q/k/v projections, same stores
+                    P_FP8_BF16(&Lx->q_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS,            QS, cn, s);
+                    P_FP8_BF16(&Lx->k_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS + QL,       QS, cn, s);
+                    P_FP8_BF16(&Lx->v_proj, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkva + (size_t)c0 * QS + QL + KVL, QS, cn, s);
+                }
             });
-            signed char* kc = d.kc + (size_t)fsx * d.tp_kv;  float* ks = d.ks + (size_t)fsx * d.tp_kvs;
-            signed char* vc = d.vc + (size_t)fsx * d.tp_kv;  float* vs = d.vs + (size_t)fsx * d.tp_kvs;
-            const int kvstride = g_ls ? Q27_KVROWS : KVL;
-            const int hoff0    = g_ls ? g * KVL : 0;
+            signed char* kc = d.kc + d.kv_off[fsx];   q27_kvs_t* ks = d.ks + d.kvs_off[fsx];
+            signed char* vc = d.vc + Q27_VOFF(d.kv_off[fsx]);   q27_kvs_t* vs = d.vs + Q27_VSOFF(d.kvs_off[fsx]);
+            const int kvstride = d.kv_rowstride[fsx];
+            const int hoff0    = d.kv_hoff[fsx];
+            static const bool attn_q = q27_env_flag("Q27_ATTN_Q", false);
+            int attn_q_ok = attn_q ? 1 : 0;
             // all NR rows in one prep launch (every row.s K/V lands before any row attends) and one
             // decode launch (row r attends to pos0 + r + 1 positions)
             if (g_nr_att1) {   // bisect: per-row launches
                 for (int r = 0; r < NR; ++r)
                     q27_attn_prep_tp(d.nr_qkva + (size_t)r * QS, Lx->q_norm, Lx->k_norm, kc, ks, vc, vs,
-                                     d.nr_qh + (size_t)r * Q27_OROWS, pos0 + r, ndev, kvstride, hoff0, s);
-                for (int r = 0; r < NR; ++r)
-                    q27_attn_decode_tp(d.nr_qh + (size_t)r * Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)r * QS,
-                                       d.nr_mix6 + (size_t)r * MIXL, pos0 + r, ndev, kvstride, hoff0, nullptr, nullptr, 0.0f, s);
+                                     d.nr_qh + (size_t)r * Q27_OROWS, pos0 + r, T->attn_g, kvstride, hoff0, s);
+                for (int r = 0; r < NR; ++r) {
+                    if (attn_q)
+                        attn_q_ok &= q27_attn_decode_tp(d.nr_qh + (size_t)r * Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)r * QS,
+                                           d.nr_mix6 + (size_t)r * MIXL, pos0 + r, T->attn_g, kvstride, hoff0,
+                                           d.nr_xq + (size_t)r * OL, d.nr_xs + (size_t)r * (OL / 16), Lx->o_proj.in_scale, s, OL);
+                    else
+                        q27_attn_decode_tp(d.nr_qh + (size_t)r * Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)r * QS,
+                                           d.nr_mix6 + (size_t)r * MIXL, pos0 + r, T->attn_g, kvstride, hoff0, nullptr, nullptr, 0.0f, s);
+                }
             } else {
-            nr_chunks(NR, [&](int c0, int cn) {
+            TPF(TPF_TR_ATTN, s, nr_chunks(NR, [&](int c0, int cn) {
             q27_attn_prep_tp_nr(d.nr_qkva + (size_t)c0 * QS, QS, Lx->q_norm, Lx->k_norm, kc, ks, vc, vs,
-                                d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, pos0 + c0, cn, ndev, kvstride, hoff0, s);
-            q27_attn_decode_tp_nr(d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)c0 * QS, QS,
-                                  d.nr_mix6 + (size_t)c0 * MIXL, MIXL, pos0 + c0, cn, ndev, kvstride, hoff0, s);
-            });
+                                d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, pos0 + c0, cn, T->attn_g, kvstride, hoff0, s);
+            if (attn_q)
+                attn_q_ok &= q27_attn_decode_tp_nr(d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)c0 * QS, QS,
+                                  d.nr_mix6 + (size_t)c0 * MIXL, MIXL, pos0 + c0, cn, T->attn_g, kvstride, hoff0, s,
+                                  d.nr_xq + (size_t)c0 * OL, d.nr_xs + (size_t)c0 * (OL / 16), Lx->o_proj.in_scale, OL);
+            else
+                q27_attn_decode_tp_nr(d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)c0 * QS, QS,
+                                  d.nr_mix6 + (size_t)c0 * MIXL, MIXL, pos0 + c0, cn, T->attn_g, kvstride, hoff0, s);
+            }));
             }
+            if (g_nr_dup & 1) {   // duplicate: idempotent stores -> d(wall)/d(attention) on the SHIPPED path
+                if (g_nr_att1) {
+                    for (int r = 0; r < NR; ++r)
+                        q27_attn_decode_tp(d.nr_qh + (size_t)r * Q27_OROWS, kc, ks, vc, vs, d.nr_qkva + (size_t)r * QS,
+                                           d.nr_mix6 + (size_t)r * MIXL, pos0 + r, T->attn_g, kvstride, hoff0, nullptr, nullptr, 0.0f, s);
+                } else {
+                    nr_chunks(NR, [&](int c0, int cn) {
+                        q27_attn_decode_tp_nr(d.nr_qh + (size_t)c0 * Q27_OROWS, Q27_OROWS, kc, ks, vc, vs,
+                                              d.nr_qkva + (size_t)c0 * QS, QS, d.nr_mix6 + (size_t)c0 * MIXL, MIXL,
+                                              pos0 + c0, cn, T->attn_g, kvstride, hoff0, s);
+                    });
+                }
+            }
+            if (!attn_q_ok) {
             if (g_nr_qb) nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(d.nr_mix6 + (size_t)c0 * MIXL, (size_t)MIXL, d.nr_xq + (size_t)c0 * OL, (size_t)OL, d.nr_xs + (size_t)c0 * (OL / 16), (size_t)(OL / 16), OL, Lx->o_proj.in_scale, cn, s); });
             else for (int r = 0; r < NR; ++r) q27_quant_fp8(d.nr_mix6 + (size_t)r * MIXL, d.nr_xq + (size_t)r * OL, d.nr_xs + (size_t)r * (OL / 16), OL, Lx->o_proj.in_scale, s);
-            nr_chunks(NR, [&](int c0, int cn) { P_FP8_RES(&Lx->o_proj, d.nr_xq + (size_t)c0 * OL, d.nr_xs + (size_t)c0 * (OL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, 0.25f, cn, s); });
+            }
+            nr_chunks(NR, [&](int c0, int cn) {
+                ll_arm(c0);   // Q27_LL_EPI: this producer feeds site 1 (the next site)
+                if (exl3_f32(d, Lx->ex_o, d.nr_mix6 + (size_t)c0 * MIXL, part + (size_t)c0 * HID, cn, s, MIXL, HID))
+                    q27_exl3_add_res(part + (size_t)c0 * HID, hid + (size_t)c0 * HID, rshare, HID, cn, HID, HID, s);
+                else P_FP8_RES(&Lx->o_proj, d.nr_xq + (size_t)c0 * OL, d.nr_xs + (size_t)c0 * (OL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s); });
+            ll_settle();
+            if (g_nr_dup & 16) nr_chunks(NR, [&](int c0, int cn) {   // duplicate: o_proj (validate by hash)
+                P_FP8_RES(&Lx->o_proj, d.nr_xq + (size_t)c0 * OL, d.nr_xs + (size_t)c0 * (OL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s);
+            });
+            if (g_nr_dup & 32) {   // duplicate: the attention-output quantize (store-only)
+                if (g_nr_qb) nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(d.nr_mix6 + (size_t)c0 * MIXL, (size_t)MIXL, d.nr_xq + (size_t)c0 * OL, (size_t)OL, d.nr_xs + (size_t)c0 * (OL / 16), (size_t)(OL / 16), OL, Lx->o_proj.in_scale, cn, s); });
+                else for (int r = 0; r < NR; ++r) q27_quant_fp8(d.nr_mix6 + (size_t)r * MIXL, d.nr_xq + (size_t)r * OL, d.nr_xs + (size_t)r * (OL / 16), OL, Lx->o_proj.in_scale, s);
+            }
         } else {
             nr_chunks(NR, [&](int c0, int cn) {
+                if (Lx->ex_iqkv[0].live() && Lx->ex_iz.live()) {
+                    { int off = 0;
+                      for (int r = 0; r < 3; ++r) {
+                          exl3_bf16(d, Lx->ex_iqkv[r], d.nr_norm + (size_t)c0 * HID,
+                                    d.nr_qkv + (size_t)c0 * QKVL + off, cn, s, HID, QKVL);
+                          off += Lx->ex_iqkv[r].out; } }
+                    exl3_bf16(d, Lx->ex_iz,   d.nr_norm + (size_t)c0 * HID, d.nr_zbuf + (size_t)c0 * ZL,   cn, s, HID, ZL);
+                } else {
+                const q27_fp8_t* sw[2] = { &Lx->in_qkv, &Lx->in_z };
+                unsigned short* sy[2] = { d.nr_qkv + (size_t)c0 * QKVL, d.nr_zbuf + (size_t)c0 * ZL };
+                const int sst[2] = { QKVL, ZL };
+                if (!(g_proj_seg && q27_proj_i8g_bf16_seg(sw, sy, sst, 2, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), cn, s))) {   // Q27_PROJ_SEG: one launch
                 P_FP8_BF16(&Lx->in_qkv, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkv + (size_t)c0 * QKVL,  QKVL, cn, s);
                 P_FP8_BF16(&Lx->in_z,   d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_zbuf + (size_t)c0 * ZL,   ZL,   cn, s);
+                }
+                }
+                if (g_nr_dup & 8) {   // duplicate: in_qkv / in_z, same stores
+                    P_FP8_BF16(&Lx->in_qkv, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_qkv + (size_t)c0 * QKVL,  QKVL, cn, s);
+                    P_FP8_BF16(&Lx->in_z,   d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16), d.nr_zbuf + (size_t)c0 * ZL,   ZL,   cn, s);
+                }
             });
             // a/b per chunk (tile form, identical arithmetic); rows at stride VHL
-            nr_chunks(NR, [&](int c0, int cn) {
+            const bool gdn_ab_conv = q27_env_flag("Q27_GDN_AB_CONV", false) && !g_nr_gdn1;
+            const bool g_dn_scan_q = q27_env_flag("Q27_GDN_SCAN_Q", false) && !g_nr_gdn1;
+            if (!gdn_ab_conv) nr_chunks(NR, [&](int c0, int cn) {
                 q27_bf16_gemv2_tile(Lx->in_a, Lx->in_b, d.nr_norm + (size_t)c0 * HID, HID,
                                     d.nr_ab + (size_t)c0 * VHL, d.nr_bb + (size_t)c0 * VHL, VHL, HID, cn, s);
             });
-            unsigned short* convp = d.conv + (size_t)gsx * d.tp_conv;
-            float* Sp = d.S + (size_t)gsx * d.tp_s + (g_ls ? (size_t)g * sshard : 0);
+            unsigned short* convp = d.conv + d.conv_off[gsx];
+            float* Sp = d.S + d.s_off[gsx] + d.s_qoff[gsx];
             // conv and the recurrence over the NR rows in ONE launch each (the prefill scan/tile forms),
             // both writing bank t = the state after row t for t < NR-1 (no copies).
             if (g_nr_gdn1) {   // bisect: per-row conv + step with memcpy snapshots
                 for (int r = 0; r < NR; ++r) {
-                    q27_gdn_conv_tp(d.nr_qkv + (size_t)r * QKVL, convp, g_ls ? 1 : 0, Lx->conv1d, g, ndev, s);
-                    q27_gdn_step_tp(d.nr_qkv + (size_t)r * QKVL, d.nr_zbuf + (size_t)r * ZL, d.nr_ab + (size_t)r * VHL, d.nr_bb + (size_t)r * VHL,
-                                    Lx->A_log, Lx->dt_bias, Lx->gdn_norm, Sp, d.nr_mix6 + (size_t)r * MIXL, g, ndev, nullptr, nullptr, 0.0f, s);
+                    q27_gdn_conv_tp_r(d.nr_qkv + (size_t)r * QKVL, convp, d.conv_wide[gsx], Lx->conv1d, T->gk_h0, T->gk_hn, s);
+                    q27_gdn_step_tp_r(d.nr_qkv + (size_t)r * QKVL, d.nr_zbuf + (size_t)r * ZL, d.nr_ab + (size_t)r * VHL, d.nr_bb + (size_t)r * VHL,
+                                    Lx->A_log, Lx->dt_bias, Lx->gdn_norm, Sp, d.nr_mix6 + (size_t)r * MIXL, T->gk_h0, T->gk_hn, nullptr, nullptr, 0.0f, s);
                     if (r < NR - 1) {
                         CK(hipMemcpyAsync(d.nr_Ssnap + ((size_t)r * n_gdn + gsx) * sshard, Sp, sshard * 4, hipMemcpyDeviceToDevice, s));
-                        CK(hipMemcpyAsync(d.nr_csnap + ((size_t)r * n_gdn + gsx) * d.tp_conv, convp, d.tp_conv * 2, hipMemcpyDeviceToDevice, s));
+                        CK(hipMemcpyAsync(d.nr_csnap + ((size_t)r * n_gdn + gsx) * d.tp_conv, convp, d.conv_bytes[gsx], hipMemcpyDeviceToDevice, s));
                     }
                 }
             } else {
-            nr_chunks(NR, [&](int c0, int cn) {
-            q27_gdn_conv_tp_tile2(d.nr_qkv + (size_t)c0 * QKVL, QKVL, cn, convp, g_ls ? 1 : 0, Lx->conv1d, g, ndev,
+            TPF(TPF_TR_GDN, s, nr_chunks(NR, [&](int c0, int cn) {
+            if (gdn_ab_conv) {
+                q27_gdn_ab_conv_tp_tile2_r(Lx->in_a, Lx->in_b, d.nr_norm + (size_t)c0 * HID, HID,
+                    d.nr_ab + (size_t)c0 * VHL, d.nr_bb + (size_t)c0 * VHL, VHL, HID,
+                    d.nr_qkv + (size_t)c0 * QKVL, QKVL, cn, convp, d.conv_wide[gsx], Lx->conv1d, T->gk_h0, T->gk_hn,
+                    d.nr_csnap + (size_t)(gsx + c0 * n_gdn) * d.tp_conv, (size_t)n_gdn * d.tp_conv, (c0 + cn < NR) ? 1 : 0, s);
+            } else {
+            q27_gdn_conv_tp_tile2_r(d.nr_qkv + (size_t)c0 * QKVL, QKVL, cn, convp, d.conv_wide[gsx], Lx->conv1d, T->gk_h0, T->gk_hn,
                                   d.nr_csnap + (size_t)(gsx + c0 * n_gdn) * d.tp_conv, (size_t)n_gdn * d.tp_conv, (c0 + cn < NR) ? 1 : 0, s);
-            q27_gdn_scan_tp_snap(d.nr_qkv + (size_t)c0 * QKVL, QKVL, d.nr_zbuf + (size_t)c0 * ZL, ZL,
-                                 d.nr_ab + (size_t)c0 * VHL, d.nr_bb + (size_t)c0 * VHL, VHL,
-                                 Lx->A_log, Lx->dt_bias, Lx->gdn_norm, Sp, d.nr_mix6 + (size_t)c0 * MIXL, MIXL, g, ndev, cn,
-                                 nullptr, nullptr, 0.0f, d.nr_Ssnap + (size_t)(gsx + c0 * n_gdn) * sshard, (size_t)n_gdn * sshard, (c0 + cn < NR) ? 1 : 0, s);
-            });
             }
+            q27_gdn_scan_tp_snap_r(d.nr_qkv + (size_t)c0 * QKVL, QKVL, d.nr_zbuf + (size_t)c0 * ZL, ZL,
+                                 d.nr_ab + (size_t)c0 * VHL, d.nr_bb + (size_t)c0 * VHL, VHL,
+                                 Lx->A_log, Lx->dt_bias, Lx->gdn_norm, Sp, d.nr_mix6 + (size_t)c0 * MIXL, MIXL, T->gk_h0, T->gk_hn, cn,
+                                 // Q27_GDN_SCAN_Q: scan's epilogue quantizes into nr_xq/nr_xs (same
+                                 // arithmetic as q27_quant_fp8_b), so the separate quant launch is skipped.
+                                 g_dn_scan_q ? d.nr_xq + (size_t)c0 * ZL : nullptr,
+                                 g_dn_scan_q ? d.nr_xs + (size_t)c0 * (ZL / 16) : nullptr,
+                                 g_dn_scan_q ? Lx->out_proj.in_scale : 0.0f,
+                                 d.nr_Ssnap + (size_t)(gsx + c0 * n_gdn) * sshard, (size_t)n_gdn * sshard, (c0 + cn < NR) ? 1 : 0, s);
+            }));
+            }
+            if (!g_dn_scan_q) {
             if (g_nr_qb) nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(d.nr_mix6 + (size_t)c0 * MIXL, (size_t)MIXL, d.nr_xq + (size_t)c0 * ZL, (size_t)ZL, d.nr_xs + (size_t)c0 * (ZL / 16), (size_t)(ZL / 16), ZL, Lx->out_proj.in_scale, cn, s); });
             else for (int r = 0; r < NR; ++r) q27_quant_fp8(d.nr_mix6 + (size_t)r * MIXL, d.nr_xq + (size_t)r * ZL, d.nr_xs + (size_t)r * (ZL / 16), ZL, Lx->out_proj.in_scale, s);
-            nr_chunks(NR, [&](int c0, int cn) { P_FP8_RES(&Lx->out_proj, d.nr_xq + (size_t)c0 * ZL, d.nr_xs + (size_t)c0 * (ZL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, 0.25f, cn, s); });
+            }
+            nr_chunks(NR, [&](int c0, int cn) { ll_arm(c0); P_FP8_RES(&Lx->out_proj, d.nr_xq + (size_t)c0 * ZL, d.nr_xs + (size_t)c0 * (ZL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s); });
+            ll_settle();
+            if (g_nr_dup & 16) nr_chunks(NR, [&](int c0, int cn) {   // duplicate: out_proj (validate by hash)
+                P_FP8_RES(&Lx->out_proj, d.nr_xq + (size_t)c0 * ZL, d.nr_xs + (size_t)c0 * (ZL / 16), part + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s);
+            });
         }
+    };
+    auto enq_pro = [&](const q27_layer_t* Lx, int fsx, int gsx) {
+        TPF(TPF_PROJ_FP8, s, enq_pro_impl(Lx, fsx, gsx));
     };
     if (!pro_in) enq_pro(L, fslot, gslot);
 
@@ -2389,34 +3770,197 @@ static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int 
     unsigned cg1 = 0, gn1 = 0;
     if (p2p_) {
         nrp_site(C, g, ndev, 0, s, part, NR, p2p_);      // v2: wait peers rd, push bf16 rows to the peers, record done; barrier; wait peers done
-        if (p2p_ == 2) {
+        if (p2p_ == 4) {
+            if (!nrp_ll_reduce(C, g, ndev, 1, part, L->post_norm, hid, nullptr, d.nr_xq, d.nr_xs, 1, L->gate.in_scale, NR, s, true)) { std::fprintf(stderr, "Q27_NR_P2P=4: site 1 declined\n"); std::abort(); }
+        } else if (p2p_ == 2) {
             if (!q27_red_rn_nr_p2p(1, C.nrp_part[0][0], C.nrp_part[0][1], C.nrp_part[0][2], C.nrp_part[0][3], C.nrp_red[g], C.nrp_ssp[g],
                                    L->post_norm, hid, nullptr, d.nr_xq, d.nr_xs, HID, 1, L->gate.in_scale, NR, s)) { std::fprintf(stderr, "Q27_NR_P2P: site 1 declined\n"); std::abort(); }
         } else {
             const int* pk = nrp_peers(g);
-            if (!q27_red_rn_nr_local(1, part, g, C.nrp_recv[0][g][pk[0]], C.nrp_recv[0][g][pk[1]], C.nrp_recv[0][g][pk[2]], C.nrp_red[g], C.nrp_ssp[g],
+            if (!q27_red_rn_nr_local(1, part, g, NRP_RECV(0, g, pk, 0), NRP_RECV(0, g, pk, 1), NRP_RECV(0, g, pk, 2), C.nrp_red[g], C.nrp_ssp[g],
                                      L->post_norm, hid, nullptr, d.nr_xq, d.nr_xs, HID, 1, L->gate.in_scale, NR, s)) { std::fprintf(stderr, "Q27_NR_P2P: site 1 declined\n"); std::abort(); }
         }
-        CK(hipEventRecord(C.ev_nrp_rd[0][g], s));
+        if (p2p_ != 4) CK(hipEventRecord(C.ev_nrp_rd[0][g], s));
     } else {
         cg1 = pro_in ? C.pre_gen[g] : tp_stage_out_nr(C, g, part, NR, s);
         gn1 = ++C.gen[g];
-        CK(hipStreamWaitValue32(s, (void*)(C.flag_d + g), gn1, hipStreamWaitValueEq, 0xffffffffu));
+        if (prequeue) tp_flag_wait(s, C, g, gn1);
+        else { tp_stage_wait(C,g,cg1);tp_allreduce_nr(C,g,NR);C.n_coll[g]++; }
     }
-    nr_chunks(NR, [&](int c0, int cn) {
+    TPF(TPF_TR_MLP, s, nr_chunks(NR, [&](int c0, int cn) {
+        // ---- Q27_DEC_MLP_I8: this layer's MLP is the persistent int8 mirror, so run the SAME
+        // rocBLAS/Tensile path the prefill uses and let the NVFP4 MLP shard stay unallocated. The
+        // decode's intermediate is per-card (IL = INTER/ndev) and contiguous, so gate/up are one
+        // full-K GEMM each on a ROW view of the mirror and down is one GEMM on a COLUMN view of it
+        // (ldw = the full INTER), with every per-row scale applied after the collective reduction --
+        // a K-shard's int32 partial is in the same units, so the K-view is sound here exactly as it
+        // is in the prefill. ----
+        if (L->dc_gate8r.w && L->dc_up8r.w && L->dc_down8r.w) {
+            const q27_i8r_t* G8 = &L->dc_gate8r; const q27_i8r_t* U8 = &L->dc_up8r;
+            const q27_i8r_t* D8 = &L->dc_down8r;
+            int* ag = (int*)(d.nr_pa + (size_t)c0 * IL);
+            int* au = (int*)(d.nr_pb + (size_t)c0 * IL);
+            int* ad = d.nr_acc + (size_t)c0 * HID;
+            if (!p2p_) q27_rmsnorm_hostss_tok_b(g_coll_acc + (size_t)c0 * HID, L->post_norm,
+                                                d.nr_xq + (size_t)c0 * HID, d.nr_xs + c0, HID, 1,
+                                                L->gate.in_scale, C.invN_d + g * 8 + c0, cn, 0, s);
+            if (!q27_rb_gemm_i8g(d.id, G8->w, G8->rows, G8->K, d.nr_xq + (size_t)c0 * HID, cn, ag, G8->gs, s) ||
+                !q27_rb_gemm_i8g(d.id, U8->w, U8->rows, U8->K, d.nr_xq + (size_t)c0 * HID, cn, au, U8->gs, s)) {
+                std::fprintf(stderr, "Q27_DEC_MLP_I8: gate/up GEMM declined (L=%d N=%d K=%d M=%d)\n",
+                             L->layer, G8->rows, G8->K, cn); std::abort();
+            }
+            if (!q27_epi_swiglu_tok_small(ag, au, G8->rows, G8->s, U8->s, G8->ng, d.nr_xs + c0,
+                                          G8->alpha, U8->alpha, 1.0f / L->down.in_scale,
+                                          d.nr_xq + (size_t)c0 * IL, d.nr_xs + c0, cn, s)) {
+                std::fprintf(stderr, "Q27_DEC_MLP_I8: swiglu epilogue declined\n"); std::abort();
+            }
+            if (!q27_rb_gemm_i8g_ld(d.id, D8->w, D8->rows, D8->K, d.nr_xq + (size_t)c0 * IL, cn, ad,
+                                    D8->gs, Q27_INTER, s)) {
+                std::fprintf(stderr, "Q27_DEC_MLP_I8: down GEMM declined (L=%d N=%d K=%d ldw=%d M=%d)\n",
+                             L->layer, D8->rows, D8->K, Q27_INTER, cn); std::abort();
+            }
+            if (!q27_epi_f32r_bf(ad, D8->rows, D8->s, D8->ng, d.nr_xs + c0, D8->alpha,
+                                 part2 + (size_t)c0 * HID, hid + (size_t)c0 * HID, rshare, cn, s)) {
+                std::fprintf(stderr, "Q27_DEC_MLP_I8: down epilogue declined\n"); std::abort();
+            }
+            return;
+        }
+        // ---- Q27_FP8_MLP: block-scaled FP8 gate/up (Qwen3.8-27B-FP8). FIRST-BOOT SCOPE: gate/up
+        // only. The FP8 consumers take NATURAL-order int8 activations (q27.h activation contract:
+        // "FP8 projections consume the NATURAL order"), which is exactly what
+        // q27_rmsnorm_hostss_fp8_b produces; q27_swiglu_quant_b then emits the EVEN-THEN-ODD
+        // permuted order that the NVFP4 down consumer requires, so down stays on its existing path
+        // rather than being fed an ordering it cannot read. Extending down needs a natural-order
+        // swiglu quantiser, which is the next step, not a first-boot one. ----
+        if (L->f8_gate.w && L->f8_up.w && L->f8_gate.bs && L->f8_up.bs) {
+            if (!p2p_) q27_rmsnorm_hostss_fp8_b(g_coll_acc + (size_t)c0 * HID, L->post_norm, hid + (size_t)c0 * HID, nullptr,
+                                      d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                                      HID, 1, L->f8_gate.in_scale, C.invN_d + g * 8 + c0, cn, s);
+            int gu_ok = 0;
+            TPF(TPF_PROJ_NVFP4, s, gu_ok = q27_proj_fp8b_gu_nr(&L->f8_gate, &L->f8_up,
+                                  d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                                  d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, IL, cn, s));
+            if (!gu_ok) {
+                std::fprintf(stderr, "Q27_FP8_MLP: gate/up declined (L=%d rows=%d K=%d NR=%d)\n",
+                             L->layer, L->f8_gate.rows, L->f8_gate.K, cn); std::abort();
+            }
+            if (L->f8_down.w && L->f8_down.bs) {
+                // ---- Q27_TPSR: the down_proj is this card's block-scaled FP8 K-SLICE ([HID][INTER/ndev],
+                // the geometry SR's f8_dn[c] consumer already runs), fed in NATURAL order by the SR swiglu
+                // quantiser; the 0.25 residual share rides in the epilogue exactly as P_DOWN's did, so
+                // collective #2 is unchanged. The NVFP4 down shard is not resident on this arm. ----
+                if (!q27_sr_swiglu_quant_nat_b(d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+                                               d.nr_xs + (size_t)c0 * (IL / 16), IL, L->f8_down.in_scale, cn, s)) {
+                    std::fprintf(stderr, "Q27_TPSR: natural swiglu declined (L=%d NR=%d)\n", L->layer, cn); std::abort(); }
+                if (p2p_ == 2 && c0 == 0) for (int k = 0; k < ndev; ++k) if (k != g) CK(hipStreamWaitEvent(s, C.ev_nrp_rd[1][k], 0));
+                int dn_ok = 0;
+                TPF(TPF_DOWN, s, dn_ok = q27_proj_fp8b_nrs(&L->f8_down, d.nr_xq + (size_t)c0 * IL, IL, d.nr_xs + (size_t)c0 * (IL / 16),
+                                       part2 + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s));
+                if (!dn_ok) {
+                    std::fprintf(stderr, "Q27_TPSR: FP8 down slice declined (L=%d rows=%d K=%d NR=%d)\n",
+                                 L->layer, L->f8_down.rows, L->f8_down.K, cn); std::abort(); }
+                return;
+            }
+            q27_swiglu_quant_b(d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+                               d.nr_xs + (size_t)c0 * (IL / 16), IL, L->down.in_scale, cn, s);
+            if (p2p_ == 2 && c0 == 0) for (int k = 0; k < ndev; ++k) if (k != g) CK(hipStreamWaitEvent(s, C.ev_nrp_rd[1][k], 0));
+            P_DOWN(&L->down, d.nr_xq + (size_t)c0 * IL, d.nr_xs + (size_t)c0 * (IL / 16), part2 + (size_t)c0 * HID, HID,
+                   hid + (size_t)c0 * HID, HID, rshare, cn, s);
+            return;
+        }
         if (!p2p_) q27_rmsnorm_hostss_perm_b(g_coll_acc + (size_t)c0 * HID, L->post_norm, hid + (size_t)c0 * HID, nullptr,
                                   d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
                                   HID, 1, L->gate.in_scale, C.invN_d + g * 8 + c0, cn, s);
-        P_GU(&L->gate, &L->up, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
-             d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, IL, cn, s);
-        q27_swiglu_quant_b(d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+        const bool ex_mlp_done =
+            exl3_mlp(d, L, d.nr_norm + (size_t)c0 * HID, HID,
+                     d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, IL,
+                     part2 + (size_t)c0 * HID, HID, IL, cn, s) &&
+            q27_exl3_add_res(part2 + (size_t)c0 * HID, hid + (size_t)c0 * HID, rshare, HID, cn, HID, HID, s);
+        if (!ex_mlp_done) {
+        static const bool gu_swilu = q27_env_flag("Q27_GU_SWILU", false);
+        static const bool gu_swilu_q = q27_env_flag("Q27_GU_SWILU_Q", false);
+        int down_done = 0;
+        if (gu_swilu_q && cn == 1 && IL == (int)L->down.K) {
+            // one launch: GEMV + SwiGLU + group-4 quant. Writes nr_pb (int8s) and nr_pa (scales)
+            // so input nr_xq (HID) / nr_xs (HID/16) are never overwritten mid-kernel.
+            if (!q27_gu_swilu_q16(L->mx_gate.gs_mx ? &L->mx_gate : &L->gate, L->mx_up.gs_mx ? &L->mx_up : &L->up,
+                    d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                    (signed char*)(d.nr_pb + (size_t)c0 * IL), d.nr_pa + (size_t)c0 * IL, IL, L->down.in_scale, s)) {
+                std::fprintf(stderr, "FATAL Q27_TP3: gu_swilu_q16 declined (L=%d rows=%d)\n", L->layer, L->gate.rows); std::abort();
+            }
+        } else if (gu_swilu) {
+            // silu(gate)*up lands in nr_pa; quant_group4 consumes it (same permutation/scale).
+            if (!q27_proj_nvfp4_gu_swilu(L->mx_gate.gs_mx ? &L->mx_gate : &L->gate, L->mx_up.gs_mx ? &L->mx_up : &L->up,
+                    d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                    d.nr_pa + (size_t)c0 * IL, IL, cn, s)) {
+                std::fprintf(stderr, "FATAL Q27_TP3: gate/up swilu declined (L=%d rows=%d NR=%d)\n", L->layer, L->gate.rows, cn); std::abort();
+            }
+            static const bool quant_down = q27_env_flag("Q27_QUANT_DOWN", false);
+            if (quant_down && cn == 1 && (L->down.K == 5760 || L->down.K == 5888)) {
+                if (!q27_quant_down(d.nr_pa + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+                        d.nr_xs + (size_t)c0 * (IL / 16), IL, L->down.in_scale,
+                        L->mx_down.gs_mx ? &L->mx_down : &L->down,
+                        (const unsigned*)(d.nr_xq + (size_t)c0 * IL), d.nr_xs + (size_t)c0 * (IL / 16),
+                        part2 + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, IL, s)) {
+                    std::fprintf(stderr, "FATAL Q27_TP3: quant_down declined (L=%d)\n", L->layer); std::abort();
+                }
+                down_done = 1;
+            } else {
+                q27_quant_group4(d.nr_pa + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+                                 d.nr_xs + (size_t)c0 * (IL / 16), IL, L->down.in_scale, cn, s);
+            }
+        } else {
+        if (!P_GU(L->mx_gate.gs_mx ? &L->mx_gate : &L->gate, L->mx_up.gs_mx ? &L->mx_up : &L->up, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+             d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, IL, cn, s)) {
+            std::fprintf(stderr, "FATAL Q27_TP3: gate/up declined (L=%d rows=%d NR=%d)\n", L->layer, L->gate.rows, cn); std::abort();
+        }
+        q27_swiglu_quant_trunk(d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
                            d.nr_xs + (size_t)c0 * (IL / 16), IL, L->down.in_scale, cn, s);
+        }
         if (p2p_ == 2 && c0 == 0) for (int k = 0; k < ndev; ++k) if (k != g) CK(hipStreamWaitEvent(s, C.ev_nrp_rd[1][k], 0));   // pull: slot 1 free on every peer
-        P_DOWN(&L->down, d.nr_xq + (size_t)c0 * IL, d.nr_xs + (size_t)c0 * (IL / 16), part2 + (size_t)c0 * HID, HID,
-               hid + (size_t)c0 * HID, HID, 0.25f, cn, s);
-    });
-    if (!p2p_) {
-        tp_stage_wait(C, g, cg1);
+        ll_arm(c0);   // Q27_LL_EPI: this producer feeds site 2
+        if (!down_done) {
+        static const bool gu_swilu_q = q27_env_flag("Q27_GU_SWILU_Q", false);
+        const bool fused_q = gu_swilu_q && cn == 1 && IL == (int)L->down.K;
+        const signed char* down_xq = fused_q
+            ? (const signed char*)(d.nr_pb + (size_t)c0 * IL)
+            : d.nr_xq + (size_t)c0 * IL;
+        const float* down_xs = fused_q
+            ? (d.nr_pa + (size_t)c0 * IL)
+            : (d.nr_xs + (size_t)c0 * (IL / 16));
+        if (!P_DOWN(L->mx_down.gs_mx ? &L->mx_down : &L->down, down_xq, down_xs, part2 + (size_t)c0 * HID, HID,
+               hid + (size_t)c0 * HID, HID, rshare, cn, s)) {
+            std::fprintf(stderr, "FATAL Q27_TP3: down_proj declined (L=%d K=%d NR=%d) -- no kernel instantiation for this shard width\n", L->layer, L->down.K, cn); std::abort();
+        }
+        }
+        }   // !ex_mlp_done
+        // BIT 64 (2026-09-17): DOWN_PROJ ALONE. The 08:21 note below blamed P_DOWN for the invalid
+        // whole-trio arm. That diagnosis is WRONG and it cost the estate the largest unpriced GPU
+        // stage. q27_proj_nvfp4_down_nr epilogue is v = acc*alpha; if (radd) v += rs*bf2f(radd[..]);
+        // Y[..] = v -- ONE output pointer (part2), one READ-ONLY bf16 residual (radd = hid). A pure
+        // store, the same shape bit 16 already duplicates. What actually broke the trio is ALIASING:
+        // d.nr_xq is a single activation scratch viewed at stride HID=5120 by gate/up and at stride
+        // IL=4352 by swiglu, and at c0=0 the two views overlap byte-for-byte -- so a duplicated
+        // swiglu overwrites the gate/up input it is about to be re-fed. Bit 2 survives only because
+        // its duplicate sits AFTER this call. Bit 64 therefore goes HERE, before bit 2 clobbers
+        // nr_xq, where the inputs are still the ones P_DOWN just consumed.
+        if (g_nr_dup & 64) P_DOWN(L->mx_down.gs_mx ? &L->mx_down : &L->down, d.nr_xq + (size_t)c0 * IL, d.nr_xs + (size_t)c0 * (IL / 16),
+                                  part2 + (size_t)c0 * HID, HID, hid + (size_t)c0 * HID, HID, rshare, cn, s);
+        // BIT 2 DUPLICATES ONLY THE STORE-ONLY PART OF THE MLP. Receipt: duplicating the whole trio
+        // (2026-09-17 08:21, Q27_NR_DUP=2 with down included) CHANGED THE TOKEN STREAM -- 8,192-token
+        // repetition cap, tokhash b65f6e92e04f54c8 vs the stashed 8b04cd30fa708350 -- so P_DOWN is
+        // not a pure store: it fuses something additive (its two output pointers plus alpha=1/ndev
+        // are the tell). An idempotent-stage discriminator is only valid where the stage stores.
+        if (g_nr_dup & 2) {   // duplicate: gate/up + swiglu only (both store their own outputs)
+            P_GU(L->mx_gate.gs_mx ? &L->mx_gate : &L->gate, L->mx_up.gs_mx ? &L->mx_up : &L->up, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                 d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, IL, cn, s);
+            q27_swiglu_quant_b(d.nr_pa + (size_t)c0 * IL, d.nr_pb + (size_t)c0 * IL, d.nr_xq + (size_t)c0 * IL,
+                               d.nr_xs + (size_t)c0 * (IL / 16), IL, L->down.in_scale, cn, s);
+        }
+    }));
+    ll_settle();
+    if (!p2p_ && prequeue) {
+        { const double tw = tp_now(); tp_stage_wait(C, g, cg1); g_collt[g][0] += tp_now() - tw; }
         C.t_comp[g] += tp_now() - *mark;
         { const double t0 = tp_now(); tp_allreduce_nr(C, g, NR);
           C.t_coll[g] += tp_now() - t0; C.n_coll[g]++; *mark = tp_now(); }
@@ -2430,25 +3974,27 @@ static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int 
     } else {
         cg2 = tp_stage_out_nr(C, g, part2, NR, s);
         gn2 = ++C.gen[g];
-        CK(hipStreamWaitValue32(s, (void*)(C.flag_d + g), gn2, hipStreamWaitValueEq, 0xffffffffu));
+        if (prequeue) tp_flag_wait(s, C, g, gn2);
+        else { tp_stage_wait(C,g,cg2);tp_allreduce_nr(C,g,NR);C.n_coll[g]++; }
     }
     if (Lnext) {
         const float in_s2 = Lnext->is_full ? Lnext->q_proj.in_scale : Lnext->in_qkv.in_scale;
         if (p2p_) {
             int ok2 = 0;
-            if (p2p_ == 2) ok2 = q27_red_rn_nr_p2p(0, C.nrp_part[1][0], C.nrp_part[1][1], C.nrp_part[1][2], C.nrp_part[1][3], C.nrp_red[g], C.nrp_ssp[g],
+            if (p2p_ == 4) ok2 = nrp_ll_reduce(C, g, ndev, 0, part2, Lnext->input_norm, hid, d.nr_norm, d.nr_xq, d.nr_xs, 1, in_s2, NR, s, true);
+            else if (p2p_ == 2) ok2 = q27_red_rn_nr_p2p(0, C.nrp_part[1][0], C.nrp_part[1][1], C.nrp_part[1][2], C.nrp_part[1][3], C.nrp_red[g], C.nrp_ssp[g],
                                                      Lnext->input_norm, hid, d.nr_norm, d.nr_xq, d.nr_xs, HID, 1, in_s2, NR, s);
             else { const int* pk = nrp_peers(g);
-                   ok2 = q27_red_rn_nr_local(0, part2, g, C.nrp_recv[1][g][pk[0]], C.nrp_recv[1][g][pk[1]], C.nrp_recv[1][g][pk[2]], C.nrp_red[g], C.nrp_ssp[g],
+                   ok2 = q27_red_rn_nr_local(0, part2, g, NRP_RECV(1, g, pk, 0), NRP_RECV(1, g, pk, 1), NRP_RECV(1, g, pk, 2), C.nrp_red[g], C.nrp_ssp[g],
                                              Lnext->input_norm, hid, d.nr_norm, d.nr_xq, d.nr_xs, HID, 1, in_s2, NR, s); }
             if (!ok2) { std::fprintf(stderr, "Q27_NR_P2P: site 2 declined\n"); std::abort(); }
-            CK(hipEventRecord(C.ev_nrp_rd[1][g], s));
-        } else nr_chunks(NR, [&](int c0, int cn) {
+            if (p2p_ != 4) CK(hipEventRecord(C.ev_nrp_rd[1][g], s));
+        } else TPF(TPF_TR_CONS, s, nr_chunks(NR, [&](int c0, int cn) {
             q27_rmsnorm_hostss_fp8_b(g_coll_acc + (size_t)c0 * HID, Lnext->input_norm, hid + (size_t)c0 * HID,
                                      d.nr_norm + (size_t)c0 * HID, d.nr_xq + (size_t)c0 * HID,
                                      d.nr_xs + (size_t)c0 * (HID / 16),
                                      HID, 1, in_s2, C.invN_d + g * 8 + c0, cn, s);
-        });
+        }));
         const int fsx = Lnext->is_full ? (fsraw + (L->is_full ? 1 : 0)) : 0;
         const int gsx = Lnext->is_full ? 0 : (gsraw + (L->is_full ? 0 : 1));
         enq_pro(Lnext, fsx, gsx);
@@ -2459,13 +4005,14 @@ static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int 
         const float* accp = g_coll_acc;
         if (p2p_) {   // reduce only: the same fp32 rows the host path leaves in g_coll_acc, local to this card
             int okh = 0;
-            if (p2p_ == 2) okh = q27_red_rn_nr_p2p(2, C.nrp_part[1][0], C.nrp_part[1][1], C.nrp_part[1][2], C.nrp_part[1][3], C.nrp_red[g], C.nrp_ssp[g],
+            if (p2p_ == 4) okh = nrp_ll_reduce(C, g, ndev, 2, part2, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 1.0f, NR, s, true);
+            else if (p2p_ == 2) okh = q27_red_rn_nr_p2p(2, C.nrp_part[1][0], C.nrp_part[1][1], C.nrp_part[1][2], C.nrp_part[1][3], C.nrp_red[g], C.nrp_ssp[g],
                                                      nullptr, nullptr, nullptr, nullptr, nullptr, HID, 0, 1.0f, NR, s);
             else { const int* pk = nrp_peers(g);
-                   okh = q27_red_rn_nr_local(2, part2, g, C.nrp_recv[1][g][pk[0]], C.nrp_recv[1][g][pk[1]], C.nrp_recv[1][g][pk[2]], C.nrp_red[g], C.nrp_ssp[g],
+                   okh = q27_red_rn_nr_local(2, part2, g, NRP_RECV(1, g, pk, 0), NRP_RECV(1, g, pk, 1), NRP_RECV(1, g, pk, 2), C.nrp_red[g], C.nrp_ssp[g],
                                              nullptr, nullptr, nullptr, nullptr, nullptr, HID, 0, 1.0f, NR, s); }
             if (!okh) { std::fprintf(stderr, "Q27_NR_P2P: head reduce declined\n"); std::abort(); }
-            CK(hipEventRecord(C.ev_nrp_rd[1][g], s));
+            if (p2p_ != 4) CK(hipEventRecord(C.ev_nrp_rd[1][g], s));
             accp = C.nrp_red[g];
         }
         for (int r = 0; r < NR; ++r) q27_add_inplace(hid + (size_t)r * HID, accp + (size_t)r * HID, HID, s);
@@ -2473,19 +4020,26 @@ static void run_layer_tp_nr(Dev& d, const q27_layer_t* L, int pos0, int NR, int 
         for (int r = 0; r < NR; ++r) q27_quant_perm(d.nr_norm + (size_t)r * HID, d.nr_xq + (size_t)r * HID,
                                                     d.nr_xs + (size_t)r * (HID / 16), HID, G->lm_head.in_scale, s);
         nr_chunks(NR, [&](int c0, int cn) {
+            if (exl3_head(d, G, d.nr_norm + (size_t)c0 * HID,
+                          d.nr_pa + (size_t)c0 * G->ex_head.out, cn, s)) return;
+            P_LM(&G->lm_head, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
+                 d.nr_pa + (size_t)c0 * G->lm_head.rows, G->lm_head.rows, cn, s);
+        });
+        if (g_nr_dup & 4) nr_chunks(NR, [&](int c0, int cn) {   // duplicate: lm_head, same stores
             P_LM(&G->lm_head, d.nr_xq + (size_t)c0 * HID, d.nr_xs + (size_t)c0 * (HID / 16),
                  d.nr_pa + (size_t)c0 * G->lm_head.rows, G->lm_head.rows, cn, s);
         });
         for (int r = 0; r < NR; ++r) q27_argmax_val(d.nr_pa + (size_t)r * G->lm_head.rows, d.nr_tok + r, d.nr_val + r, G->lm_head.rows, s);
         C.pre_in[g] = 0; C.pre_gen[g] = 0;
     }
-    if (!p2p_) {
-        tp_stage_wait(C, g, cg2);
+    if (!p2p_ && prequeue) {
+        { const double tw = tp_now(); tp_stage_wait(C, g, cg2); g_collt[g][0] += tp_now() - tw; }
         C.t_comp[g] += tp_now() - *mark;
         { const double t0 = tp_now(); tp_allreduce_nr(C, g, NR);
           C.t_coll[g] += tp_now() - t0; C.n_coll[g]++; *mark = tp_now(); }
         __atomic_store_n(&C.flag_h[g], gn2, __ATOMIC_RELEASE);
     } else { C.t_comp[g] += tp_now() - *mark; *mark = tp_now(); }
+    if (!Lnext) g_nr_warmed = true;
 }
 
 // =============================================================================================
@@ -2548,26 +4102,53 @@ static void mtp_nr_alloc(int id) {
     A((void**)&B.pa, N * Q27_INTER * 4); A((void**)&B.pb, N * Q27_INTER * 4); A((void**)&B.pd, N * HID * 4);
     B.cap = (int)N;
 }
+// ---- Q27_MTP_GRAPH: the draft pass as two captured graphs ---------------------------------
+// The draft block is a pure per-card kernel sequence -- q27_mtp_defs.h: "with NO communication at
+// all" -- so it is the one part of the step that graphs cleanly. Only TWO of its ~60 launches
+// depend on the token position (attn_prep / attn_decode take pos0), so the block is captured
+// AROUND them: graph A up to the q/k/v projections, the two position-dependent launches issued
+// normally, graph B from the attention epilogue to the head. No kernel ABI change, and no
+// per-launch node patching.
+// Because those two calls are also the only users of d.mtp_kc/vc/ks/vs, neither graph captures a
+// draft-KV pointer -- so Q27_MTP_PAGED growth cannot invalidate them. Keyed by (card, NR,
+// head_row): NR sets every buffer offset and head_row selects which row feeds the head.
+struct MtpGraph { hipGraphExec_t a = nullptr, b = nullptr; };
+static MtpGraph g_mtp_graph[Q27_MAX_DEVICES][9][10];
+static int g_mtp_graph_on = 0;
+
 static void mtp_pass_nr(Dev& d, MtpState& S, const q27_globals_t* G, int NR, const unsigned short* const* hrows,
                         const unsigned* toks, const unsigned short* emb_tbl, int dpos0, int head_row) {
     hipStream_t s = d.stream;
     mtp_nr_alloc(d.id);
     MtpNr& B = g_mtpnr[d.id];
     const float IS = g_mtp_is;
+    const int g = d.id;   // TPF bracket index (logical worker)
     const int HID = Q27_HID, QS = Q27_QROWS + 2 * Q27_KVROWS, OR = Q27_OROWS, IN = Q27_INTER;
     for (int r = 0; r < NR; ++r) spec_emb_h2d(d, B.emb + (size_t)r * HID, emb_tbl, toks[r], s);
-    for (int r = 0; r < NR; ++r) {
+    const bool gon = g_mtp_graph_on && NR >= 1 && NR <= 8 && head_row < 9;
+    MtpGraph& GR = g_mtp_graph[d.id][NR][head_row + 1];
+    auto capture = [&](void (*unused)(), hipGraphExec_t* out, const std::function<void()>& fn) {
+        (void)unused;
+        CK(hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal));
+        fn();
+        hipGraph_t gg = nullptr;
+        CK(hipStreamEndCapture(s, &gg));
+        CK(hipGraphInstantiate(out, gg, nullptr, nullptr, 0));
+        CK(hipGraphDestroy(gg));
+    };
+    std::function<void()> bodyA = [&]() {
+    TPF(TPF_DR_PRE, s, ([&]{ for (int r = 0; r < NR; ++r) {
         unsigned short* cat = B.cat + (size_t)r * 2 * HID;
         q27_rmsnorm(B.emb + (size_t)r * HID, S.W.pre_emb, cat + mtp_emb_off(), HID, g_mtp_po, s);
         q27_rmsnorm(hrows[r], S.W.pre_hid, cat + mtp_hid_off(), HID, g_mtp_po, s);
         q27_quant_perm(cat,       B.xqa + (size_t)r * HID, B.xsa + (size_t)r * (HID / 16), HID, IS, s);
         q27_quant_perm(cat + HID, B.xqb + (size_t)r * HID, B.xsb + (size_t)r * (HID / 16), HID, IS, s);
-    }
-    nr_chunks(NR, [&](int c0, int cn) {
+    } })());
+    TPF(TPF_DR_FC, s, nr_chunks(NR, [&](int c0, int cn) {
         q27_proj_nvfp4_nr(&S.W.fc[0], B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.pa + (size_t)c0 * HID, HID, cn, s);
         q27_proj_nvfp4_nr(&S.W.fc[1], B.xqb + (size_t)c0 * HID, B.xsb + (size_t)c0 * (HID / 16), B.pb + (size_t)c0 * HID, HID, cn, s);
-    });
-    for (int r = 0; r < NR; ++r) {
+    }));
+    TPF(TPF_DR_PRE, s, ([&]{ for (int r = 0; r < NR; ++r) {
         q27_f2bf_vec(B.pa + (size_t)r * HID, B.nrm + (size_t)r * HID, HID, s);          // residual stream
         q27_add_inplace(B.nrm + (size_t)r * HID, B.pb + (size_t)r * HID, HID, s);
         if (!q27_rmsnorm_quant_fp8(B.nrm + (size_t)r * HID, S.W.in_norm, B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID,
@@ -2575,52 +4156,145 @@ static void mtp_pass_nr(Dev& d, MtpState& S, const q27_globals_t* G, int NR, con
             q27_rmsnorm(B.nrm + (size_t)r * HID, S.W.in_norm, B.hid + (size_t)r * HID, HID, g_mtp_po, s);
             q27_quant_fp8(B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID, B.xsa + (size_t)r * (HID / 16), HID, IS, s);
         }
-    }
-    nr_chunks(NR, [&](int c0, int cn) {
+    } })());
+    TPF(TPF_DR_QKV, s, nr_chunks(NR, [&](int c0, int cn) {
         q27_proj_fp8_bf16_nr(&S.W.q, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS, QS, cn, s);
         q27_proj_fp8_bf16_nr(&S.W.k, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS + Q27_QROWS, QS, cn, s);
         q27_proj_fp8_bf16_nr(&S.W.v, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS + Q27_QROWS + Q27_KVROWS, QS, cn, s);
-    });
-    nr_chunks(NR, [&](int c0, int cn) {
+    }));
+    };   // bodyA
+    if (gon) { if (!GR.a) capture(nullptr, &GR.a, bodyA); CK(hipGraphLaunch(GR.a, s)); } else bodyA();
+    TPF(TPF_DR_ATTN, s, nr_chunks(NR, [&](int c0, int cn) {
         q27_attn_prep_tp_nr(B.qkva + (size_t)c0 * QS, QS, S.W.q_norm, S.W.k_norm, d.mtp_kc, d.mtp_ks, d.mtp_vc, d.mtp_vs,
                             B.qh + (size_t)c0 * OR, OR, dpos0 + c0, cn, 1, Q27_KVROWS, 0, s);
         q27_attn_decode_tp_nr(B.qh + (size_t)c0 * OR, OR, d.mtp_kc, d.mtp_ks, d.mtp_vc, d.mtp_vs, B.qkva + (size_t)c0 * QS, QS,
                               B.mix6 + (size_t)c0 * OR, OR, dpos0 + c0, cn, 1, Q27_KVROWS, 0, s);
-    });
-    nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(B.mix6 + (size_t)c0 * OR, (size_t)OR, B.xqo + (size_t)c0 * OR, (size_t)OR, B.xso + (size_t)c0 * (OR / 16), (size_t)(OR / 16), OR, IS, cn, s); });
-    nr_chunks(NR, [&](int c0, int cn) { q27_proj_fp8_bf16_nrs(&S.W.o, B.xqo + (size_t)c0 * OR, OR, B.xso + (size_t)c0 * (OR / 16), B.hid + (size_t)c0 * HID, HID, cn, s); });   // K = 6144
-    for (int r = 0; r < NR; ++r) {
+    }));
+    std::function<void()> bodyB = [&]() {
+    TPF(TPF_DR_O, s, nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(B.mix6 + (size_t)c0 * OR, (size_t)OR, B.xqo + (size_t)c0 * OR, (size_t)OR, B.xso + (size_t)c0 * (OR / 16), (size_t)(OR / 16), OR, IS, cn, s); }));
+    TPF(TPF_DR_O, s, nr_chunks(NR, [&](int c0, int cn) { q27_proj_fp8_bf16_nrs(&S.W.o, B.xqo + (size_t)c0 * OR, OR, B.xso + (size_t)c0 * (OR / 16), B.hid + (size_t)c0 * HID, HID, cn, s); }));   // K = 6144
+    TPF(TPF_DR_O, s, ([&]{ for (int r = 0; r < NR; ++r) {
         q27_add_inplace_bf16(B.nrm + (size_t)r * HID, B.hid + (size_t)r * HID, HID, s);
         if (!q27_rmsnorm_quant_perm(B.nrm + (size_t)r * HID, S.W.post_norm, B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID,
                                     B.xsa + (size_t)r * (HID / 16), HID, g_mtp_po, IS, nullptr, 0, s)) {
             q27_rmsnorm(B.nrm + (size_t)r * HID, S.W.post_norm, B.hid + (size_t)r * HID, HID, g_mtp_po, s);
             q27_quant_perm(B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID, B.xsa + (size_t)r * (HID / 16), HID, IS, s);
         }
-    }
-    nr_chunks(NR, [&](int c0, int cn) {
+    } })());
+    TPF(TPF_DR_MLP, s, nr_chunks(NR, [&](int c0, int cn) {
         q27_proj_nvfp4_gu_nr(&S.W.gate, &S.W.up, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16),
                              B.pa + (size_t)c0 * IN, B.pb + (size_t)c0 * IN, IN, cn, s);
         q27_swiglu_quant_b(B.pa + (size_t)c0 * IN, B.pb + (size_t)c0 * IN, B.xq2 + (size_t)c0 * IN,
                            B.xs2 + (size_t)c0 * (IN / 16), IN, IS, cn, s);
-    });
-    for (int j = 0; j < 4; ++j) {
+    }));
+    TPF(TPF_DR_MLP, s, ([&]{ for (int j = 0; j < 4; ++j) {
         nr_chunks(NR, [&](int c0, int cn) {
             q27_proj_nvfp4_down_nrs(&S.W.down[j], B.xq2 + (size_t)c0 * IN + (size_t)j * 4352, IN,
                                     B.xs2 + (size_t)c0 * (IN / 16) + (size_t)j * 272, B.pd + (size_t)c0 * HID, HID, nullptr, 0, 0.f, cn, s);
         });
         for (int r = 0; r < NR; ++r) q27_add_inplace(B.nrm + (size_t)r * HID, B.pd + (size_t)r * HID, HID, s);
-    }
-    if (head_row >= 0) {
+    } })());
+    if (head_row >= 0) TPF(TPF_DR_HEAD, s, ([&]{
         q27_rmsnorm(B.nrm + (size_t)head_row * HID, S.W.mtp_norm, B.hid, HID, 1, s);
         q27_quant_perm(B.hid, B.xqa, B.xsa, HID, G->lm_head.in_scale, s);
-        q27_proj_nvfp4(&G->lm_head, B.xqa, B.xsa, S.dpa, s);                            // this card's logit shard
-    }
+        if (!exl3_head(d, G, B.hid, S.dpa, 1, s)) {
+            // 2026-09-28: the draft's logit shard through the row-batched NR form (the trunk tail's P_LM), NR=1;
+            // Q27_DRAFT_HEAD_PLAIN=1 restores the plain q27_proj_nvfp4 launch for A/B.
+            static const int plain = q27_env_int("Q27_DRAFT_HEAD_PLAIN", 0);
+            if (plain || !q27_proj_nvfp4_nr(&G->lm_head, B.xqa, B.xsa, S.dpa, G->lm_head.rows, 1, s))
+                q27_proj_nvfp4(&G->lm_head, B.xqa, B.xsa, S.dpa, s);                            // this card's logit shard
+        }
+    })());
+    };   // bodyB
+    if (gon) { if (!GR.b) capture(nullptr, &GR.b, bodyB); CK(hipGraphLaunch(GR.b, s)); } else bodyB();
+}
+
+// Q27_MTP_TP (2026-09-28): the draft layer as a TP-sharded full-attention layer. Every card runs fc + the pre-norms on
+// the full hidden (replicated, cheap), then ITS q heads / kv heads / o K-slice / MLP rows, and the two LL sites carry the
+// two partial sums exactly as a trunk layer's do (residual folded into the producers with rs = 1/ndev; site 1 consumer
+// = post_norm + permuted quant for gate/up, site 2 consumer = mtp.norm + permuted quant for the lm_head shard).
+// The draft KV cache stays full-width (the prompt pass fills every head from k_full/v_full); decode writes and reads only
+// this card's heads at their offset, as the trunk does for a shard reading a wider stored row.
+static void mtp_pass_nr_tp(Dev& d, MtpState& S, const q27_globals_t* G, int NR, const unsigned short* const* hrows,
+                           const unsigned* toks, const unsigned short* emb_tbl, int dpos0, int head_row, TpColl& C, int ndev) {
+    hipStream_t s = d.stream;
+    mtp_nr_alloc(d.id);
+    MtpNr& B = g_mtpnr[d.id];
+    const float IS = g_mtp_is;
+    const int g = d.id;   // TPF bracket index (logical worker)
+    const q27_tp_shard_t* T = q27_tp_shard(g);
+    const int HID = Q27_HID, QL = T->QL, KVL = T->KVL, QS = QL + 2 * KVL, OR = T->OL, IN = T->mlp_len;
+    const int hoff = T->kv_h0 * Q27_HDIM;
+    const float rshare = 1.0f / (float)ndev;
+    float* const part  = C.nrp_part[0][g];   // [NR][HID] fp32 partials (8 rows deep)
+    float* const part2 = C.nrp_part[1][g];
+    for (int r = 0; r < NR; ++r) spec_emb_h2d(d, B.emb + (size_t)r * HID, emb_tbl, toks[r], s);
+    TPF(TPF_DR_PRE, s, ([&]{ for (int r = 0; r < NR; ++r) {
+        unsigned short* cat = B.cat + (size_t)r * 2 * HID;
+        q27_rmsnorm(B.emb + (size_t)r * HID, S.W.pre_emb, cat + mtp_emb_off(), HID, g_mtp_po, s);
+        q27_rmsnorm(hrows[r], S.W.pre_hid, cat + mtp_hid_off(), HID, g_mtp_po, s);
+        q27_quant_perm(cat,       B.xqa + (size_t)r * HID, B.xsa + (size_t)r * (HID / 16), HID, IS, s);
+        q27_quant_perm(cat + HID, B.xqb + (size_t)r * HID, B.xsb + (size_t)r * (HID / 16), HID, IS, s);
+    } })());
+    TPF(TPF_DR_FC, s, nr_chunks(NR, [&](int c0, int cn) {
+        q27_proj_nvfp4_nr(&S.W.fc[0], B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.pa + (size_t)c0 * HID, HID, cn, s);
+        q27_proj_nvfp4_nr(&S.W.fc[1], B.xqb + (size_t)c0 * HID, B.xsb + (size_t)c0 * (HID / 16), B.pb + (size_t)c0 * HID, HID, cn, s);
+    }));
+    TPF(TPF_DR_PRE, s, ([&]{ for (int r = 0; r < NR; ++r) {
+        q27_f2bf_vec(B.pa + (size_t)r * HID, B.nrm + (size_t)r * HID, HID, s);          // residual stream
+        q27_add_inplace(B.nrm + (size_t)r * HID, B.pb + (size_t)r * HID, HID, s);
+        if (!q27_rmsnorm_quant_fp8(B.nrm + (size_t)r * HID, S.W.in_norm, B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID,
+                                   B.xsa + (size_t)r * (HID / 16), HID, g_mtp_po, IS, nullptr, 0, s)) {
+            q27_rmsnorm(B.nrm + (size_t)r * HID, S.W.in_norm, B.hid + (size_t)r * HID, HID, g_mtp_po, s);
+            q27_quant_fp8(B.hid + (size_t)r * HID, B.xqa + (size_t)r * HID, B.xsa + (size_t)r * (HID / 16), HID, IS, s);
+        }
+    } })());
+    TPF(TPF_DR_QKV, s, nr_chunks(NR, [&](int c0, int cn) {   // this card's q heads and kv heads only
+        const q27_fp8_t* sw[3] = { &S.W.q, &S.W.k, &S.W.v };
+        unsigned short* sy[3] = { B.qkva + (size_t)c0 * QS, B.qkva + (size_t)c0 * QS + QL, B.qkva + (size_t)c0 * QS + QL + KVL };
+        const int sst[3] = { QS, QS, QS };
+        if (!(g_proj_seg && q27_proj_i8g_bf16_seg(sw, sy, sst, 3, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), cn, s))) {
+            q27_proj_fp8_bf16_nr(&S.W.q, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS, QS, cn, s);
+            q27_proj_fp8_bf16_nr(&S.W.k, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS + QL, QS, cn, s);
+            q27_proj_fp8_bf16_nr(&S.W.v, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16), B.qkva + (size_t)c0 * QS + QL + KVL, QS, cn, s);
+        }
+    }));
+    TPF(TPF_DR_ATTN, s, nr_chunks(NR, [&](int c0, int cn) {
+        q27_attn_prep_tp_nr(B.qkva + (size_t)c0 * QS, QS, S.W.q_norm, S.W.k_norm, d.mtp_kc, d.mtp_ks, d.mtp_vc, d.mtp_vs,
+                            B.qh + (size_t)c0 * OR, OR, dpos0 + c0, cn, T->attn_g, Q27_KVROWS, hoff, s);
+        q27_attn_decode_tp_nr(B.qh + (size_t)c0 * OR, OR, d.mtp_kc, d.mtp_ks, d.mtp_vc, d.mtp_vs, B.qkva + (size_t)c0 * QS, QS,
+                              B.mix6 + (size_t)c0 * OR, OR, dpos0 + c0, cn, T->attn_g, Q27_KVROWS, hoff, s);
+    }));
+    // ---- site 1: o_proj K-slice with the residual folded in (rs = 1/ndev), then the LL all-reduce + post_norm + permuted quant ----
+    TPF(TPF_DR_O, s, nr_chunks(NR, [&](int c0, int cn) { q27_quant_fp8_b(B.mix6 + (size_t)c0 * OR, (size_t)OR, B.xqo + (size_t)c0 * OR, (size_t)OR, B.xso + (size_t)c0 * (OR / 16), (size_t)(OR / 16), OR, IS, cn, s); }));
+    TPF(TPF_DR_O, s, nr_chunks(NR, [&](int c0, int cn) {
+        if (!q27_proj_fp8_res_nr(&S.W.o, B.xqo + (size_t)c0 * OR, B.xso + (size_t)c0 * (OR / 16), part + (size_t)c0 * HID, HID, B.nrm + (size_t)c0 * HID, HID, rshare, cn, s)) {
+            std::fprintf(stderr, "Q27_MTP_TP: o_proj (K=%d) declined\n", S.W.o.K); std::abort(); }
+    }));
+    nrp_site(C, g, ndev, 0, s, part, NR, 4);
+    if (!nrp_ll_reduce(C, g, ndev, 1, part, S.W.post_norm, B.nrm, nullptr, B.xqa, B.xsa, g_mtp_po, S.W.gate.in_scale, NR, s)) { std::fprintf(stderr, "Q27_MTP_TP: site 1 declined\n"); std::abort(); }
+    // ---- MLP rows [mlp_off, +mlp_len): gate/up, swiglu, down K-slice with the residual folded in; site 2: LL + mtp.norm + head quant ----
+    TPF(TPF_DR_MLP, s, nr_chunks(NR, [&](int c0, int cn) {
+        q27_proj_nvfp4_gu_nr(&S.W.gate, &S.W.up, B.xqa + (size_t)c0 * HID, B.xsa + (size_t)c0 * (HID / 16),
+                             B.pa + (size_t)c0 * IN, B.pb + (size_t)c0 * IN, IN, cn, s);
+        q27_swiglu_quant_b(B.pa + (size_t)c0 * IN, B.pb + (size_t)c0 * IN, B.xq2 + (size_t)c0 * IN,
+                           B.xs2 + (size_t)c0 * (IN / 16), IN, IS, cn, s);
+        if (!q27_proj_nvfp4_down_nr(&S.W.down[0], B.xq2 + (size_t)c0 * IN, B.xs2 + (size_t)c0 * (IN / 16), part2 + (size_t)c0 * HID, HID, B.nrm + (size_t)c0 * HID, HID, rshare, cn, s)) {
+            std::fprintf(stderr, "Q27_MTP_TP: down (K=%d) declined\n", S.W.down[0].K); std::abort(); }
+    }));
+    nrp_site(C, g, ndev, 1, s, part2, NR, 4);
+    if (!nrp_ll_reduce(C, g, ndev, 1, part2, S.W.mtp_norm, B.nrm, nullptr, B.xqa, B.xsa, 1, G->lm_head.in_scale, NR, s)) { std::fprintf(stderr, "Q27_MTP_TP: site 2 declined\n"); std::abort(); }
+    if (head_row >= 0) TPF(TPF_DR_HEAD, s, ([&]{
+        const signed char* xq = B.xqa + (size_t)head_row * HID; const float* xs = B.xsa + (size_t)head_row * (HID / 16);
+        if (!q27_proj_nvfp4_nr(&G->lm_head, xq, xs, S.dpa, G->lm_head.rows, 1, s))
+            q27_proj_nvfp4(&G->lm_head, xq, xs, S.dpa, s);                            // this card's logit shard
+    })());
 }
 
 static int mtp_prompt_init(Dev& d, int g, int M) {
     MtpPP& P = g_mtppp[g]; if (P.ready) return 1;
     MtpState& S = g_mtp[g];
-    const q27_fp8_t* s2[2] = { &S.W.k, &S.W.v };   // only k and v feed the cache; q is never needed for prompt positions
+    const q27_fp8_t* s2[2] = { g_mtp_tp ? &S.W.k_full : &S.W.k, g_mtp_tp ? &S.W.v_full : &S.W.v };   // only k and v feed the cache (full width: the prompt pass fills every head)
     if (!q27_fp8_to_i8g64_cat(s2, 2, P.kv8g, 0)) { std::fprintf(stderr, "Q27_MTP_PP: k|v int8 mirror failed\n"); return 0; }
     for (int i = 0; i < 2; ++i) if (!q27_i8g64_to_row_conv(&P.kv8g[i], &P.kv8r[i], 0, 0)) { std::fprintf(stderr, "Q27_MTP_PP: k|v row view failed\n"); return 0; }
     for (int j = 0; j < 2; ++j) {
@@ -2699,18 +4373,28 @@ static inline void spec_mail_wait(Dev& d, TpColl& C, int g, hipStream_t s, int n
     q27_copy_f4_flag_mb(d.nr_mail_d, (const float*)d.nr_tok, n, C.done_d[g] + g, gen, C.cp_cnt[g], target, 8, s);
     tp_stage_wait(C, g, gen);
 }
+#include "q27_sr_main.inc"   // Q27_LS_SR: single residency -- sequential decode round, prefill mirror ring, boot helpers
+// `K` IS A PARAMETER, NOT g_spec_k, AND THAT IS LOAD-BEARING. When a decode walks out of the draft
+// KV's reach the round must still run -- with K=0, i.e. one trunk row through run_layer_tp_nr, which
+// is the path the product actually runs (int8 MLP mirror, K-views, shipped collectives). Falling into
+// the PLAIN step instead is not a slower step, it is a crash: the plain path has no Q27_DEC_MLP_I8
+// dispatch and dereferences the NVFP4 MLP shards that DEC_MLP_I8 deliberately never allocates. That is
+// the root cause recorded in DECODE_AUTHORITY_AND_LS_PREFILL_GATE_20260915.md for Q27_SPEC=0
+// (`gate=(nil)` -> "Memory access fault by GPU node-1"). Measured again 2026-09-15 22:28:07: a Harness
+// turn at pos 65,388 generating past the 65,536 draft-KV cap took the plain step and the engine died
+// mid-generation. K=0 is the documented working non-draft configuration; use it.
 static int spec_round(Dev& d, q27_model_t* m, const unsigned short* emb, int nlayer, int pos, unsigned tok,
-                      int g, int ndev, TpColl& C, double* mark, unsigned* outtok) {
+                      int g, int ndev, TpColl& C, double* mark, unsigned* outtok, int K) {
     hipStream_t s = d.stream;
     const double sp0 = tp_now(); double spa = sp0;
     d.nr_eslot = 0;
     auto lap = [&](int k) { const double t = tp_now(); d.sp_t[k] += t - spa; spa = t; };
     MtpState& S = g_mtp[g];
     const q27_globals_t* G = q27_globals(m, d.id);
-    const int K = g_spec_k, NR = K + 1, HID = Q27_HID;
+    const int NR = K + 1, HID = Q27_HID;
     const int n_gdn = Q27_LAYERS - Q27_LAYERS / 4;
-    const size_t sshard = (size_t)(Q27_GDN_VH / ndev) * Q27_GDN_D * Q27_GDN_D;
-    if (!d.nr_Ssnap) {   // snapshot banks (normally allocated at init; lazy fallback), sized by the SHARD
+    const size_t sshard = (size_t)q27_tp_shard(g)->VHL * Q27_GDN_D * Q27_GDN_D;
+    if (K > 0 && !d.nr_Ssnap) {   // snapshot banks (normally allocated at init; lazy fallback), sized by the SHARD
         CK(hipMalloc((void**)&d.nr_Ssnap, (size_t)K * n_gdn * sshard * 4));
         CK(hipMalloc((void**)&d.nr_csnap, (size_t)K * n_gdn * d.tp_conv * 2));
     }
@@ -2739,13 +4423,13 @@ static int spec_round(Dev& d, q27_model_t* m, const unsigned short* emb, int nla
             for (int c = 0; c < d.nr_ncatch; ++c) { hrows[nrm] = d.nr_hcatch + (size_t)c * HID; toks[nrm] = d.nr_catch_tok[c]; ++nrm; }
             hrows[nrm] = d.nr_hprev; toks[nrm] = tok; ++nrm;
             const int dpos0 = (d.nr_ncatch ? d.nr_catch_pos[0] : pos - 1) - d.nr_mtp_base;   // consecutive by construction
-            mtp_pass_nr(d, S, G, nrm, hrows, toks, emb, dpos0, nrm - 1);
+            if (g_mtp_tp) mtp_pass_nr_tp(d, S, G, nrm, hrows, toks, emb, dpos0, nrm - 1, C, ndev); else mtp_pass_nr(d, S, G, nrm, hrows, toks, emb, dpos0, nrm - 1);
             d.nr_ncatch = 0;
             hchain = g_mtpnr[d.id].nrm + (size_t)(nrm - 1) * HID;   // the draft row's residual: the next draft's hidden
         } else {
             // draft j consumes the MTP layer's OWN residual output for draft j-1 and emb(draft j-1)
             const unsigned short* hr[1] = { hchain }; const unsigned tk[1] = { dt[j - 1] };
-            mtp_pass_nr(d, S, G, 1, hr, tk, emb, pos - 1 - d.nr_mtp_base + j, 0);
+            if (g_mtp_tp) mtp_pass_nr_tp(d, S, G, 1, hr, tk, emb, pos - 1 - d.nr_mtp_base + j, 0, C, ndev); else mtp_pass_nr(d, S, G, 1, hr, tk, emb, pos - 1 - d.nr_mtp_base + j, 0);
             hchain = g_mtpnr[d.id].nrm;
         }
         q27_argmax_val(S.dpa, d.nr_tok, d.nr_val, G->lm_head.rows, s);
@@ -2754,7 +4438,7 @@ static int spec_round(Dev& d, q27_model_t* m, const unsigned short* emb, int nla
         lap(0);
         C.t_comp[g] += tp_now() - *mark;
         tc0 = tp_now();
-        C.hval[g] = lv; C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li);
+        C.hval[g] = lv; C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);
         C.b1.wait();
         unsigned bt = C.hidx[0]; float bv = C.hval[0];
         for (int k = 1; k < ndev; ++k)
@@ -2796,7 +4480,7 @@ static int spec_round(Dev& d, q27_model_t* m, const unsigned short* emb, int nla
     lap(4);
     C.t_comp[g] += tp_now() - *mark;
     tc0 = tp_now();
-    for (int r = 0; r < NR; ++r) { C.hvalN[g][r] = lvs[r]; C.hidxN[g][r] = (unsigned)((long long)g * G->lm_head.rows + (long long)lis[r]); }
+    for (int r = 0; r < NR; ++r) { C.hvalN[g][r] = lvs[r]; C.hidxN[g][r] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)lis[r]); }
     C.b1.wait();
     unsigned nx[8] = {0u,0u,0u,0u,0u,0u,0u,0u};
     for (int r = 0; r < NR; ++r) {
@@ -2934,9 +4618,9 @@ static int spec_round(Dev& d, q27_model_t* m, const unsigned short* emb, int nla
         const float* Sb = d.nr_Ssnap + (size_t)nacc * n_gdn * sshard;
         const unsigned short* Cb = d.nr_csnap + (size_t)nacc * n_gdn * d.tp_conv;
         for (int j = 0; j < n_gdn; ++j) {
-            float* Sp = d.S + (size_t)j * d.tp_s + (g_ls ? (size_t)g * sshard : 0);
+            float* Sp = d.S + d.s_off[j] + d.s_qoff[j];
             CK(hipMemcpyAsync(Sp, Sb + (size_t)j * sshard, sshard * 4, hipMemcpyDeviceToDevice, s));
-            CK(hipMemcpyAsync(d.conv + (size_t)j * d.tp_conv, Cb + (size_t)j * d.tp_conv, d.tp_conv * 2, hipMemcpyDeviceToDevice, s));
+            CK(hipMemcpyAsync(d.conv + d.conv_off[j], Cb + (size_t)j * d.tp_conv, d.conv_bytes[j], hipMemcpyDeviceToDevice, s));
         }
     }
     // ---- 4. hand-off: h_prev = final residual of the last committed position; when row 1 was
@@ -3006,13 +4690,358 @@ static unsigned q27_sample_logits(const float* lg, int n, float temp, int topk, 
     return (unsigned)idx[(size_t)(keep - 1)];
 }
 
+// ---- Q27_SERVE_GROW: grow the per-position prefill scratch IN PLACE -----------------------------
+// Called when a request's window exceeds g_pf_cap, instead of refusing it. Only the three
+// slot-dependent buffers move (hidden_slots, pend_slots, inv_slots) plus the pinned MTP prompt hall;
+// the weights, the int8 mirrors, the target/draft KV, the recurrent state, pos_cur and the tokenizer
+// session are untouched, so the same resident conversation continues and only the delta is ever
+// prefilled. Capacity goes up a bucket ladder (1.5x, 1024-aligned) and is capped by the TIGHTEST
+// card's free memory, keeping a driver safety margin -- the cliff is real and measured: 0.46-0.61 GiB
+// free is fast, 0.06 GiB took a 5.9 s prefill to 32 s.
+// Shed ONE int8 MLP mirror on THIS CARD (its own ordinal in the ownership order) to make room for
+// something else this card needs -- the draft KV here, the slot arena in q27_pfslots_grow. Per-card
+// only: the memory is per-card, so there is nothing to coordinate, and the caller may retry.
+static int q27_evict_one_mlp_own_card(q27_model_t* m, int ndev, int card) {
+    static int s_ord[Q27_MAX_DEVICES];
+    // LATCHED PER CARD, AND IT IS THE POINT OF THIS FUNCTION'S CONTRACT: an eviction that does not
+    // return memory must not be attempted a second time. Two callers use this -- the draft-KV grow
+    // loop and q27_keep_headroom -- and a guard in either one only bounds that caller. Measured
+    // 2026-09-15 21:49:15-19: keep_headroom stopped after one round per card, but the draft-KV loop
+    // then took ordinal 1 on card 3 on the very next growth attempt, 164 MB more expensive each time,
+    // walking every card to `no fast layer left to shed` on a 30 k conversation. Returning 0 here
+    // makes the caller fall back (smaller draft KV, speculation off), which is recoverable;
+    // stripped residency is not.
+    static int s_useless[Q27_MAX_DEVICES];
+    if (!m || card < 0 || card >= Q27_MAX_DEVICES || ndev < 1) return 0;
+    if (s_useless[card]) return 0;
+    const int lpp = Q27_LAYERS;   // Q27_TP3: ordinal loop bounded by actual ownership (quotas may be uneven)
+    for (int ord = s_ord[card]; ord < lpp; ++ord) {
+        int seen = 0;
+        for (int L = 0; L < Q27_LAYERS; ++L) {
+            if (!q27_ls_owned(L, card, ndev)) continue;
+            if (seen++ != ord) continue;
+            size_t fr_before = 0, fr_after = 0, tt = 0;
+            if (hipSetDevice(card) == hipSuccess) hipMemGetInfo(&fr_before, &tt);
+            if (q27_ls_mlp_evict(m, L, card, ndev)) {
+                s_ord[card] = ord + 1;
+                if (hipSetDevice(card) == hipSuccess && hipMemGetInfo(&fr_after, &tt) == hipSuccess &&
+                    fr_after + 32ull * 1048576ull < fr_before) {
+                    s_useless[card] = 1;
+                    std::fprintf(stderr, "Q27_SERVE_EVICT card %d layer %d (ordinal %d): converted, "
+                                         "but the card LOST %.0f MB (%.2f -> %.2f GiB free) -- latching "
+                                         "this card: no further residency will be spent on it\n",
+                                 card, L, ord, (double)(fr_before - fr_after) / 1048576.0,
+                                 (double)fr_before / 1073741824.0, (double)fr_after / 1073741824.0);
+                    std::fflush(stderr);
+                    return 0;       // caller must fall back, not try the next ordinal
+                }
+                std::fprintf(stderr, "Q27_SERVE_EVICT card %d layer %d (ordinal %d): int8 MLP mirror "
+                                     "released for the draft KV\n", card, L, ord);
+                std::fflush(stderr);
+                return 1;
+            }
+            break;      // this layer is already on NVFP4: move to the next ordinal
+        }
+        s_ord[card] = ord + 1;
+    }
+    return 0;
+}
+
+// KEEP THE DRIVER'S WORKING ROOM ON THIS CARD. Below the margin the driver evicts continuously and
+// every kernel slows by an order of magnitude; the engine's own growth code documents the cliff
+// (0.46-0.61 GiB free is fast, 0.06 GiB took a 5.9 s prefill to 32 s). A growing conversation walks
+// into it without touching the slot arena at all: KV, draft KV and recurrent state all keep growing
+// while fast-layer residency stays where it was. Each card sheds its OWN mirrors (owner card only,
+// nothing to coordinate -- the peers never read this card's layer weights), and only until the margin
+// is back, so the layers that can be kept are kept.
+static void q27_keep_headroom(q27_model_t* m, int ndev, Dev& d) {
+    // THE MARGIN IS A DRIVER WORKING-ROOM TARGET, NOT A RESIDENCY TARGET. The fast floor measured on
+    // this host is 0.46-0.61 GiB free (see the pfslots comment above: 0.06 GiB took a 5.9 s prefill
+    // to 32 s, and every point in 0.46-0.61 was fast). The old 1.00 GiB target is above what a loaded
+    // card ever has, so the policy fired on every draft-KV grow and spent int8 MLP residency -- the
+    // residency the whole 1554 prefill speedup consists of -- to chase a number it could not reach.
+    // 384 MB is BELOW the measured fast band (0.46-0.61 GiB), on purpose. The loaded engine sits at
+    // 0.47 GiB free before the draft KV is built, so a 512 MB target evicted one layer per card to
+    // chase 33 MB it could not gain -- and each of those four layers is prefill at ~6% of the total
+    // (measured: 1,488 tok/s with the four gone, 1,577 with them kept). The cliff this guards is the
+    // 0.06 GiB point in the pfslots comment, which is a long way below 384 MB.
+    const size_t margin = (size_t)q27_env_int("Q27_SERVE_HEADROOM_MB", 384) * 1048576ull;
+    if (hipSetDevice(d.id) != hipSuccess) return;
+    for (int i = 0; i < Q27_LAYERS; ++i) {
+        size_t fr = 0, tt = 0;
+        if (hipMemGetInfo(&fr, &tt) != hipSuccess || fr >= margin) return;
+        const size_t before = fr;
+        if (!q27_evict_one_mlp_own_card(m, ndev, d.id)) {
+            std::fprintf(stderr, "Q27_SERVE_HEADROOM card %d: %.2f GiB free, no fast layer left to "
+                                 "shed (margin %.2f GiB)\n", d.id, (double)fr / 1073741824.0,
+                         (double)margin / 1073741824.0);
+            std::fflush(stderr);
+            return;
+        }
+        hipMemGetInfo(&fr, &tt);
+        // AN EVICTION THAT DOES NOT RETURN MEMORY MUST STOP THE LOOP. The swap allocates the layer's
+        // NVFP4 authority BEFORE releasing the int8 mirror, and the mirror's buffers are not always
+        // separately freeable, so a layer can come out NET NEGATIVE: measured 2026-09-15 21:21:13,
+        // "card 1: 0.61 -> 0.45 GiB free" after one eviction -- 164 MB LOST, not gained. The loop
+        // then shed all 16 layers per card (1,481 Q27_SERVE_EVICT lines in twelve minutes) without
+        // ever reaching the margin: it gave away the fast prefill path (1,577 -> 1,170 tok/s on the
+        // same 9.1 k Harness turn) and bought nothing. Stopping here keeps the layers that can be
+        // kept and lets the caller fall back to a smaller draft KV / speculation-off, which is
+        // recoverable; stripped residency is not.
+        if (fr + 32ull * 1048576ull < before) {
+            std::fprintf(stderr, "Q27_SERVE_HEADROOM card %d: eviction returned %.0f MB LESS free "
+                                 "(%.2f -> %.2f GiB) -- stopping instead of shedding more residency\n",
+                         d.id, (double)(before - fr) / 1048576.0,
+                         (double)before / 1073741824.0, (double)fr / 1073741824.0);
+            std::fflush(stderr);
+            return;
+        }
+        std::fprintf(stderr, "Q27_SERVE_HEADROOM card %d: %.2f -> %.2f GiB free (margin %.2f GiB)\n",
+                     d.id, (double)before / 1073741824.0, (double)fr / 1073741824.0,
+                     (double)margin / 1073741824.0);
+        std::fflush(stderr);
+    }
+}
+
+// Is EVERY card's draft KV capacity able to hold positions up to `need`? Speculation touches the
+// draft cache on all four cards, so the decision has to be the same on all four: one card
+// short means either a write past its cache (a GPU fault) or a verify round that never
+// completes. Cheap enough to re-evaluate per decode step.
+static bool q27_mtp_within_cap(const std::vector<Dev>& D, int ndev, int need) {
+    if (g_sr) return D[g_sr_head].mtp_cap >= need;   // Q27_LS_SR: one draft KV, on the head card
+    for (int q = 0; q < ndev; ++q) if (D[q].mtp_cap < need) return false;
+    return true;
+}
+
+static int q27_pfslots_grow(q27_model_t* m, std::vector<Dev>& D, int ndev, int need) {
+    // HIP VALIDATES STREAM, EVENT AND MEMORY HANDLES AGAINST THE CALLING THREAD'S CURRENT DEVICE.
+    // This helper is run by card 0's thread and allocates on EVERY card, so it leaves that thread on
+    // whichever device it touched last; the thread's next hipEventRecord on its OWN stream then fails
+    // with "invalid resource handle". Measured 2026-09-15: a 15,616-position chunk step died at the
+    // first event of the layer-split ring schedule with a handle that had just been created
+    // successfully -- the handle was fine, the current device was not. Restore on every exit path,
+    // including the early returns below.
+    int q27_saved_dev = 0;
+    CK(hipGetDevice(&q27_saved_dev));
+    struct DevRestore {
+        int d; ~DevRestore() { hipSetDevice(d); }
+    } q27_dev_restore{q27_saved_dev};
+    int want = g_pf_cap + g_pf_cap / 2;
+    if (want < need) want = need;
+    want = ((want + 1023) / 1024) * 1024;
+    const size_t per_pos = (size_t)Q27_HID * 6;                       // hidden (bf16) + pend (fp32)
+    // THE GROWTH MARGIN IS THE FAST/CLIFF BOUNDARY AND IT MUST SIT ABOVE THE CLIFF, NOT BELOW IT.
+    // Measured 2026-09-15 on one Harness session: growing the arena to 14,336 slots for an 11,297-token
+    // window took a card from 0.47 to 0.32 GiB free and prefill from 1,571 to 809 tok/s; the draft-KV
+    // grow then took it to 0.10 GiB and decode collapsed to 10.1 tok/s on a 45-token append. 0.46-0.61
+    // GiB is the fast band (see the pfslots comment); 256 MB left the engine growing INTO the cliff.
+    // Refusing to grow and appending in arena chunks instead keeps the headroom and the fast path.
+    const size_t margin  = (size_t)q27_env_int("Q27_SERVE_MARGIN_MB", 512) * 1048576ull;
+    auto cap_at_margin = [&]() {
+        int cap = want;
+        for (int gg = 0; gg < ndev; ++gg) {
+            size_t fr = 0, tt = 0;
+            if (hipSetDevice(D[gg].id) != hipSuccess) return g_pf_cap;
+            if (hipMemGetInfo(&fr, &tt) != hipSuccess || fr <= margin) return g_pf_cap;
+            const int extra = (int)((fr - margin) / per_pos);
+            if (g_pf_cap + extra < cap) cap = g_pf_cap + extra;
+            cap = (cap / 1024) * 1024;
+        }
+        return cap;
+    };
+    int cap = cap_at_margin();
+    // BEFORE SPENDING ANY RESIDENCY: can eviction possibly pay for this window? A failed growth
+    // attempt is NOT free. The int8 mirrors are released before the new buffers are allocated, and
+    // a released layer is never restored -- it stays on its NVFP4 authority. Without this check a
+    // hopeless window (a 249,310-token probe against a 16,256-position arena) would strip every fast
+    // layer and STILL fail, which is the worst of both: the request is served by the chunk fallback
+    // afterwards and runs the whole way on the slow path for no reason.
+    // One eviction is worth about 7/16 of a layer's int8 payload per card: the mirror is
+    // 3*INTER*HID int8 bytes and the NVFP4 authority restored in its place is 1/2 + 1/16 of that.
+    if (cap < want) {
+        const long long net_per_layer = (long long)3 * Q27_INTER * Q27_HID * 7 / 16;
+        int owned = 0;
+        for (int L = 0; L < Q27_LAYERS; ++L) if (q27_ls_owned(L, 0, ndev)) ++owned;
+        const long long gain = net_per_layer * owned / (long long)per_pos;
+        if ((long long)cap + gain < want) {
+            std::fprintf(stderr, "Q27_SERVE_GROW need=%d unreachable: %d owned fast layers are worth at "
+                                 "most +%lld positions on top of %d -- refusing without evicting\n",
+                         need, owned, gain, cap);
+            std::fflush(stderr);
+            return 0;
+        }
+    }
+    // Not enough on free memory alone? Buy the rest with fast-layer residency: release int8 MLP
+    // mirrors (owner card only -- the other cards' NVFP4 shards were never dropped) until the
+    // tightest card can pay for the bucket at the margin. Release BEFORE allocate, always: the new
+    // buffers are taken only after the memory to hold them exists.
+    int evicted = 0;
+    int shed[Q27_MAX_DEVICES] = {0};   // per-card ordinal cursor: how many of ITS OWN layers went
+    while (cap < want && q27_env_flag("Q27_SERVE_EVICT", true)) {
+        const int prev_cap = cap;
+        int did = 0;
+        // SHED THE BINDING CARD ONLY. cap_at_margin() takes the MINIMUM over cards, so a fast layer
+        // released on a card that is not the minimum cannot buy a single position -- it only destroys
+        // residency, and q27_ls_mlp_evict never restores it (the layer stays on its NVFP4 authority
+        // for the life of the process). The loop used to spend one layer on EVERY card and only then
+        // ask whether the round had bought anything, so a hopeless round cost four layers instead of
+        // one. Measured 2026-09-17 11:45:48 on the live serve path: card 0 L0, card 1 L4, card 2 L8,
+        // card 3 L12 all released, immediately followed by "round 1 bought no positions (cap still
+        // 33792)". Whole-log: 1616 Q27_SERVE_EVICT lines against 24 such wasted rounds. A converted
+        // layer is worth ~203 ms of prefill on a 9K window (FREEZE_q27-prefill-1372-20260914.md,
+        // linear 8->12 layers = 813 ms), and stripping all 16 is the measured 1557 -> 1026 tok/s
+        // (-34%), or 935 -> 703 (-25%) on this V4=1 build. The guard below still stops the NEXT
+        // round; this stops the round that is about to be wasted from costing 4x what it must.
+        int bind = -1; size_t bind_free = (size_t)-1;
+        for (int g = 0; g < ndev; ++g) {
+            size_t fr = 0, tt = 0;
+            if (hipSetDevice(D[g].id) != hipSuccess) continue;
+            if (hipMemGetInfo(&fr, &tt) != hipSuccess) continue;
+            if (fr < bind_free) { bind_free = fr; bind = g; }
+        }
+        if (bind < 0) break;
+        {
+            const int g = bind;
+            // the card's layer of ordinal shed[g] in its OWN ownership order, as at load time
+            int ord = 0;
+            for (int L = 0; L < Q27_LAYERS; ++L) {
+                if (!q27_ls_owned(L, g, ndev)) continue;
+                if (ord++ != shed[g]) continue;
+                if (q27_ls_mlp_evict(m, L, g, ndev)) {
+                    ++did; ++shed[g];
+                    std::fprintf(stderr, "Q27_SERVE_EVICT card %d layer %d (ordinal %d, binding card, "
+                                         "%.0f MB free): int8 MLP mirror released, layer back on "
+                                         "NVFP4 authority\n", g, L, shed[g] - 1,
+                                 (double)bind_free / 1048576.0);
+                    std::fflush(stderr);
+                }
+                break;
+            }
+        }
+        if (!did) break;
+        ++evicted;
+        cap = cap_at_margin();
+        if (cap <= prev_cap) {
+            // THE ROUND BOUGHT NOTHING, AND THAT WILL NOT CHANGE. q27_ls_mlp_evict rebuilds a
+            // layer's NVFP4 authority BEFORE releasing its int8 mirror, so a card without that much
+            // free memory gives up nothing at all -- which is what card 3 did on 2026-09-15 (63 MB
+            // free after an earlier attempt leaked) while every round kept spending cards 0-2.
+            // Without this check the loop keeps spending residency for a window it can never reach.
+            std::fprintf(stderr, "Q27_SERVE_GROW need=%d: round %d bought no positions (cap still %d)"
+                                 " -- stopping without spending more residency\n", need, evicted, cap);
+            std::fflush(stderr);
+            return 0;
+        }
+    }
+    if (cap <= g_pf_cap) return 0;
+    // A GROW THAT CANNOT REACH THE WINDOW IS NOT A GROW. Measured 2026-09-17 on real agentic traffic:
+    // slots 23,552 -> 52,224 (-840 MB/card) toward a 55,280-token window, then Q27_REQ_REFUSED sweep
+    // anyway and the window was appended in 8,960-token chunks -- which the OLD arena already held.
+    // The server's chunk step never exceeds Q27_SERVE_STEP, so an arena short of `need` buys nothing
+    // and costs the headroom the draft KV needs later. Refuse whole; the chunk fallback is exact.
+    if (cap < need) {
+        std::fprintf(stderr, "Q27_SERVE_GROW need=%d: reachable cap %d is short of the window -- refusing the partial grow "
+                             "(slots stay %d; the window is appended in chunks)\n", need, cap, g_pf_cap);
+        std::fflush(stderr);
+        return 0;
+    }
+    // Pinned MTP prompt hall first: if the pinned window cannot take the new size we keep the old one
+    // and simply stop priming the draft beyond it (a degraded draft is not a correctness problem --
+    // every drafted token is still verified against the target).
+    size_t hall_old = g_mtp_hall_cap;
+    if (g_spec && g_mtp_pp && g_mtp_hall) {
+        void* nh = nullptr;
+        if (hipHostMalloc(&nh, (size_t)cap * Q27_HID * 2, hipHostMallocDefault) == hipSuccess) {
+            hipHostFree(g_mtp_hall); g_mtp_hall = (unsigned short*)nh; g_mtp_hall_cap = (size_t)cap;
+        }
+    }
+    const size_t before = [&]() { size_t fr = 0, tt = 0; hipSetDevice(D[0].id); hipMemGetInfo(&fr, &tt); return fr; }();
+    // TRANSACTIONAL GROW. 2026-09-18. This loop used to free each card's sweep scratch and then
+    // allocate the replacement, returning 0 the moment any allocation failed -- which left every
+    // card after the failure with pend_slots/hidden_slots/inv_slots FREED AND NULL while the engine
+    // carried on. The layer-split ring handoff then passed D[src].pend_slots straight into
+    // hipMemcpyPeerAsync, and HIP dereferenced the null: SIGSEGV at 0x18, backtrace
+    // hipMemcpyPeerAsync <- run_tp's worker lambda. The engine was not out of memory when it died;
+    // it died on a pointer a FAILED grow had already thrown away.
+    //
+    // ALLOCATE EVERYTHING FIRST, FREE THE OLD ONLY ONCE ALL OF IT SUCCEEDED. A grow that cannot be
+    // afforded now leaves the arena exactly as it was and the caller falls back to chunked append,
+    // which is the documented behaviour ("refuse whole; the chunk fallback is exact").
+    {
+        std::vector<unsigned short*> nh_(ndev, nullptr);
+        std::vector<float*>          np_(ndev, nullptr);
+        std::vector<float*>          ni_(ndev, nullptr);
+        int ok = 1;
+        for (int gg = 0; gg < ndev && ok; ++gg) {
+            if (hipSetDevice(D[gg].id) != hipSuccess) { ok = 0; break; }
+            if (hipMalloc((void**)&nh_[gg], (size_t)cap * Q27_HID * 2) != hipSuccess) { ok = 0; break; }
+            if (hipMalloc((void**)&np_[gg], (size_t)cap * Q27_HID * 4) != hipSuccess) { ok = 0; break; }
+            if (hipHostMalloc((void**)&ni_[gg], (size_t)cap * 4, hipHostMallocDefault) != hipSuccess) { ok = 0; break; }
+        }
+        if (!ok) {   // roll back: nothing old was touched, so the engine is exactly as it was
+            for (int gg = 0; gg < ndev; ++gg) {
+                if (nh_[gg]) { hipSetDevice(D[gg].id); hipFree(nh_[gg]); }
+                if (np_[gg]) { hipSetDevice(D[gg].id); hipFree(np_[gg]); }
+                if (ni_[gg]) hipHostFree(ni_[gg]);
+            }
+            std::fprintf(stderr, "Q27_SERVE_GROW need=%d cap=%d: allocation failed -- ROLLED BACK, arena stays "
+                                 "%d slots and the window is appended in chunks (no scratch was freed)\n",
+                         need, cap, g_pf_cap);
+            std::fflush(stderr);
+            return 0;
+        }
+        for (int gg = 0; gg < ndev; ++gg) {   // every replacement exists: now retire the old
+            Dev& d = D[gg];
+            hipSetDevice(d.id);
+            if (d.hidden_slots) hipFree(d.hidden_slots);
+            if (d.pend_slots)   hipFree(d.pend_slots);
+            if (d.inv_slots)    hipHostFree(d.inv_slots);
+            d.hidden_slots = nh_[gg]; d.pend_slots = np_[gg]; d.inv_slots = ni_[gg];
+            hipMemset(d.hidden_slots, 0, (size_t)cap * Q27_HID * 2);
+            hipMemset(d.pend_slots,   0, (size_t)cap * Q27_HID * 4);
+        }
+    }
+    size_t after = 0, tt2 = 0; hipSetDevice(D[0].id); hipMemGetInfo(&after, &tt2);
+    const int old = g_pf_cap;
+    g_pf_cap = cap;
+    std::fprintf(stderr, "Q27_SERVE_GROW slots %d -> %d (need %d)  device %+.0f MB/card  "
+                         "free_after %.2f GiB  draft_hall %zu -> %zu  pos_cur preserved\n",
+                 old, cap, need, (double)((long long)after - (long long)before) / 1048576.0,
+                 (double)after / 1073741824.0, hall_old, g_mtp_hall_cap);
+    std::fflush(stderr);
+    return cap;
+}
+
 static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                   const std::vector<unsigned>& prompt, const char* orc) {
+    // ARGV TOKEN BUDGET. maxn == -2 means "request 0 is PREFILL-ONLY": the caller booted this engine
+    // on a BOUNDED prefix of a longer prompt and will append the remainder (argv cannot carry it),
+    // so request 0 must not generate -- an answer generated there is written into the KV and the
+    // appended remainder then lands at the wrong positions behind it.
+    const bool arg_pf_only = (maxn == -2);
+    const int  gen_budget = arg_pf_only ? 0 : (maxn > 0 ? maxn : 0);   // draft-KV growth horizon
     const int nlayer = q27_env_int("Q27_TP_LAYERS", Q27_LAYERS);
     // Size the prefill slots to the prompt (never below the historical 1024, so the MTP verifier's
     // small windows keep their headroom). 30 KB per position per card: 8K = 245 MB, 32K = 1 GB.
     if ((int)prompt.size() > g_pf_cap) g_pf_cap = (int)prompt.size();
-    if (q27_env_flag("Q27_SERVE", false)) { const int mx = q27_env_int("Q27_SERVE_MAXPROMPT", 8192); if (mx > g_pf_cap) g_pf_cap = mx; }
+    // Q27_SERVE_MAXPROMPT is an INGEST LIMIT. The prefill slots cost g_pf_cap * 30,720 B and every
+    // card pays it, so inflating g_pf_cap to the ceiling spends ~1 GiB of the 262K layer-split
+    // budget on positions that are never swept -- and on the head card, which also carries the full
+    // lm_head, that is the difference between fitting and not. The engine is cold-started on the
+    // prompt it will actually serve and the turns that follow are appends, so size the slots to that
+    // prompt plus headroom; anything longer still fails closed at the g_pf_cap check.
+    if (q27_env_flag("Q27_SERVE", false)) {
+        // FLOOR, then cap. Sizing purely from the first prompt is wrong in a server: the engine
+        // is cold-started by WHICHEVER request arrives first, and that is routinely a 200-token
+        // title generation. The slots then sit at the 1024 floor and the real 9K conversation
+        // cannot be swept at all -- it has to throw the engine away and reload 27B of weights.
+        // Q27_SERVE_SLOTS is the number of positions we intend to be able to sweep; the prompt
+        // raises it further if it is longer. 30,720 B per position per card, so 12288 ~= 360 MB.
+        const int floor_ = q27_env_int("Q27_SERVE_SLOTS", q27_env_int("Q27_SERVE_MAXPROMPT", 8192));
+        int cap = (int)prompt.size() + 256;
+        if (cap < floor_) cap = floor_;
+        if (cap > g_pf_cap) g_pf_cap = cap;
+    }
     if (nlayer < 1 || nlayer > Q27_LAYERS) { std::fprintf(stderr, "Q27_TP_LAYERS out of range\n"); return 1; }
 
     // the embedding table stays on the HOST: 2.37 GiB x 4 cards buys nothing when the row is
@@ -3034,6 +5063,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     // unchecked, and only 1, 2 and 4 have instantiated attention kernels; anything else used to
     // make attention a silent no-op deep inside the run.
     g_tp_profile = q27_env_flag("Q27_TP_PROFILE", false);
+    g_exl3_dup_o = q27_env_int("Q27_EXL3_DUP_O", 0);
     g_tp_lead    = q27_env_flag("Q27_TP_LEAD", false);
     if (g_tp_lead) g_tp_profile = true;          // the lead rides on the profile's events
     g_bar_deadline_ms = (double)q27_env_int("Q27_TP_BAR_MS", 5000);
@@ -3042,6 +5072,38 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     if (const char* v = std::getenv("Q27_TOPP")) g_topp = (float)std::atof(v);
     g_topk    = q27_env_int("Q27_TOPK", 0);
     g_sampler = (g_temp > 0.f) ? 1 : 0;
+    g_sr = q27_env_flag("Q27_LS_SR", false) ? 1 : 0;
+    if (g_sr) {
+        g_sr_head = q27_ls_sr_head_card(m);
+        g_sr_rb   = q27_env_int("Q27_SR_MLP_RB", 1);
+        g_sr_time = q27_env_int("Q27_SR_TIME", 0);   // 1 = per-card block timing, 2 = + per-stage timing inside the layer step
+        sr_check_geometry(ndev);
+        if (g_sr_head != ndev - 1) { std::fprintf(stderr, "FATAL Q27_LS_SR: head card %d is not the last card\n", g_sr_head); return 4; }
+        if (g_sampler) { std::fprintf(stderr, "FATAL Q27_LS_SR: the sequential decode is greedy-only (Q27_TEMP must be unset)\n"); return 4; }
+        std::fprintf(stderr, "Q27_LS_SR: single residency, sequential decode, head card %d, prefill MLP %s\n",
+                     g_sr_head, g_sr_rb ? "rocBLAS per-row" : "int8/64 wide");
+    }
+    g_tpsr = q27_env_flag("Q27_TPSR", false) ? 1 : 0;
+    if (g_tpsr) {   // Q27_TPSR: tensor-parallel single residency -- every precondition checked at the seam, before any card allocates
+        if (q27_env_flag("Q27_LAYER_SPLIT", true)) { std::fprintf(stderr, "FATAL Q27_TPSR needs Q27_LAYER_SPLIT=0 (one residency: the TP shards)\n"); return 4; }
+        if (g_sr) { std::fprintf(stderr, "FATAL Q27_TPSR and Q27_LS_SR are exclusive\n"); return 4; }
+        if (!q27_env_int("Q27_DEC_I8", 0)) { std::fprintf(stderr, "FATAL Q27_TPSR: decode reads the int8 per-64 projection mirrors, which need Q27_DEC_I8=1\n"); return 4; }
+        if (q27_env_flag("Q27_ALIAS_MLP", false) || (q27_env_flag("Q27_DEC_MLP_I8", false) && !q27_env_flag("Q27_DEC_MLP_NV", false))) {
+            std::fprintf(stderr, "FATAL Q27_TPSR: Q27_ALIAS_MLP / Q27_DEC_MLP_I8 drop TP MLP shards that only a layer-split copy could replace\n"); return 4; }
+        int missing = 0;
+        for (int gg = 0; gg < ndev; ++gg) for (int L = 0; L < nlayer; ++L) {
+            const q27_layer_t* lay = q27_layer_tp(m, L, gg);
+            if (q27_env_flag("Q27_TPSR_NV", false)) {
+                if (!lay || !lay->gate.w || !lay->up.w || !lay->down.w) ++missing;
+            } else if (!lay || !lay->f8_gate.w || !lay->f8_up.w || !lay->f8_down.w || !lay->f8_gate.bs || !lay->f8_up.bs || !lay->f8_down.bs) ++missing;
+        }
+        if (missing) { std::fprintf(stderr, "FATAL Q27_TPSR: %d (layer, card) handles lack the FP8 gate/up/down shards (Q27_FP8_MLP + Q27_FP8_MLP_DOWN=1)\n", missing); return 4; }
+        std::fprintf(stderr, "Q27_TPSR: tensor-parallel single residency -- FP8 gate/up row shards + FP8 down K-slice, int8/64 projection mirrors, "
+                             "quarter KV on every card; batched TP prefill with the MLP on rocBLAS int8; draft prompt-conditioned\n");
+        std::fflush(stderr);
+    }
+    g_tpsr_proj_rb = q27_env_flag("Q27_TPSR_PROJ_RB", false) ? 1 : 0;
+    if (g_tpsr_proj_rb && !g_tpsr) { std::fprintf(stderr, "FATAL Q27_TPSR_PROJ_RB needs Q27_TPSR=1\n"); return 4; }
     if (g_sampler) {
         CK(hipHostMalloc((void**)&g_logitbuf, (size_t)Q27_VOCAB * 4, hipHostMallocDefault));
         std::printf("Q27_SAMPLER temp=%.3f topk=%d topp=%.3f  (gather of 4 x %d logits per token)\n",
@@ -3056,6 +5118,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     g_coll_bf16       = q27_env_flag("Q27_COLL_BF16", false);
     g_coll_nrbf16     = q27_env_flag("Q27_COLL_NRBF16", true);
     g_nr_p2p          = q27_env_int("Q27_NR_P2P", 1);
+    g_mtp_tp          = q27_env_int("Q27_MTP_TP", 0);
+    if (g_mtp_tp && g_nr_p2p != 4) { std::fprintf(stderr, "Q27_MTP_TP needs the LL collective (Q27_NR_P2P=4); draft head stays replicated\n"); g_mtp_tp = 0; }
     g_nr_p2p_min      = q27_env_int("Q27_NR_P2P_MIN", 4);
     // REJECTED on measurement, retained as evidence. Multi-block rmsnorm (stage A 5 blocks
     // reducing partial sums, stage B 20 blocks applying + quantizing) measured rmsnorm
@@ -3106,6 +5170,9 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     g_nr_att1         = q27_env_flag("Q27_NR_ATT1", false) ? 1 : 0;
     g_nr_gdn1         = q27_env_flag("Q27_NR_GDN1", false) ? 1 : 0;
     g_nr_qb           = q27_env_flag("Q27_NR_QB", true) ? 1 : 0;
+    g_nr_dup          = q27_env_int("Q27_NR_DUP", 0);
+    g_ab_arm          = q27_env_int("Q27_AB_ARM", 0);
+    g_ab_file         = std::getenv("Q27_AB_FILE");     // null -> per-request re-read disabled
     g_nr_ch           = q27_env_int("Q27_NR_CH", 4); if (g_nr_ch < 1) g_nr_ch = 1; if (g_nr_ch > 8) g_nr_ch = 8;   // 8 = native 8-row kernels (no chunking)
     g_serve           = q27_env_flag("Q27_SERVE", false);
     g_eos_im_end      = q27_env_flag("Q27_EOS_IM_END", g_serve);
@@ -3180,6 +5247,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     g_pf_mk3          = q27_env_int("Q27_PF_MK3", 0);
     g_pf_m3f          = q27_env_int("Q27_PF_M3F", 0);
     g_pf_mlp3         = q27_env_int("Q27_PF_MLP3", 0);
+    g_pf_kvp2p        = q27_env_int("Q27_PF_KVP2P", 0);
     g_pf_p2p          = q27_env_int("Q27_PF_P2P", 0);
     g_pf_p2p_rn       = q27_env_int("Q27_PF_P2P_RN", 1);
     g_pf_p2p_mix      = q27_env_int("Q27_PF_P2P_MIX", 1);
@@ -3238,6 +5306,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     // Q27_GDN_DSPLIT=1: the documented GDN restructure -- 12 -> 48 blocks per card by splitting
     // each head's value dims across 4 blocks; only the two scalar norms cross blocks.
     g_dsplit           = q27_env_flag("Q27_GDN_DSPLIT", false);
+    if (g_dsplit && q27_env_int("Q27_NDEV", 4) == 3) { std::fprintf(stderr, "Q27_GDN_DSPLIT has no ragged (Q27_TP3) form; disabled\n"); g_dsplit = false; }
     g_preenq_mlp       = q27_env_flag("Q27_PREENQ_MLP", true);   // KEPT: 200-tok blocks +3.20/+1.22%
                                                         // (3/6 each), 500-tok block +4.35% (6/6); tokens identical
     // REJECTED end-to-end: +2.72% then -2.21%, 6/12 paired, medians opposite in sign -- while the
@@ -3269,6 +5338,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     g_slow_null       = q27_env_int("Q27_SLOW_NULL", 0);
     g_rn_dropy        = q27_env_flag("Q27_RN_DROPY", true);
     g_tail_preenq     = q27_env_flag("Q27_TAIL_PREENQ", true);
+    g_host_tail_mask = (unsigned)q27_env_int("Q27_HOST_TAIL_MASK", 0);
+    g_wait_kernel    = q27_env_int("Q27_WAIT_KERNEL", 0);   // 1: spin kernel instead of the CP barrier-value wait at the two NR sites
     // REJECTED. Two blocks of six disagree in sign (+3.70% then -1.43%, 8/12 paired) and the
     // mechanism check is decisive: the reduce phase is 6.56/6.35/5.91/6.55 us/call with this off
     // and 6.78/6.29/6.76/5.57 with it on. Allocation mode does not touch the reduction cost, so
@@ -3283,14 +5354,41 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     // ranges), the GDN TP kernel offsets, the KV-cache split and the collective slice were all
     // derived for four shards. 1 and 2 would COMPILE and run, which is exactly the hazard.
     // Accept only what is actually implemented; do not generalise on the strength of the CLI.
-    if (ndev != 4) {
-        std::fprintf(stderr, "FATAL run_tp: this TP implementation has a FOUR-CARD contract; "
-                             "ndev=%d is not implemented (attention has G=1,2 kernels but the "
-                             "shard map, GDN offsets and KV split were derived for 4 only).\n", ndev);
-        return 4;
+    //
+    // 2026-09-18 -- Q27_TP_NDEV_ANY=1 OPENS THIS DELIBERATELY. Operator order: run the model on
+    // the single 32 GiB card. The refusal above is CAUTION, not a missing implementation -- its
+    // own comment says 1 and 2 compile and run. At ndev=1 every quantity this comment worries
+    // about degenerates to the identity: each "shard" is the full tensor, every /ndev is /1, the
+    // KV split is the whole cache, and a collective over one card is a no-op. That is the least
+    // dangerous member of the family, not the most.
+    // Still OPT-IN and still loud: an unreviewed ndev=2 really does carry the shard-map risk the
+    // comment describes (half-width in_proj_qkv ranges and GDN offsets nobody has checked), so
+    // this prints what it is accepting and why, every boot.
+    {
+        const bool ndev_any = q27_env_flag("Q27_TP_NDEV_ANY", false);
+        if (!q27_tp_shard_init(ndev)) { std::fprintf(stderr, "FATAL: no valid TP shard plan for ndev=%d\n", ndev); return 1; }
+        for (int gg = 0; gg < ndev; ++gg) { const q27_tp_shard_t* T = q27_tp_shard(gg);
+            std::fprintf(stderr, "Q27_TP_SHARD worker %d: q_heads [%d,+%d) kv_heads [%d,+%d) attn_g=%d gdn_key_heads [%d,+%d) value_heads [%d,+%d) mlp [%d,+%d) vocab [%d,+%d) | QL=%d KVL=%d OL=%d QKVL=%d ZL=%d\n",
+                         gg, T->q_h0, T->q_hn, T->kv_h0, T->kv_hn, T->attn_g, T->gk_h0, T->gk_hn, T->gv_h0, T->gv_hn, T->mlp_off, T->mlp_len, T->voc_off, T->voc_len, T->QL, T->KVL, T->OL, T->QKVL, T->ZL); }
+        if (ndev != 4 && !ndev_any) {
+            std::fprintf(stderr, "FATAL run_tp: this TP implementation has a FOUR-CARD contract; "
+                                 "ndev=%d is not implemented (attention has G=1,2 kernels but the "
+                                 "shard map, GDN offsets and KV split were derived for 4 only). "
+                                 "Set Q27_TP_NDEV_ANY=1 to run it anyway.\n", ndev);
+            return 4;
+        }
+        if (ndev != 4) {
+            std::fprintf(stderr, "Q27_TP_NDEV_ANY: running the FOUR-CARD TP path at ndev=%d by "
+                                 "explicit opt-in.%s\n", ndev,
+                         ndev == 1 ? "  ndev=1: all shards are full width, every collective is a"
+                                     " no-op -- the degenerate case."
+                                   : "  ndev!=1: the in_proj_qkv shard ranges and GDN offsets were"
+                                     " NEVER reviewed for this width. Verify output before trusting it.");
+            std::fflush(stderr);
+        }
     }
-    if (Q27_NHEAD % ndev || Q27_NKV % ndev || Q27_HID % ndev) {
-        std::fprintf(stderr, "FATAL run_tp: geometry not divisible by ndev=%d "
+    if (!q27_tp_shard_init(ndev)) {   // Q27_TP3: a valid (possibly ragged) shard plan replaces the divisibility rule
+        std::fprintf(stderr, "FATAL run_tp: no shard plan for ndev=%d "
                              "(heads %d, kv %d, hidden %d).\n",
                              ndev, Q27_NHEAD, Q27_NKV, Q27_HID);
         return 4;
@@ -3301,7 +5399,125 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     //      released the banks/slots land in HBM instead of GTT (the p1k K=7 collapse). Q27_DEC_I8_PLAIN=1 routes the
     //      single-row (plain) consumers to the mirrors too; only then is the fp8 arena freed (Q27_KEEP_FP8=1 keeps it,
     //      diagnostic). bad > 0 => fp8 stays resident (the routers fall back per tensor). Draft-head mirrors: below. ----
-    if (q27_env_flag("Q27_SPEC", true) && q27_env_int("Q27_DEC_I8", 0)) {
+    // ---- Q27_ALIAS_QKV: address the layer-split residency instead of duplicating it -----------
+    // The model is resident TWICE: q27_upload_tp (all 64 layers, each sharded to 1/4 width, for
+    // decode) and q27_upload_ls (this card's 16 layers at FULL width, for the fast prefill). That
+    // is ~34.6 GiB of weights for a ~20 GB checkpoint, and it is why only ~0.9 GiB/card is left
+    // and the int8 MLP mirrors do not fit at 262144.
+    //
+    // They do not have to be two copies. q27_i8g_t is w=[rows][K] with s=[rows][K/64] -- both
+    // row-contiguous, and the group scales are PER ROW, so a TP output-row boundary can never
+    // split a quantization group. q_proj/k_proj/v_proj are output-row sharded, so card g's TP
+    // shard of a layer it ALSO owns in LS is exactly a row block of the LS full-width mirror:
+    // same bytes, same scales, a different starting pointer and row count. Point the decode
+    // handle's side-table entry at that view and the TP copy has no reader.
+    //
+    // Not in_qkv: the loader shards it as THREE contiguous ranges (q|k|v inside one tensor), so
+    // its TP shard is not a single row block. It needs three views and is left alone here.
+    //
+    // RUNS BEFORE THE Q27_DEC_I8 MIRROR BUILD ON PURPOSE. q27_fp8_make_i8g() early-returns when a
+    // handle already has a side-table entry, so registering the views first makes the build loop
+    // skip exactly the mirrors we are aliasing -- the duplicate is never allocated at all, which
+    // is the point. Registering afterwards would overwrite them and save nothing.
+    if (g_ls && !g_sr && q27_env_int("Q27_ALIAS_QKV", 0)) {
+        int aliased = 0, skipped = 0;
+        for (int gg = 0; gg < ndev; ++gg) {
+            for (int L = 0; L < nlayer; ++L) {
+                if (!Q27_IS_FULL(L)) continue;
+                const q27_layer_t* lsl = q27_layer_ls(m, L, gg);
+                const q27_layer_t* tpl = q27_layer_tp(m, L, gg);
+                if (!lsl || !tpl || !lsl->q8g.w) { ++skipped; continue; }   // gg does not own L in LS
+                const q27_i8g_t* src[3] = { &lsl->q8g, &lsl->k8g, &lsl->v8g };
+                const q27_fp8_t* dst[3] = { &tpl->q_proj, &tpl->k_proj, &tpl->v_proj };
+                for (int i = 0; i < 3; ++i) {
+                    if (!src[i]->w || !src[i]->s) { ++skipped; continue; }
+                    q27_i8g_t v = *src[i];
+                    const q27_tp_shard_t* TS = q27_tp_shard(gg);   // Q27_TP3: the card's head range, not an equal slice
+                    const int nr = (i == 0) ? TS->QL : TS->KVL;
+                    const int r0 = (i == 0) ? (Q27_QROWS / Q27_NHEAD) * TS->q_h0 : Q27_HDIM * TS->kv_h0;
+                    v.w    = v.w + (size_t)r0 * (size_t)v.K;
+                    v.s    = v.s + (size_t)r0 * (size_t)(v.K / 64);
+                    v.rows = nr;
+                    if (dst[i]->rows != nr) { ++skipped; continue; }   // shard geometry must agree
+                    aliased += q27_fp8_set_i8g(dst[i], &v);
+                }
+            }
+        }
+        // in_z is the one GDN projection the loader shards as a SINGLE row range (q/k/v of in_qkv
+        // are three separate ranges and cannot be expressed as one descriptor). Its column-parallel
+        // shard is therefore rows [g*Z/ndev, +Z/ndev) of the card's own full-width in_z mirror --
+        // the same row-view trick as q/k/v, applied to the other half of the GDN prologue.
+        for (int gg = 0; gg < ndev; ++gg) {
+            for (int L = 0; L < nlayer; ++L) {
+                if (Q27_IS_FULL(L)) continue;
+                const q27_layer_t* lsl = q27_layer_ls(m, L, gg);
+                const q27_layer_t* tpl = q27_layer_tp(m, L, gg);
+                if (!lsl || !tpl || !lsl->iz8g.w || !lsl->iz8g.s) { ++skipped; continue; }
+                q27_i8g_t v = lsl->iz8g;
+                const q27_tp_shard_t* TS = q27_tp_shard(gg);   // Q27_TP3
+                const int nr = TS->ZL, r0 = Q27_GDN_D * TS->gv_h0;
+                v.w    = v.w + (size_t)r0 * (size_t)v.K;
+                v.s    = v.s + (size_t)r0 * (size_t)(v.K / 64);
+                v.rows = nr;
+                if (tpl->in_z.rows != nr) { ++skipped; continue; }
+                if (v.alpha != tpl->in_z.in_scale * tpl->in_z.wscale) { ++skipped; continue; }
+                aliased += q27_fp8_set_i8g(&tpl->in_z, &v);
+            }
+        }
+        std::fprintf(stderr, "Q27_ALIAS_QKV: %d decode handles now address the layer-split copy "
+                             "(%d skipped)\n", aliased, skipped);
+        std::fflush(stderr);
+    }
+    // ---- Q27_ALIAS_K: the same trick for the tensors the loader shards along K --------------
+    // Tp::fp8_row splits o_proj and out_proj by INPUT columns, so card g's TP shard is
+    // [rows][K/ndev] whose rows are a COLUMN RANGE of the card's own full-K layer-split tensor.
+    // Same bytes, same per-64 groups (K/ndev is group-aligned), different starting pointer and
+    // row stride. Register the view before the mirror build so the duplicate TP mirror is never
+    // allocated -- which is the memory this is for. The consumer side is q27_proj_i8g_rows ->
+    // q27_k_proj_i8g_snr, which now takes the physical row stride and scale-plane stride.
+    if (g_ls && !g_sr && q27_env_int("Q27_ALIAS_K", 0)) {
+        int aliased = 0, skipped = 0;
+        const int kdbg = q27_env_int("Q27_ALIAS_K_DBG", 0);
+        for (int gg = 0; gg < ndev; ++gg) {
+            for (int L = 0; L < nlayer; ++L) {
+                const q27_layer_t* lsl = q27_layer_ls(m, L, gg);
+                const q27_layer_t* tpl = q27_layer_tp(m, L, gg);
+                if (!lsl || !tpl) { ++skipped; continue; }
+                // (LS mirror, decode fp8 handle) for each K-sharded family. o_proj/out_proj only;
+                // in_qkv is output-row sharded as three discrete ranges and needs row views, not
+                // a K-view, so it is deliberately not in this list.
+                const q27_i8g_t* src[2] = { lsl->o8g.w ? &lsl->o8g : nullptr, lsl->op8g.w ? &lsl->op8g : nullptr };
+                const q27_fp8_t* dst[2] = { &tpl->o_proj, &tpl->out_proj };
+                for (int i = 0; i < 2; ++i) {
+                    if (!src[i] || !src[i]->w || !src[i]->s) { ++skipped; continue; }
+                    const int Kfull = src[i]->K;
+                    const int Ksh   = dst[i]->K;
+                    if (Ksh <= 0 || Kfull <= 0 || (Kfull % (Ksh * ndev))) { ++skipped; continue; }
+                    const int k0 = gg * Ksh;                     // this card's contiguous K range
+                    if ((k0 % 64) || (Ksh % 64)) { ++skipped; continue; }   // must not split a group
+                    q27_i8g_t v = *src[i];
+                    v.w    = v.w + (size_t)k0;
+                    v.s    = v.s + (size_t)(k0 >> 6);
+                    v.ldw  = Kfull;                              // physical row stride of the resident row
+                    v.lds  = Kfull >> 6;                         // matching scale-plane row stride
+                    v.K    = Ksh;                                // logical stride of the shard
+                    if (v.alpha != dst[i]->in_scale * dst[i]->wscale) { ++skipped; continue; }
+                    if (kdbg) std::fprintf(stderr, "Q27_ALIAS_K_DBG view card=%d L=%d %s rows=%d K=%d k0=%d "
+                                                    "ldw=%d lds=%d w=%p s=%p (tp fp8 w=%p rows=%d K=%d)\n",
+                                            gg, L, i ? "out_proj" : "o_proj", v.rows, v.K, k0,
+                                            v.ldw, v.lds, (const void*)v.w, (const void*)v.s,
+                                            (const void*)dst[i]->w, dst[i]->rows, dst[i]->K);
+                    aliased += q27_fp8_set_i8g(dst[i], &v);
+                }
+            }
+        }
+        std::fprintf(stderr, "Q27_ALIAS_K: %d decode K-sharded handles now address the layer-split "
+                             "copy (%d skipped)\n", aliased, skipped);
+        std::fflush(stderr);
+    }
+    if (g_sr) sr_build_mirrors(m, ndev);   // Q27_LS_SR: per-64 mirrors on the layer-split handles, then the fp8 originals go
+    else if (q27_env_int("Q27_DEC_I8", 0) &&
+             (q27_env_flag("Q27_SPEC", true) || q27_env_flag("Q27_DEC_I8_PLAIN", false) || g_tpsr)) {
         size_t bytes = 0; int nt = 0, bad = 0;
         for (int gg = 0; gg < ndev; ++gg) {
             CK(hipSetDevice(gg));
@@ -3314,6 +5530,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 for (int i = 0; i < nh; ++i) { if (q27_fp8_make_i8g(hs[i], 0)) { ++nt; bytes += (size_t)hs[i]->rows * hs[i]->K; } else ++bad; }
             }
             CK(hipDeviceSynchronize());
+            q27_storage_owner_ready(gg);
         }
         std::printf("Q27_DEC_I8 on: %d int8 per-64 layer mirrors, %.2f GiB over %d cards (%d failed)\n", nt, (double)bytes / (1024.0 * 1024.0 * 1024.0), ndev, bad);
         for (int gg = 0; gg < ndev; ++gg) { size_t fr = 0, tt = 0; CK(hipSetDevice(gg)); CK(hipMemGetInfo(&fr, &tt));
@@ -3327,8 +5544,9 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         } else if (bad) std::printf("Q27_DEC_I8: %d mirrors failed, fp8 projections kept resident (per-tensor fallback)\n", bad);
         CK(hipSetDevice(0));
     }
-    MS("T3_devalloc_begin");
-    for (int g = 0; g < ndev; ++g) dev_alloc_tp(D[g], g, g_ls ? 1 : ndev, ctx);
+    q27_memory_receipt("weights_resident"); MS("T3_devalloc_begin");
+    for (int g = 0; g < ndev; ++g) dev_alloc_tp(D[g], g, g_ls ? 1 : ndev, ctx, ndev, g_ls != 0);
+    if (g_sr) { g_sr_D = D.data(); g_sr_ndev = ndev; }
     MS("T4_devalloc_done");
     for (int gg = 0; gg < ndev; ++gg) { size_t fr = 0, tt = 0; CK(hipSetDevice(gg)); CK(hipMemGetInfo(&fr, &tt));
         std::printf("Q27_VRAM after_devalloc card %d: free %.2f GiB of %.2f GiB\n", gg, (double)fr / 1073741824.0, (double)tt / 1073741824.0); }
@@ -3357,8 +5575,18 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             CK(hipHostFree(pin));
         }
     }
+    g_mtp_graph_on = q27_env_int("Q27_MTP_GRAPH", 0);
     g_spec = q27_env_flag("Q27_SPEC", true) ? 1 : 0;   // shipped default: speculative decoding (greedy); Q27_SPEC=0 = plain
-    g_spec_k = q27_env_int("Q27_SPEC_K", 1); if (g_spec_k < 1) g_spec_k = 1; if (g_spec_k > 7) g_spec_k = 7;   // K<=7: NR=K+1 verify rows run as chunks of <= 4
+    // K is the number of DRAFT tokens the round proposes; NR = K+1 is the number of trunk rows the
+    // verify pass runs. K=0 is legal and is the NON-SPECULATIVE measurement configuration: the draft
+    // loop does not execute, spec_round runs exactly one trunk row through run_layer_tp_nr, no
+    // acceptance test can fire, and ncommit is 1 by construction -- i.e. a plain target decode step
+    // built from the SHIPPED kernels. That matters because the alternative (Q27_SPEC=0) is not a
+    // working configuration: the persistent int8 MLP mirror deliberately leaves the NVFP4 TP MLP
+    // shards unallocated and the int8 dispatch exists ONLY inside run_layer_tp_nr, so the plain
+    // Q27_SPEC=0 path dereferences a null gate (measured: "layer_in L=1 gate=(nil)", fault at the
+    // sweep->decode boundary). K=0 reaches back into the shipped code instead of resurrecting it.
+    g_spec_k = q27_env_int("Q27_SPEC_K", 1); if (g_spec_k < 0) g_spec_k = 0; if (g_spec_k > 7) g_spec_k = 7;   // K<=7: NR=K+1 verify rows run as chunks of <= 4
     if (q27_env_flag("Q27_MTP_DRAFT", false) || g_spec) {
         // DEFAULT IS THE EMBEDDING-FIRST ORDER. Settled by the golden test, not by taste: feeding
         // the oracle's h_0 and emb(t_1)=8678, embedding-first predicts 198 (= the authority stream's
@@ -3374,16 +5602,31 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         g_lmref = q27_globals(m, ndev - 1)->lm_head;
         for (int gg = 0; gg < ndev; ++gg) { size_t fr = 0, tt = 0; CK(hipSetDevice(gg)); CK(hipMemGetInfo(&fr, &tt));
             std::printf("Q27_VRAM pre_mtp_init card %d: free %.2f GiB of %.2f GiB\n", gg, (double)fr / 1073741824.0, (double)tt / 1073741824.0); }
-        if (mtp_init(m, ndev)) {
+        // The K=0 target-only row decoder never consumes draft weights. Keep
+        // its existing scratch/protocol setup below, but avoid loading and
+        // converting the replicated MTP head when every draft consumer is off.
+        const bool need_draft_weights = g_spec_k > 0 || q27_env_flag("Q27_MTP_DRAFT", false)
+            || q27_env_flag("Q27_MTP_PP", true) || g_sr
+            || std::getenv("Q27_MTP_GOLD_H") || q27_env_flag("Q27_MTP_KERNBENCH", false);
+        if (!need_draft_weights) std::fprintf(stderr,"Q27_MTP weights skipped: target-only K=0, draft and prompt-head disabled\n");
+        if (need_draft_weights && mtp_init(m, ndev)) {
             if (std::getenv("Q27_SPEC") || std::getenv("Q27_MTP_DRAFT")) { std::fprintf(stderr, "Q27_MTP_INIT_FAIL\n"); return 1; }
             std::fprintf(stderr, "Q27_MTP_INIT_FAIL: speculative decoding disabled, plain decode\n"); g_spec = 0;
         }
         g_mtp_on = q27_env_flag("Q27_MTP_DRAFT", false) ? 1 : 0;
         g_mtp_pp = q27_env_flag("Q27_MTP_PP", true) ? 1 : 0;
         if (g_spec && g_mtp_pp) { g_mtp_hall_cap = (size_t)g_pf_cap; CK(hipHostMalloc((void**)&g_mtp_hall, g_mtp_hall_cap * Q27_HID * 2, hipHostMallocDefault)); }
-        if (g_spec) {   // GDN state / conv snapshot banks (K banks per card) reserved now, not at the first round when VRAM is at its peak (32K OOM)
-            const int n_gdn = Q27_LAYERS - Q27_LAYERS / 4; const size_t sshard = (size_t)(Q27_GDN_VH / ndev) * Q27_GDN_D * Q27_GDN_D;
+        if (g_sr) {   // Q27_LS_SR: full-width banks for this card's OWN gdn layers, the decode scratch and the prefill mirror ring
+            for (int gg = 0; gg < ndev; ++gg) sr_alloc_card(D[gg], ndev, g_spec_k);
+            CK(hipSetDevice(0));
+        } else
+        if (g_spec && g_spec_k > 0) {   // GDN state / conv snapshot banks (K banks per card) reserved now, not at the first round when VRAM is at its peak (32K OOM)
+            // K=0 needs no banks: the snapshot is written only for rows that a later acceptance test
+            // could reject (c0 + cn < NR), and NR = 1 means there is no such row. Sizing this at K=0
+            // would be a zero-byte hipMalloc.
+            const int n_gdn = Q27_LAYERS - Q27_LAYERS / 4;
             for (int gg = 0; gg < ndev; ++gg) { CK(hipSetDevice(D[gg].id));
+                const size_t sshard = (size_t)q27_tp_shard(gg)->VHL * Q27_GDN_D * Q27_GDN_D;
                 CK(hipMalloc((void**)&D[gg].nr_Ssnap, (size_t)g_spec_k * n_gdn * sshard * 4));
                 CK(hipMalloc((void**)&D[gg].nr_csnap, (size_t)g_spec_k * n_gdn * D[gg].tp_conv * 2)); }
         }
@@ -3399,8 +5642,33 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             return 0;   // probe mode
         }
     }
+    // WHAT SPECULATION ACTUALLY RESOLVED TO. Q27_SPEC_K=0 (no draft, one trunk row per round) is
+    // the non-speculative measurement configuration, and it looks identical to K=2 in every other
+    // log line, so the engine states it once at start-up rather than leaving it to be inferred.
+    std::fprintf(stderr, "Q27_SPECCFG spec=%d K=%d verify_rows=%d draft=%d mtp_pp=%d paged=%d\n",
+                 g_spec, g_spec_k, g_spec ? g_spec_k + 1 : 1, g_mtp_on, g_mtp_pp,
+                 q27_env_int("Q27_MTP_PAGED", 1));
+    std::fflush(stderr);
+    {   // E2 (2026-09-17): the boot names the binary it is running. Reported BEFORE the first
+        // request so every arm of an A/B is attributable from the log alone. See q27_buildstamp.cpp.
+        // nr / nr_p2p / nr_p2p_min come from the PARSED GLOBALS (set ~500 lines above, same
+        // function), not from a re-read of the environment: the receipt has to name what the
+        // engine will actually execute with. nr = the speculative verify row count, which is what
+        // the collective's transport threshold is compared against -- printing it next to
+        // nr_p2p_min makes the transport decision readable off the boot line alone.
+        char bcfg[288];
+        std::snprintf(bcfg, sizeof bcfg,
+                      "v4=%d pf_ch=%d pf_tslot=%d ls=%d kvplace=%d dec_mlp_nv=%d "
+                      "nr=%d nr_p2p=%d nr_p2p_min=%d coll_nrbf16=%d tpsr=%d",
+                      (int)Q27_V4, (int)Q27_PF_CH, (int)Q27_PF_TSLOT,
+                      q27_env_int("Q27_LAYER_SPLIT", 0), q27_env_int("Q27_KVPLACE", 0),
+                      q27_env_int("Q27_DEC_MLP_NV", 0),
+                      g_spec ? g_spec_k + 1 : 1, g_nr_p2p, g_nr_p2p_min, (int)g_coll_nrbf16, g_tpsr);
+        q27_bootstamp(g_spec, g_spec_k, ctx, ndev, bcfg);
+    }
 
     TpColl C; C.ndev = ndev; C.n = Q27_HID; C.b1.init(ndev); C.b2.init(ndev);
+    for (int g = 0; g < Q27_MAX_DEVICES; ++g) C.sr_pub[g].store(0);   // Q27_LS_SR hop counters (atomics do not self-initialise)
     // ALLOCATION MODE IS PART OF THE ALGORITHM HERE. ROCm's default host allocation is
     // fine-grained coherent, which keeps the GPU coherent with no explicit flush and makes CPU
     // reads slow -- and this buffer's whole purpose is a GPU write followed by a CPU read. The
@@ -3428,6 +5696,11 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         for (int g = 0; g < ndev && g_preenq_ok; ++g) {
             CK(hipSetDevice(D[g].id));
             CK(hipEventCreateWithFlags(&C.ev_copy[g], hipEventDisableTiming));
+            // Initialize the stream-wait path with an already-satisfied value,
+            // before workers can enqueue an unsatisfied host-published flag.
+            CK(hipStreamWaitValue32(D[g].stream, (void*)(C.flag_d + g), 0,
+                                    hipStreamWaitValueEq, 0xffffffffu));
+            CK(hipStreamSynchronize(D[g].stream));
         }
     }
 
@@ -3502,6 +5775,33 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         CK(hipHostGetDevicePointer((void**)&C.hp2_d[g], C.hp2[g], 0));
         for (int q = 0; q < TpColl::NB; ++q) CK(hipHostGetDevicePointer((void**)&C.hpb_d[q][g], C.hpb[q][g], 0)); }
 
+    // ---- ndev < 4: PAD THE UNUSED COLLECTIVE SLOTS WITH ZEROS, DO NOT LEAVE THEM NULL. 2026-09-18.
+    // FIVE host-reduce sites (tp_reduce_bx and four siblings around :1285/:1410/:1503/:1565) are
+    // hand-unrolled over hp[0..3] and read all four UNCONDITIONALLY. At ndev=2 slots 2 and 3 were
+    // null and the adds dereferenced them: both card threads faulted at address 0 and 0x2800 inside
+    // tp_reduce_bx (dmesg, 2026-09-18 12:42:30). That is what "the shard map was derived for 4 only"
+    // amounted to in practice -- not a shard map at all, an unrolled loop.
+    // Zero is the identity for this reduction, so padding is numerically EXACT: every unrolled fast
+    // path keeps running at every width and no reduce site has to change. The ndev==4 arm allocates
+    // nothing here and is untouched.
+    for (int k = ndev; k < 4; ++k) {
+        const size_t nb = (size_t)C.n * TpColl::BC * 4;
+        CK(hipHostMalloc((void**)&C.hp[k],  nb, g_coll_hostflag)); std::memset(C.hp[k],  0, nb);
+        CK(hipHostMalloc((void**)&C.hp2[k], nb, g_coll_hostflag)); std::memset(C.hp2[k], 0, nb);
+        for (int q = 0; q < TpColl::NB; ++q) {
+            CK(hipHostMalloc((void**)&C.hpb[q][k], nb, g_coll_hostflag)); std::memset(C.hpb[q][k], 0, nb);
+        }
+        if (g_pf_wide) {
+            const size_t wb = (size_t)C.n * Q27_PF_TSLOT * 4;
+            CK(hipHostMalloc((void**)&C.hp2w[k], wb, g_coll_hostflag)); std::memset(C.hp2w[k], 0, wb);
+        }
+    }
+    if (ndev < 4) {
+        std::fprintf(stderr, "Q27_COLL_PAD: ndev=%d -- collective slots %d..3 zero-filled "
+                             "(the host reduces are unrolled over hp[0..3])\n", ndev, ndev);
+        std::fflush(stderr);
+    }
+
     // ---- Q27_PF_P2P: peer access behind a runtime self-test. A kernel writes a marker into every
     // peer's buffer; the host reads each back and verifies. Any failure (or a missing wide producer)
     // drops P2P and the sweep runs the untouched host collective -- both the producer routing and
@@ -3538,7 +5838,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         CK(hipSetDevice(D[0].id));
     }
     if (g_spec && g_nr_p2p) {
-        int ok = (ndev == 4) ? 1 : 0;
+        int ok = (ndev == 4 || ndev == 3) ? 1 : 0;
         for (int i = 0; i < ndev && ok; ++i) for (int j = 0; j < ndev; ++j) if (i != j) {
             int can = 0; CK(hipDeviceCanAccessPeer(&can, D[i].id, D[j].id)); if (!can) ok = 0; }
         for (int i = 0; i < ndev && ok; ++i) { CK(hipSetDevice(D[i].id));
@@ -3559,6 +5859,11 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         }
         if (ok) {
             for (int gg = 0; gg < ndev; ++gg) g_devid_tab[gg] = D[gg].id;
+            g_nrp_ndev = ndev;
+            if (ndev == 3) {   // pull mode reads four partial slots: the fourth is a zero pad on card 0 (never written)
+                CK(hipSetDevice(D[0].id));
+                for (int q = 0; q < 2; ++q) { CK(hipMalloc((void**)&C.nrp_part[q][3], (size_t)8 * Q27_HID * 4)); CK(hipMemset(C.nrp_part[q][3], 0, (size_t)8 * Q27_HID * 4)); }
+            }
             for (int gg = 0; gg < ndev; ++gg) {
                 CK(hipSetDevice(D[gg].id));
                 for (int q = 0; q < 2; ++q) {
@@ -3575,8 +5880,64 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     CK(hipMemset(C.nrp_recv[q][gg][k], 0, (size_t)8 * Q27_HID * 2)); }
                 for (int q = 0; q < 2; ++q) CK(hipMalloc((void**)&C.nrp_stage[q][gg], (size_t)8 * Q27_HID * 2));
             }
-            std::printf("Q27_NR_P2P=%d on: %s for the %d-card row-batched collective (self-test 12/12)\n", g_nr_p2p,
-                        g_nr_p2p == 2 ? "peer-read (pull) reduce" : (g_nr_p2p == 3 ? "bf16 SDMA push (hipMemcpyPeerAsync) + local reduce" : "bf16 store-kernel push + local reduce"), ndev);
+            if (g_nr_p2p == 4) {
+                // LL slots: 8 rows x HID/2 words x 8 B per (owner, source, slot), UNCACHED if the runtime offers it, else fine-grained.
+                // Both map MTYPE UC on gfx9 (amdgpu get_pte_flags: coherent -> UC), for the owner's spin-reads AND the peers' stores.
+                const size_t llb = (size_t)8 * (Q27_HID / 2) * 8;
+                const char* llkind = "uncached";
+                int llok = 1;
+                for (int gg = 0; gg < ndev && llok; ++gg) {
+                    CK(hipSetDevice(D[gg].id));
+                    for (int q = 0; q < Q27_LL_SLOTS && llok; ++q) for (int k = 0; k < ndev && llok; ++k) if (k != gg) {
+                        void* p = nullptr;
+                        hipError_t e = hipExtMallocWithFlags(&p, llb, hipDeviceMallocUncached);
+                        if (e != hipSuccess) { (void)hipGetLastError(); llkind = "finegrained"; e = hipExtMallocWithFlags(&p, llb, hipDeviceMallocFinegrained); }
+                        if (e != hipSuccess) { (void)hipGetLastError(); std::fprintf(stderr, "Q27_NR_P2P=4: no uncached/fine-grained device allocation on card %d (%s)\n", gg, hipGetErrorString(e)); llok = 0; break; }
+                        CK(hipMemset(p, 0, llb));
+                        C.nrp_ll[q][gg][k] = (unsigned*)p;
+                    }
+                    for (int q = 0; q < Q27_LL_SLOTS; ++q) { CK(hipMalloc((void**)&C.nrp_llstage[q][gg], llb)); CK(hipMemset(C.nrp_llstage[q][gg], 0, llb)); }
+                    CK(hipMalloc((void**)&C.nrp_cnt[gg], 64)); CK(hipMemset(C.nrp_cnt[gg], 0, 64));
+                    CK(hipHostMalloc((void**)&C.nrp_err[gg], 64, hipHostMallocMapped));
+                    std::memset(C.nrp_err[gg], 0, 64);
+                    C.nrp_seq[gg] = 0;
+                }
+                g_ll_sdma = q27_env_int("Q27_LL_SDMA", 1);
+                g_ll_epi  = g_ll_sdma ? q27_env_int("Q27_LL_EPI", 0) : 0;
+                g_proj_seg = q27_env_int("Q27_PROJ_SEG", 0);
+                // Self-test, every ordered pair, the protocol itself: the OWNER's spinning reader is launched FIRST (it reads the
+                // stale word once, then polls), THEN the source stores {data, seq} through peer access. The reader must see the new
+                // word (proves the peer store lands and the owner's re-read is not served from a stale cache) and report the stale
+                // seq it saw first (proves the reader was really waiting, not reading a leftover).
+                int llpass = 0, lltot = 0;
+                for (int i = 0; i < ndev && llok; ++i) for (int j = 0; j < ndev; ++j) if (i != j) {
+                    ++lltot;
+                    unsigned* out = C.nrp_err[j];                   // pinned scratch on the owner side
+                    std::memset(out, 0, 16);
+                    unsigned* slot = C.nrp_ll[0][j][i];             // owner j, source i
+                    const unsigned seq = 0x51000000u + (unsigned)(i * 16 + j), data = 0xA5000000u + (unsigned)(j * 16 + i);
+                    CK(hipSetDevice(D[j].id)); CK(hipMemset(slot, 0, 64)); CK(hipStreamSynchronize(D[j].stream));
+                    q27_ll_probe_wait(slot, seq, out, D[j].stream);               // owner spins
+                    usleep(2000);
+                    CK(hipSetDevice(D[i].id)); q27_ll_probe_write(slot, data, seq, D[i].stream); CK(hipStreamSynchronize(D[i].stream));
+                    CK(hipSetDevice(D[j].id)); CK(hipStreamSynchronize(D[j].stream));
+                    const int ok1 = (out[0] == data) && (out[1] == 0u);
+                    if (ok1) ++llpass;
+                    else std::fprintf(stderr, "Q27_NR_P2P=4 self-test FAIL %d->%d: got %08x want %08x (stale-before %08x, spins %u)\n", i, j, out[0], data, out[1], out[2]);
+                    std::memset(out, 0, 16);
+                    CK(hipSetDevice(D[j].id)); CK(hipMemset(slot, 0, 64)); CK(hipStreamSynchronize(D[j].stream));
+                }
+                CK(hipSetDevice(D[0].id));
+                if (!llok || llpass != lltot) {
+                    std::fprintf(stderr, "Q27_NR_P2P=4: LL transport unavailable (%d/%d pairs); host-staged collective kept.\n", llpass, lltot);
+                    g_nr_p2p = 0;
+                } else {
+                    std::printf("Q27_NR_P2P=4 on: LL flag-in-data %s + local spin reduce for the %d-card row-batched collective (%s slots, %d deep, self-test %d/%d)\n",
+                                g_ll_sdma ? "pack + copy-engine push" : "shader-store push", ndev, llkind, Q27_LL_SLOTS, llpass, lltot);
+                }
+            } else
+            std::printf("Q27_NR_P2P=%d on: %s for the %d-card row-batched collective (self-test %d/%d)\n", g_nr_p2p,
+                        g_nr_p2p == 2 ? "peer-read (pull) reduce" : (g_nr_p2p == 3 ? "bf16 SDMA push (hipMemcpyPeerAsync) + local reduce" : "bf16 store-kernel push + local reduce"), ndev, ndev * (ndev - 1), ndev * (ndev - 1));
         } else {
             std::fprintf(stderr, "Q27_NR_P2P: peer access unavailable or self-test failed; host-staged collective kept.\n");
             g_nr_p2p = 0;
@@ -3590,6 +5951,13 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         std::printf("Q27_VRAM after_spec_init card %d: free %.2f GiB of %.2f GiB\n", gg, (double)fr / 1073741824.0, (double)tt / 1073741824.0);
     }
     for (int g = 0; g < ndev; ++g) dev_alloc_pfslots(D[g]);
+    // The ACTUAL slot capacity, announced where it becomes true. Q27_READY's `slots=` is a
+    // different quantity (an argv/env ingest knob that defaults to 1), so a server that wants to
+    // pace work against the slot arena has to read this line -- and the Q27_SERVE_GROW line after
+    // every in-place growth.
+    q27_memory_receipt("runtime_resident");
+    std::printf("Q27_SLOTS cap=%d\n", g_pf_cap);
+    std::fflush(stdout);
     for (int gg = 0; gg < ndev; ++gg) {
         size_t fr = 0, tt = 0; CK(hipSetDevice(D[gg].id)); CK(hipMemGetInfo(&fr, &tt));
         std::printf("Q27_VRAM after_pfslots card %d: free %.2f GiB of %.2f GiB\n", gg, (double)fr / 1073741824.0, (double)tt / 1073741824.0);
@@ -3604,8 +5972,18 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         for (int i = 0; i < ndev && p2p_ok; ++i) {
             CK(hipSetDevice(i));
             for (int j = 0; j < ndev; ++j) if (i != j) {
+                // hipDeviceEnablePeerAccess returns hipErrorPeerAccessAlreadyEnabled when the
+                // pair is already enabled, and Q27_NR_P2P (on in the shipped recipe) enables every
+                // pair earlier in startup. Treating that as failure declared peer access
+                // "unavailable" on a box where it works perfectly well, which silently demoted the
+                // collective to host staging -- and made the peer-quarter KV path read and write
+                // through pointers it believed were mapped. Clear the sticky error and continue.
                 hipError_t pe = hipDeviceEnablePeerAccess(j, 0);
-                if (pe != hipSuccess) p2p_ok = 0;
+                if (pe == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); pe = hipSuccess; }
+                if (pe != hipSuccess) {
+                    std::fprintf(stderr, "Q27_PF_P2P: enable %d->%d failed: %s\n", i, j, hipGetErrorName(pe));
+                    p2p_ok = 0;
+                }
             }
         }
         if (p2p_ok) {
@@ -3678,6 +6056,32 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     bool done = false;
     double t_decode = 0, t_prefill = 0;
     int n_decode = 0;
+    // E3 (2026-09-17): SPECULATIVE DECOMPOSITION OF THE DECODE RATE.
+    //   decode_tok_s == 1000 * (tokens/round) / (ms/round)
+    // Only the denominator is kernel speed. The numerator is speculative ACCEPTANCE, which moves
+    // with the token stream -- so two arms that generate different text cannot be compared on
+    // decode_tok_s at all. Receipt for why this matters: prompt 13,665 on 37a74d01 read 72.73 tok/s
+    // and on b34ccefd read 81.69, with the SAME tokhash and the SAME 2,130 tokens -- 12.3% apart
+    // for an identical computation. A round counter separates the two terms: ms_per_round is what
+    // a kernel change moves, tok_per_round is what a stream change moves.
+    int  n_rounds = 0;                     // forward passes (draft+verify rounds), not committed tokens
+    long rq_drafts0 = 0, rq_hits0 = 0, rq_acc1_0 = 0, rq_acc2_0 = 0;
+    // E5 (2026-09-17): the per-phase speculative wall (draft / draft-xchg / embed / layers /
+    // head-sync / head-xchg / tail) is ALREADY accumulated in d.sp_t[] every round, but it is only
+    // printed after the decode loop joins -- which in serve mode never happens. Snapshotting it per
+    // request turns it into a free per-round ledger, and it is the only instrument that separates
+    // the replicated MTP drafter from the trunk without duplicating anything.
+    double rq_spt0[8] = {0,0,0,0,0,0,0,0};
+    // Per-request baselines for the transport receipt. The counters themselves are process-lifetime
+    // (incremented inside the two transport implementations); differencing them per request is what
+    // makes "this arm ran P2P" a measurement rather than a claim about the environment.
+    long rq_collh0 = 0, rq_collp0[5] = {0,0,0,0,0};
+    double rq_collt0[6] = {0,0,0,0,0,0};
+    // The launch table is reset at T7_decode_begin, which fires AFTER the first decode step has
+    // already run -- so exactly one round's launches are missing from the count. On a 532-round
+    // request that is 0.19%, below the +-1.1% noise floor, but the denominator is corrected anyway
+    // so launches/round is not quietly biased low.
+    int lk_skipped = 0;
 
     // WARM-UP, before the timed region. The first launch of each kernel shape on each device loads
     // its code object, which costs tens of ms per device and otherwise lands INSIDE TTFT -- measured
@@ -3693,8 +6097,10 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
     }
 
     MS("T5_threads_begin");
+    g_tp_lsrec = C.ls_rec; g_tp_ndev_dbg = ndev;      // so the barrier's timeout handler can name the card
     std::vector<std::thread> th;
     for (int g = 0; g < ndev; ++g) th.emplace_back([&, g] {
+        t_tp_card = g;                                  // this thread's card, for the barrier timeout report
         CK(hipSetDevice(D[g].id));
         tp_pin_thread(D[g].id, g, ndev);
         Dev& d = D[g];
@@ -3765,24 +6171,144 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
         int sw_lo = 0, sw_n = -1;           // -1 => the whole prompt
         int pos_cur = 0;                    // where the next request's prompt starts
         std::vector<unsigned> req_ids;      // this thread's copy of the current request
-        int req_maxn = maxn;
+        int  req_maxn = arg_pf_only ? 0 : maxn;
+        int  req_rewind = -1;                   // Q27_SERVE_REWIND target, per request
+        bool req_pf_only = arg_pf_only;     // request 0 is prefill-only iff argv said so
+        // Q27_LCP_DBG: RESIDENT-PREFIX DIVERGENCE DIAGNOSIS. The server's reuse test is
+        // all-or-nothing (exact whole-prefix match or reset to 0), so when a Harness re-render stops
+        // being an exact extension the whole conversation is re-prefilled -- measured at ~4 minutes
+        // on a 77K window. Nothing on either side records WHERE the two token streams part, so the
+        // engine keeps its own resident history and reports the longest common prefix across a
+        // reset. Card 0 only; pure logging, no behaviour change, no GPU work.
+        const bool lcp_on = q27_env_flag("Q27_LCP_DBG", true);
+        std::vector<unsigned> lcp_hist;     // tokens this engine actually holds, by position
+        std::vector<unsigned> lcp_prev;     // what it held immediately before the last reset
+        bool lcp_pending = false;           // a reset happened; compare the next window against prev
         for (int req = 0;; ++req) {
         if (req == 0 && g == 0 && g_text) { std::fprintf(g_text_out, "[user] %s\n[assistant] ", g_first_text.c_str()); std::fflush(g_text_out); }
         if (req > 0) {
-            if (g == 0) { serve_read_request(g_req); out.clear(); done = false; n_decode = 0; t_decode = 0; t_prefill = 0; }
-            C.b1.wait();                                    // request published (or EOF)
+            if (g == 0) { serve_read_request(g_req); out.clear(); done = false; n_decode = 0; t_decode = 0; t_prefill = 0;
+                           q27_ab_reread();
+                           n_rounds = 0; rq_drafts0 = d.nr_drafts; rq_hits0 = d.nr_hits;
+                           rq_acc1_0 = d.nr_acc_hist[1]; rq_acc2_0 = d.nr_acc_hist[2];
+                           for (int j = 0; j < 8; ++j) rq_spt0[j] = d.sp_t[j];
+                           rq_collh0 = g_coll_host_sites[g];
+                           for (int j = 0; j < 5; ++j) rq_collp0[j] = g_coll_p2p_sites[g][j];
+                           for (int j = 0; j < 6; ++j) rq_collt0[j] = g_collt[g][j]; }
+            C.b1.wait(true);                                // request published (or EOF) -- IDLE: card 0 is
+                                                            // blocked reading the next request; no deadline.
             const bool eof = g_req.eof;
-            req_ids = g_req.ids; req_maxn = g_req.maxn;
+            req_ids = g_req.ids; req_maxn = g_req.maxn; req_pf_only = g_req.pf_only;
+            req_rewind = g_req.rewind_pos;
             C.b2.wait();                                    // every thread holds its copy
             d.nr_have_h = 0; d.nr_ncatch = 0;                  // Q27_SPEC: the first step of a new request is plain (it seeds h_prev)
             if (eof) break;
+            // RESET: start a fresh conversation on the RESIDENT engine.
+            // The serve protocol prefills at the current absolute position, so a request that is
+            // not a prefix extension of what we hold cannot be appended. The server was handling
+            // that by killing this process and reloading 27B of weights (~70 s), or by refusing
+            // the request with a 400. A serving backend does neither: it serves every request and
+            // pays a prefill when there is no prefix to reuse. Rewinding to position 0 costs a
+            // memset of the recurrent state -- the KV cache is position-indexed and is simply
+            // overwritten by whatever gets prefilled next.
+            // REWIND (maxn == -3): truncate the resident conversation to an absolute POSITION
+            // instead of discarding it. The KV cache needs NO work -- it is position-indexed, so
+            // every row at or beyond the target is simply overwritten by the next prefill, exactly
+            // as the reset comment below says. Only the recurrent state must be restored, because
+            // S/conv are running summaries with no per-position structure; that is what the
+            // Q27_REWIND_CK banks hold. When no bank covers the target this falls back to the
+            // position-0 reset, so the behaviour is never worse than before it existed.
+            if (req_maxn == -3) {
+                CK(hipSetDevice(d.id));
+                int pick = -1, pick_pos = -1;
+                if (q27_rewind_ck() > 0 && req_rewind > 0)
+                    for (int i = 0; i < q27_rewind_ck(); ++i)
+                        if (g_ck_pos[i] >= 0 && g_ck_pos[i] <= req_rewind && g_ck_pos[i] > pick_pos)
+                            { pick = i; pick_pos = g_ck_pos[i]; }
+                // Every worker must choose from the same checkpoint table before
+                // thread 0 invalidates future banks. Otherwise a fast worker can
+                // remove a bank while another worker is still selecting it.
+                C.b1.wait(); C.b2.wait();
+                if (pick >= 0) {
+                    CK(hipMemcpyAsync(d.S, d.ck_S + (size_t)pick * (d.s_bytes_total / sizeof(float)),
+                                      d.s_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                    CK(hipMemcpyAsync(d.conv, d.ck_conv + (size_t)pick * (d.conv_bytes_total / sizeof(unsigned short)),
+                                      d.conv_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                    CK(hipStreamSynchronize(d.stream));
+                    pos_cur = pick_pos;
+                } else {
+                    CK(hipMemsetAsync(d.S, 0, d.s_bytes_total, d.stream));
+                    CK(hipMemsetAsync(d.conv, 0, d.conv_bytes_total, d.stream));
+                    CK(hipStreamSynchronize(d.stream));
+                    pos_cur = 0;
+                }
+                d.nr_have_h = 0; d.nr_ncatch = 0;
+                // Any bank at or past the new head describes a future that no longer exists.
+                if (g == 0) for (int i = 0; i < q27_rewind_ck(); ++i) if (g_ck_pos[i] > pos_cur) g_ck_pos[i] = -1;
+                if (g == 0 && lcp_on && (int)lcp_hist.size() > pos_cur) lcp_hist.resize(pos_cur);
+                C.b1.wait(); C.b2.wait();           // every card at the new head before card 0 acks
+                if (g == 0) { std::printf("Q27_SERVE_REWIND ok %d asked %d\n", pos_cur, req_rewind); std::fflush(stdout); }
+                continue;
+            }
+            if (req_maxn == -1) {
+                CK(hipSetDevice(d.id));
+                CK(hipMemsetAsync(d.S, 0, d.s_bytes_total, d.stream));
+                CK(hipMemsetAsync(d.conv, 0, d.conv_bytes_total, d.stream));
+                CK(hipStreamSynchronize(d.stream));
+                pos_cur = 0;
+                d.nr_have_h = 0; d.nr_ncatch = 0;
+                // Keep what we held: the next window is the one that failed the server's exact-prefix
+                // test, and it is the only chance to see where the two streams diverged.
+                if (g == 0 && lcp_on) { lcp_prev.swap(lcp_hist); lcp_pending = true; }
+                lcp_hist.clear();
+                if (g == 0) for (int i = 0; i < q27_rewind_ck(); ++i) g_ck_pos[i] = -1;
+                C.b1.wait(); C.b2.wait();           // every card clean before card 0 acknowledges
+                if (g == 0) { std::printf("Q27_SERVE_RESET ok\n"); std::fflush(stdout); }
+                continue;
+            }
             if (req_ids.empty() || pos_cur + (int)req_ids.size() + req_maxn > ctx) {
                 if (g == 0) { std::printf("Q27_REQ_REFUSED %d: pos=%d prompt=%d maxn=%d ctx=%d\n", req, pos_cur,
                                           (int)req_ids.size(), req_maxn, ctx); std::fflush(stdout); }
                 continue;
             }
+            // Q27_REWIND_CK: checkpoint the recurrent state as it stands BEFORE this request's
+            // prefill, tagged with the position it corresponds to, so a later divergent window can
+            // rewind HERE instead of to 0. Same D2D copy the speculation banks already use: one
+            // 64.6 MiB/card copy per request (~0.1 ms at D2D bandwidth) and nothing at all on the
+            // decode path. Every card writes the same value into the same slot -- `req` is identical
+            // on all of them -- so the ring needs no lock.
+            if (q27_rewind_ck() > 0) {
+                const int ck_slot = (req * 2) % q27_rewind_ck();
+                CK(hipSetDevice(d.id));
+                CK(hipMemcpyAsync(d.ck_S + (size_t)ck_slot * (d.s_bytes_total / sizeof(float)), d.S,
+                                  d.s_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                CK(hipMemcpyAsync(d.ck_conv + (size_t)ck_slot * (d.conv_bytes_total / sizeof(unsigned short)),
+                                  d.conv, d.conv_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                if (g == 0) g_ck_pos[ck_slot] = pos_cur;
+            }
             sw_tok = req_ids.data(); sw_lo = pos_cur; sw_n = (int)req_ids.size();
+            if (g == 0 && lcp_on) {
+                if (lcp_pending) {      // this window is the one the server could not reuse
+                    lcp_pending = false;
+                    const size_t R = lcp_prev.size(), N = req_ids.size();
+                    const size_t lim = (R < N) ? R : N;
+                    size_t l = 0; while (l < lim && lcp_prev[l] == req_ids[l]) ++l;
+                    std::printf("Q27_LCP resident=%zu incoming=%zu lcp=%zu retainable=%.2f%% "
+                                "first_mismatch=%zu resident_tok=%d incoming_tok=%d\n",
+                                R, N, l, R ? 100.0 * (double)l / (double)R : 0.0, l,
+                                (l < R) ? (int)lcp_prev[l] : -1, (l < N) ? (int)req_ids[l] : -1);
+                    const size_t a = (l > 12) ? l - 12 : 0;
+                    std::printf("Q27_LCP_RES @%zu:", a);
+                    for (size_t i = a; i < l + 12 && i < R; ++i) std::printf(" %u", lcp_prev[i]);
+                    std::printf("\nQ27_LCP_INC @%zu:", a);
+                    for (size_t i = a; i < l + 12 && i < N; ++i) std::printf(" %u", req_ids[i]);
+                    std::printf("\n"); std::fflush(stdout);
+                }
+                lcp_hist.resize((size_t)sw_lo);     // this request starts at sw_lo; drop anything past it
+                lcp_hist.insert(lcp_hist.end(), req_ids.begin(), req_ids.end());
+            }
         }
+        if (req == 0 && g == 0 && lcp_on) lcp_hist.assign(prompt.begin(), prompt.end());
         // SWEEP WINDOW. For the prompt this is [0, npre) and behaviour is bit-identical. The MTP
         // verifier reuses the SAME body for a chunk of drafted tokens at an arbitrary base position,
         // which is why the base and length are variables rather than the prompt length: the KV cache
@@ -3800,15 +6326,268 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             const int sw_end = (sw_n < 0) ? npre : sw_lo + sw_n;
             const int sb = sw_beg;               // slot index = position - window base
             const int nwin = sw_end - sw_beg;
+            // The draft writes KV for every position this window produces, plus whatever decode
+            // generates after it. Grow before the sweep touches them.
+            // THEN KEEP THE DRIVER'S WORKING ROOM. The headroom note in q27_pfslots_grow is the
+            // measured one (0.06 GiB free took a 5.9 s prefill to 32 s), and the serve path can walk
+            // the cards into that state without ever growing the slot arena: the KV, the draft KV
+            // and the recurrent state all keep growing with the conversation while fast-layer
+            // residency stays put. Measured 2026-09-15 in a growing session: 8,960-position appends
+            // went 7.8 s -> 110 s -> 189 s with the cards at ~0.2 GiB free and four MORE fast layers
+            // resident than a comparable run that was fast at the same positions with ~1.5 GiB free.
+            // Residency is only worth keeping while the driver has room to work, so each card sheds
+            // its OWN mirrors (owner card only, no coordination) until the margin is back.
+            q27_keep_headroom(m, ndev, d);
+            // K=0 never reads the draft KV (the draft loop does not execute), so growing it is pure
+            // cost: 2,560 B/position of allocation and a copy of the live prefix for a buffer no
+            // consumer touches. The shipped path keeps the grow unchanged.
+            if (g_spec && g_spec_k > 0 && (!g_sr || g == g_sr_head)) {   // Q27_LS_SR: only the head card holds a draft KV
+                // THE GROWTH HORIZON IS THIS REQUEST'S BUDGET, NOT THE ENGINE'S ARGV. `gen_budget`
+                // is computed ONCE at boot (q27_main.cpp:4008) from the argv maxn, and the serve
+                // path boots the engine with maxn == -2 (prefill-only) -- so arg_pf_only is true and
+                // gen_budget is PERMANENTLY 0. The draft KV was therefore sized to sw_end with only
+                // q27_mtp_kv_reserve's 1024-position slack as generation headroom, whatever the
+                // request actually asked to generate. Decode then walks out of the cap,
+                // q27_mtp_within_cap() fails, eff_k drops to 0 (q27_main.cpp:8127) and the round
+                // degrades to a 1-row trunk with no draft -- the documented safe fallback, firing
+                // for the wrong reason. Measured 2026-09-17 on REAL agentic traffic:
+                //   REQ 10  gen 1003 tok (the 1024 slack)  acc_p1 0.050  nr_eff 1  decode 36.87
+                //   REQ 21  17 positions of slack left     acc_p1 0.018  nr_eff 1  decode 30.78
+                // against acc_p1 ~0.85-0.95 and 56-80 tok/s on every neighbouring request, i.e. a
+                // 45-55% decode loss whenever a generation outran the slack. req_maxn is this
+                // request's real budget (set per request by the serve loop); 8192 positions of draft
+                // KV is 21 MB, and the affordability rule below still governs whether it is taken.
+                const int gen_horizon = req_pf_only ? 0 : (req_maxn > 0 ? req_maxn : gen_budget);
+                const int mtp_need = (sw_end + gen_horizon < ctx) ? (sw_end + gen_horizon) : ctx;
+                // AFFORDABILITY FIRST. q27_mtp_kv_reserve frees the old draft buffers and allocates
+                // the new size; when the card cannot pay, hipMalloc does not return an error -- it
+                // stalls inside the driver, leaving this card's thread spinning and its three peers
+                // parked on the idle barrier (measured 2026-09-15: a 234,223-token window against a
+                // 15,616-position arena hung the 249,583-token probe exactly there, one card in R
+                // and three in S, temperatures at idle). Ask the arithmetic question first: 2,560 B
+                // per draft position (kc/vc/ks/vs, confirmed by the engine's own grow lines: 40 MiB
+                // at 16,384, 320 MiB at 131,072, 640 MiB at 262,144) against free memory minus the
+                // margin this file already keeps. Not affording it is fine: the cap stays where it
+                // is, q27_mtp_within_cap keeps speculation off beyond it, and every drafted token
+                // would have been verified anyway.
+                // THE PEAK IS THE WHOLE NEW BUFFER, NOT THE DIFFERENCE. q27_mtp_kv_reserve
+                // allocates the new kc/vc/ks/vs before it frees the old ones, and rounds the
+                // capacity UP TO A POWER OF TWO. Asking for (need - cap) is how the first version
+                // of this check still let the 249,583-token probe stall: 558 MB of "delta" against a
+                // reserve that must find 640 MB at once.
+                int mtp_cap_t = d.mtp_cap;
+                const int mtp_step = 1024;               // keep in lockstep with q27_mtp_kv_reserve
+                if (mtp_cap_t < mtp_need) {
+                    long long want = (long long)mtp_need + mtp_step;
+                    if (want > ctx) want = ctx;
+                    mtp_cap_t = (int)((want + 255LL) & ~255LL);
+                    if (mtp_cap_t < mtp_need) mtp_cap_t = ctx;
+                }
+                const size_t mtp_need_bytes = (size_t)mtp_cap_t * Q27_MTP_BPP;
+                // THE OLD CACHE IS PART OF THE BUDGET. q27_mtp_kv_reserve releases the current
+                // draft buffers before it takes the new ones (host-staged when the direct path
+                // cannot fit), so what has to fit is the NEW buffer against free + the old one.
+                // Pricing the new buffer against free alone is what refused the 138 k growth while
+                // 335 MB of old cache sat there reclaimable.
+                const size_t mtp_reclaim = (size_t)d.mtp_cap * Q27_MTP_BPP;
+                // THE DRAFT KV GETS ITS OWN, SMALLER MARGIN THAN THE ARENA. The arena costs 30,720 B
+                // per position and is worth protecting hard; the draft KV costs 2,560 B per position,
+                // so its next bucket is +40-80 MB -- and paying for it is what keeps speculation ON,
+                // which is worth roughly 2x decode (96 tok/s speculation vs 47 native, both measured
+                // on this host). Sharing the arena's 512 MB margin made every grow above 16,384
+                // positions fail at the operating point: measured 2026-09-15 22:02, "draft needs
+                // 17854 positions (+80 MB) but 0.56 GiB free -- keeping 16384, speculation stays off
+                // beyond it". 256 MB is still far above the 0.06 GiB cliff this guard exists for.
+                // ... AND IT IS TIGHTER THAN THE ARENA'S, BECAUSE IT BUYS 2x DECODE FOR 2,560 B/POSITION.
+                // Measured 2026-09-15 22:37:06: the draft KV needed one more bucket (131,072 positions,
+                // +320 MB) with 0.56 GiB free, and a 256 MB margin refused it by THREE MEGABYTES --
+                // speculation went off and decode fell 64 -> 28.7 tok/s for the rest of the conversation.
+                // 192 MB still sits well above the driver cliff (0.06 GiB measured) and is spent only on
+                // the draft cache, never on the arena, which keeps its hard 512 MB.
+                const size_t mtp_margin =
+                    (size_t)q27_env_int("Q27_SERVE_DRAFT_MARGIN_MB", 192) * 1048576ull;
+                size_t mtp_free = 0, mtp_total = 0;
+                hipMemGetInfo(&mtp_free, &mtp_total);
+                const bool mtp_afford = mtp_cap_t >= mtp_need &&
+                    mtp_need_bytes <= ((mtp_free + mtp_reclaim) > mtp_margin
+                                       ? (mtp_free + mtp_reclaim) - mtp_margin : 0);
+                if (!mtp_afford) {
+                    // FREE BEFORE ALLOCATE, PRICE THE PEAK. The gate above is right to refuse an
+                    // allocation it has not proven affordable. What it did NOT do was consult the
+                    // one wallet this card actually holds: its own fast-layer residency. The
+                    // eviction path in the next branch was reachable only when the allocation was
+                    // ALREADY affordable -- i.e. exactly when shedding was not needed -- so the
+                    // draft cache stopped growing the moment free memory fell below the whole new
+                    // buffer. Measured 2026-09-16 at 138 k positions: the draft needed the next
+                    // bucket with 0.41-0.47 GiB free, 13-16 int8 MLP layers worth ~120 MB each sat
+                    // unspent, speculation stayed off for the rest of the conversation, and decode
+                    // sat at 21 tok/s in a conversation that had decoded at 55 earlier.
+                    //
+                    // So: shed this card's own fast layers FIRST (each hipFree raises free), re-test
+                    // affordability against the same peak rule after every shed, and allocate only
+                    // once it is genuinely affordable. A card that never becomes affordable still
+                    // prints a refusal and keeps its old capacity -- a refusal must remain a message,
+                    // never a kill.
+                    for (int attempt = 0; attempt < Q27_LAYERS; ++attempt) {
+                        hipMemGetInfo(&mtp_free, &mtp_total);
+                        if (mtp_cap_t >= mtp_need &&
+                            mtp_need_bytes <= ((mtp_free + mtp_reclaim) > mtp_margin
+                                               ? (mtp_free + mtp_reclaim) - mtp_margin : 0)) break;
+                        if (!q27_evict_one_mlp_own_card(m, ndev, d.id)) break;
+                    }
+                    hipMemGetInfo(&mtp_free, &mtp_total);
+                    const bool mtp_afford_now = mtp_cap_t >= mtp_need &&
+                        mtp_need_bytes <= ((mtp_free + mtp_reclaim) > mtp_margin
+                                           ? (mtp_free + mtp_reclaim) - mtp_margin : 0);
+                    if (mtp_afford_now && q27_mtp_kv_reserve(d, mtp_need, ctx)) {
+                        std::fprintf(stderr, "Q27_MTP_FUND card %d: draft KV %d -> %d positions "
+                                             "(shed fast layers to afford the whole buffer; %.2f GiB free)\n",
+                                     d.id, d.mtp_cap, mtp_cap_t, (double)mtp_free / 1073741824.0);
+                    } else {
+                        std::fprintf(stderr, "Q27_MTP_SKIP card %d: draft needs %d positions (+%zu MB) but "
+                                             "%.2f GiB free even after shedding -- keeping %d, "
+                                             "speculation stays off beyond it\n",
+                                     d.id, mtp_need, mtp_need_bytes >> 20,
+                                     (double)mtp_free / 1073741824.0, d.mtp_cap);
+                    }
+                    std::fflush(stderr);
+                } else if (!q27_mtp_kv_reserve(d, mtp_need, ctx)) {
+                    // FUND IT from fast-layer residency, exactly like slot growth: the draft KV is
+                    // per-card memory, so each card may shed its own int8 MLP mirrors (freeing
+                    // ~120 MB each) without any cross-card coordination -- no symmetry requirement,
+                    // unlike the collective paths. Measured failure this repairs: card 0 grew its
+                    // draft cache to 131,072 positions while the tight card refused and kept
+                    // 65,536, and the verify sweep then wrote past the end of the tight card's
+                    // draft cache -> GPU page fault (node-4).
+                    for (int attempt = 0; attempt < Q27_LAYERS; ++attempt) {
+                        if (!q27_evict_one_mlp_own_card(m, ndev, d.id)) break;
+                        if (q27_mtp_kv_reserve(d, mtp_need, ctx)) break;
+                    }
+                    if (!q27_mtp_kv_reserve(d, mtp_need, ctx))
+                        std::fprintf(stderr, "Q27_MTP_PAGED card %d: grow to %d refused; keeping %d "
+                                             "(no more fast layers to shed)\n",
+                                     d.id,  sw_end + gen_horizon, d.mtp_cap);
+                }
+            }
             if (nwin > g_pf_cap) {
-                // FAIL CLOSED: the per-position slots are sized g_pf_cap at allocation (from the
-                // prompt length), so this can only fire if allocation and the prompt disagree.
+                // GROW, DON'T REFUSE. Every card reaches this with the same nwin, so card 0 is the
+                // leader: it resizes the slot buffers on ALL devices (a host thread may allocate on
+                // any device) and publishes the result; the others wait and then continue. Refusing
+                // here used to cost the whole conversation -- server kills the engine, a replacement
+                // cold-starts and re-prefills the entire history.
+                // THE GROW IS COLLECTIVE, SO IT MUST BE BRACKETED BY BARRIERS -- NOT POLLED.
+                // Every card reaches here with the same nwin, but only card 0 grows; the others used
+                // to POLL `g_pf_grow_ok < 0` with a bounded spin, which has TWO independent doors out
+                // of the round and both were open on every session:
+                //   Door A -- the waiter arrives BEFORE the leader announces. g_pf_grow_ok still holds
+                //     its previous value (0 at boot, 1 after any earlier grow), `1 < 0` is false, and
+                //     the waiter falls straight through. Card 0 is systematically LAST to arrive here
+                //     (it has just run q27_keep_headroom and the whole MTP eviction block above), so
+                //     this is the common case, not the rare one.
+                //   Door B -- the bounded 2,000,001-yield spin (~1.2 s on this box) expires while the
+                //     grow is still running (~2 s measured).
+                // Either way the escaping card re-reads the STALE g_pf_cap below, prints
+                // Q27_SWEEP_TOO_LONG, and `continue`s past the sweep -- skipping barrier pairs its
+                // peers do execute. Because the inter-request idle rendezvous reuses the same C.b1/C.b2
+                // objects, TpBar counts the desynced card's next arrival as a valid one and launders
+                // the divergence, so the failure surfaces 60 s later at an unrelated barrier with the
+                // other threads parked in the two waits that have no deadline (the bare ring spin at
+                // `while (C.ls_rec[src].load(acquire) < pos) { }` and the idle barrier). That is the
+                // "FATAL TpBar ... arrived 1/2/3" on the first big turn of a session.
+                // MEASURED 2026-09-16, and it is NOT a V4 defect: the identical signature fired at
+                // 20:13:42-20:14:45 on the V4=0 binary (its boot prints the int8 arm's
+                // "kc/vc=1.750 GiB each"), with Q27_SWEEP_TOO_LONG logged at 20:13:42 and the leader's
+                // Q27_SERVE_GROW only at 20:13:44 -- a card refusing two seconds before the grow it was
+                // supposed to be waiting for. A prior handoff recorded this same event as a
+                // VRAM-settling false negative caused by start sequencing; it is neither.
+                // b1 = nobody starts the round early. b2 = g_pf_cap is published before anyone re-reads
+                // it, so all four cards take the SAME branch below. A barrier also has a deadline, so a
+                // genuinely lost leader aborts loudly here instead of desyncing silently.
+                C.b1.wait();
+                if (g == 0) {
+                    const int seq = g_pf_grow_seq.load() + 1;
+                    g_pf_grow_ok.store(-1, std::memory_order_seq_cst);        // round in progress
+                    g_pf_grow_seq.store(seq, std::memory_order_seq_cst);      // announce
+                    const int got = q27_pfslots_grow(m, D, ndev, nwin);
+                    g_pf_grow_ok.store(got > 0 ? 1 : 0, std::memory_order_seq_cst);  // outcome
+                }
+                C.b2.wait();
+            }
+            // BELT AND BRACES: every card re-asserts its own device after a grow decision the leader
+            // may have made on its behalf (see the guard inside q27_pfslots_grow).
+            CK(hipSetDevice(d.id));
+            if (nwin > g_pf_cap) {
                 std::fprintf(stderr, "Q27_SWEEP_TOO_LONG window=%d > slots=%d -- refusing\n",
                              nwin, g_pf_cap);
+                // SAY IT ON THE SERVE WIRE TOO. The prefill slots are sized once, at cold start,
+                // from the first prompt; a later window can exceed them (a reset re-prefills the
+                // whole conversation). This used to be a stderr line only, so the server saw a
+                // normal end-of-generation with zero tokens and reported a successful empty turn
+                // -- the client just sat there. A refusal has to be visible as a refusal.
+                if (g == 0) {
+                    std::printf("Q27_REQ_REFUSED sweep: window=%d slots=%d\n", nwin, g_pf_cap);
+                    std::fflush(stdout);
+                }
                 fails.fetch_add(1);
-                return;
+                // AND IT MUST NOT KILL THE ENGINE. This was `return`: it ended this card's thread,
+                // so an un-growable window destroyed the resident conversation (all four cards
+                // return, the threads join, the process exits). The serve path is built to answer
+                // such a request by appending the window in arena-sized chunks through the slots we
+                // already have, and it can only do that if the engine survives to serve them.
+                // Nothing has been swept at this point and pos_cur is untouched, so the refusal is
+                // exactly as recoverable as the ctx refusal above.
+                continue;
             }
             g_pf_sweep = true;
+            if (g_tpsr && !d.tpsr_primed && q27_env_flag("Q27_Q8_PRIME", true)) {
+                // ---- Q27_TPSR PRIME (once per card, outside the timed sweep): tune the two rocBLAS shapes of the
+                // sharded MLP -- gate/up [INTER/ndev][HID] and down [HID][INTER/ndev] -- at the chunk width. An
+                // untuned shape runs rocblas_gemm_algo_standard, measured 9-15 vs 16-20 TMAC/s (src/q27_rb.cpp). ----
+                const q27_layer_t* l0 = q27_layer_tp(m, 0, d.id);
+                const int Mp = (g_pf_chw > 0 && g_pf_chw <= Q27_PF_CH) ? g_pf_chw : Q27_PF_CH;
+                const Q8Scr& S0 = d.q8s[0];
+                if (l0 && tpsr_mlp_view(d, l0, d.stream)) {
+                    // Q27_MLP_WSHARE: xq2 is the DOWN input, whose width is this card's MLP slice --
+                    // NOT HID. It is > HID whenever a card owns more than 5 k-blocks, and reading
+                    // Mp*mlp_len bytes out of an Mp*HID host buffer is a host overread that the DMA
+                    // engine reports as "Memory access fault by GPU node-N ... Page not present"
+                    // ~52 s into the boot (measured 19:13:32, card 0 with an 8192-row slice).
+                    const int mlw = mlp_len(d.id);
+                    const size_t nrand = (size_t)Mp * (Q27_HID > mlw ? Q27_HID : mlw);
+                    std::vector<signed char> rnd(nrand); unsigned st = 0x9E3779B9u ^ (unsigned)g;
+                    for (size_t i = 0; i < rnd.size(); ++i) { st = st * 1664525u + 1013904223u; rnd[i] = (signed char)((int)(st >> 24) - 128); }
+                    CK(hipMemcpy(S0.xqt, rnd.data(), (size_t)Mp * Q27_HID, hipMemcpyHostToDevice));
+                    CK(hipMemcpy(S0.xq2, rnd.data(), (size_t)Mp * mlw, hipMemcpyHostToDevice));
+                    (void)q27_rb_tune_i8g(d.id, d.tpsr_g8r.w, d.tpsr_g8r.rows, d.tpsr_g8r.K, S0.xqt, Mp, S0.acc, d.stream);
+                    (void)q27_rb_tune_i8g(d.id, d.tpsr_d8r.w, d.tpsr_d8r.rows, d.tpsr_d8r.K, S0.xq2, Mp, S0.acc, d.stream);
+                    CK(hipStreamSynchronize(d.stream));
+                    if (g == 0) std::printf("Q27_TPSR: rocBLAS shapes tuned at M=%d (gate/up %dx%d, down %dx%d)\n", Mp,
+                                            d.tpsr_g8r.rows, d.tpsr_g8r.K, d.tpsr_d8r.rows, d.tpsr_d8r.K);
+                    if (g_tpsr_proj_rb) {
+                        // ---- Q27_TPSR_PROJ_RB: tune the three projection shapes too, or they run algo_standard
+                        // (9-15 vs 16-20 TMAC/s). Layer 0 is GDN (in_qkv|in_z + out_proj); layer 3 is the first
+                        // full-attention layer (q|k|v + o_proj). o_proj and out_proj share the [5120][1536] key.
+                        const q27_layer_t* l3 = q27_layer_tp(m, 3, d.id);
+                        if (l0 && tpsr_proj_view(d, l0, 0, d.stream)) {
+                            const int niq = d.tpsr_iqkv8r.rows + d.tpsr_iz8r.rows;
+                            (void)q27_rb_tune_i8g(d.id, d.tpsr_iqkv8r.w, niq, Q27_HID, S0.xqt, Mp, S0.acc, d.stream);
+                            (void)q27_rb_tune_i8g(d.id, d.tpsr_op8r.w, d.tpsr_op8r.rows, d.tpsr_op8r.K, S0.mixq_t, Mp, S0.acc, d.stream);
+                        }
+                        if (l3 && tpsr_proj_view(d, l3, 1, d.stream)) {
+                            const int nqkv = d.tpsr_q8r.rows + d.tpsr_k8r.rows + d.tpsr_v8r.rows;
+                            (void)q27_rb_tune_i8g(d.id, d.tpsr_q8r.w, nqkv, Q27_HID, S0.xqt, Mp, S0.acc, d.stream);
+                            (void)q27_rb_tune_i8g(d.id, d.tpsr_o8r.w, d.tpsr_o8r.rows, d.tpsr_o8r.K, S0.mixq_t, Mp, S0.acc, d.stream);
+                        }
+                        CK(hipStreamSynchronize(d.stream));
+                        if (g == 0) std::printf("Q27_TPSR_PROJ_RB: projection shapes tuned at M=%d (q|k|v %dx%d, iqkv|iz %dx%d, o/out %dx%d)\n", Mp,
+                                                (Q27_QROWS + 2 * Q27_KVROWS) / ndev, Q27_HID,
+                                                (Q27_GDN_QKV + Q27_GDN_Z) / ndev, Q27_HID,
+                                                Q27_HID, Q27_OROWS / ndev);
+                    }
+                } else { std::fprintf(stderr, "Q27_TPSR: prime skipped on card %d (no layer-0 FP8 shard view)\n", g); }
+                d.tpsr_primed = 1;
+                C.b1.wait(); C.b2.wait();
+            }
             if (g_ls && g_ls_q8 && q27_env_flag("Q27_Q8_PRIME", true)) {
                 // ---- PRIME (outside the timed prefill): run every owned layer's rocBLAS GEMMs once on dummy input.
                 // First-touch of the ~6.7 GB of int8 weights per card + rocBLAS first-call setup made the first
@@ -3831,8 +6610,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     else (void)q27_rb_gemm_i8g(d.id, w->w, w->rows, w->K, x, Mp, S0.acc, w->gs, sp);
                 };
                 for (int L = 0; L < nlayer; ++L) {
-                    { const int bp = L / blkp, rp = bp / ndev; if (((bp + (q27_env_int("Q27_LS_BAL", 0) ? (rp & 1) : 0)) % ndev) != g) continue; }   // (BAL default 0)
-                    const q27_layer_t* lay = q27_layer_ls(m, L, d.id);
+                    { if (q27_ls_block_owner(L / blkp, ndev) != g) continue; }   // 2026-09-18: the oracle (was a sixth inline copy of the modulo)
+                    const q27_layer_t* lay = g_sr ? sr_layer_view(d, m, L, sp) : q27_layer_ls(m, L, d.id);   // Q27_LS_SR: tune on the transient mirrors the sweep will read
                     if (!lay) continue;
                     if (lay->is_full) { const q27_i8r_t* w3[3] = { &lay->q8r, &lay->k8r, &lay->v8r }; const int n3 = q27_cat_rows(w3, 3);
                         if (n3 > 0 && lay->q8r.gs == lay->q8r.K) (void)q27_rb_tune_i8g(d.id, lay->q8r.w, n3, lay->q8r.K, S0.xqt, Mp, S0.acc, sp); else { prime1(&lay->q8r, S0.xqt); prime1(&lay->k8r, S0.xqt); prime1(&lay->v8r, S0.xqt); }
@@ -3847,11 +6626,14 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             }
             if (g_ls && g_ls_q8) { C.b1.wait(); C.b2.wait(); }   // every card primed/tuned before anyone starts the timed sweep
             if (g == 0) MS("T5c_all_primed");
-            if (g_spec && g_mtp_pp && g_ls && g_ls_q8 && g_mtp_hall) {   // Q27_MTP_PP: mirrors + solutions before the clock starts
-                if (!mtp_prompt_init(d, g, Q27_PF_TSLOT)) { std::fprintf(stderr, "Q27_MTP_PP init failed on card %d\n", g); std::exit(1); }
+            if (g_spec && g_mtp_pp && ((g_ls && g_ls_q8) || g_tpsr) && g_mtp_hall) {   // Q27_MTP_PP: mirrors + solutions before the clock starts (Q27_TPSR: every card, on the batched sweep)
+                if ((!g_sr || g == g_sr_head) && !mtp_prompt_init(d, g, Q27_PF_TSLOT)) { std::fprintf(stderr, "Q27_MTP_PP init failed on card %d\n", g); std::exit(1); }
                 C.b1.wait(); C.b2.wait();
             }
             const double t_sw0 = tp_now();
+            if (g == 0) q27_transfer_receipt(req,true);
+            C.b1.wait(); C.b2.wait();
+            if (g == 0) std::fprintf(stderr, "Q27_PHASE req=%d phase=prefill edge=begin monotonic_ms=%.6f\n", req, t_sw0);
             if (g == 0) MS("T6_sweep_begin");
             const bool pf_batch = q27_env_flag("Q27_PF_BATCH", true) && nwin > 1 && g_rn_epi;
             const bool swpl = q27_env_flag("Q27_SWEEP_LADDER", false) && (orc != nullptr);
@@ -3862,7 +6644,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 static const bool noinv_pre = q27_env_flag("Q27_Q8_NOINV", true);
                 const size_t nsw = (size_t)(sw_end - sw_beg), nel = nsw * (size_t)Q27_HID;
                 static const bool q8_old_res = (q27_env_int("Q27_Q8_OLD", 0) & 4) != 0;
-                const bool need_bf16 = !(g_ls && g_ls_q8 && !q8_old_res) || g == 0;   // the Q8 ring path reads the bf16 rows only on card 0 (fp32 expand)
+                const int first_owner = q27_ls_block_owner(0, ndev);
+                const bool need_bf16 = !(g_ls && g_ls_q8 && !q8_old_res) || g == first_owner;
                 unsigned short* pin = d.emb_pin; static thread_local unsigned short* lazy = nullptr; static thread_local size_t lazy_cap = 0;
                 if (!pin || d.emb_pin_cap < nel) { if (lazy_cap < nel) { if (lazy) CK(hipHostFree(lazy)); CK(hipHostMalloc((void**)&lazy, nel * 2, hipHostMallocDefault)); lazy_cap = nel; } pin = lazy; }
                 if (need_bf16) {
@@ -3873,7 +6656,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 }
                 CK(hipMemcpyAsync(d.hidden_slots + (size_t)(sw_beg - sb) * Q27_HID, pin, nel * 2, hipMemcpyHostToDevice, d.stream));
                 }
-                if (g_ls && g_ls_q8 && g == 0) {
+                if (g_ls && g_ls_q8 && g == first_owner) {
                     if (!q27_bf16_to_f32(d.hidden_slots + (size_t)(sw_beg - sb) * Q27_HID, d.pend_slots + (size_t)(sw_beg - sb) * Q27_HID, nel, d.stream)) { std::fprintf(stderr, "embedding expand declined\n"); std::exit(1); }
                     if (!noinv_pre) {   // the device-side input norm does not read inv_slots
                         CK(hipStreamSynchronize(d.stream));
@@ -3898,10 +6681,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 // exactly one chunk's handoff. The consumer runs one chunk behind the producer
                 // (the pipeline fill), hence nch+1 barrier rounds.
                 const int LPP = nlayer / ndev;
-                int q8blk = q27_env_int("Q27_LS_BLK", 2); if (q8blk < 1 || q8blk > LPP || (LPP % q8blk)) q8blk = LPP;   // rotating layer blocks (see q27_upload_ls); 2-layer blocks with 256-wide chunks: 612 ms
+                int q8blk = q27_ls_blk_eff(ndev);   // Q27_TP3: the same quota-aware oracle as the loader (4 at 20,20,24); rotating layer blocks (see q27_upload_ls)
                 const int L0 = g * q8blk, L1 = (q8blk < LPP) ? L0 + q8blk : L0 + LPP;   // contiguous only when q8blk == LPP (the block loop below owns the general case)
-                static const int q8bal = q27_env_int("Q27_LS_BAL", 0);   // balanced ownership: off (stage collisions, 638 ms); the ring needs owner(b) = (b + const) % ndev
-                auto blk_owner = [&](int b) { const int r = b / ndev; return (b + (q8bal ? (r & 1) : 0)) % ndev; };
+                static const int q8bal = q27_env_int("Q27_LS_BAL", 0); (void)q8bal;   // applied inside q27_ls_block_owner
+                // 2026-09-18: THE ORACLE, not a fifth copy of the modulo. This is the ring the
+                // comment above is about, so it is the site that most needs to agree with the
+                // residency planner -- if it does not, a card fetches a layer it does not hold.
+                // Q27_LS_OWN's quota-skipping deal still advances one card per block, so the
+                // conflict-free constant-shift property the ring depends on is preserved.
+                auto blk_owner = [&](int b) { return q27_ls_block_owner(b, ndev); };
                 auto lay_owner = [&](int L) { return blk_owner(L / q8blk); };
                 const int last_card = blk_owner((nlayer - 1) / q8blk);                  // the card holding the last layer (finals)
                 // Q27_LS_CHW: runtime chunk width (<= the 256-position buffer sizing). Smaller
@@ -3948,7 +6736,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     CK(hipMemset(d.zbuf_slots, 0x3c, (size_t)Q27_PF_CH * Q27_GDN_Z * 2));
                     CK(hipMemset(d.ab_tile, 0x3c, (size_t)Q27_PF_SLOTS * Q27_GDN_VH * 2));
                     CK(hipMemset(d.bb_tile, 0x3c, (size_t)Q27_PF_SLOTS * Q27_GDN_VH * 2));
-                    CK(hipMemset(d.S, 0, (size_t)48 * d.tp_s * 4));
+                    CK(hipMemset(d.S, 0, d.s_off[47] + d.s_bytes[47] / 4 * 4));   // the actual S allocation, which is no longer 48 * tp_s
                     CK(hipMemset(d.norm_slots, 0x3c, (size_t)Q27_PF_SLOTS * Q27_HID * 2));
                     q27_bf16_gemv2_tile(lay0->in_a, lay0->in_b, d.norm_slots, Q27_HID, d.ab_tile, d.bb_tile,
                                         Q27_GDN_VH, Q27_HID, Cprobe, d.stream);
@@ -4011,10 +6799,34 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 static const bool q8rb = q27_env_flag("Q27_Q8_RB", true);       // register-blocked int8 projections (default; measured -98 ms/card of GPU time at 1K)
                 static const bool q8rbd = q27_env_flag("Q27_Q8_RB_DOWN", false); // register-blocked down: measured SLOWER than the row-major KI16 form (+78 ms/card), off
                 static const bool q8g64 = q27_env_flag("Q27_Q8_G64", true);     // int8 per-64-group MLP with int32 accumulation inside the group (default)
+                // Q27_LS_MLP_NV: run the MLP on the card's NVFP4 MLP weights instead of per-64 int8
+                // mirrors. The mirrors cost 4.27 GB/card (16 owned layers x gate/up/down at FULL width);
+                // the nvfp4 originals they replace cost 2.14 GB/card, so the layer-split residency drops
+                // ~2.1 GB/card -- which is what lets the layer-split KV fit at ctx=262144. Only the MLP is
+                // decoupled: the projections keep their int8 mirrors (0.42 GB) because the wide int8
+                // GEMMs are what makes the layer-split sweep fast. The MLP runs the nvfp4 kernels the TP
+                // prefill already uses (q27_wide_gu / q27_wide_down).
+                static const bool q8mlp = q8g64 && !q27_env_flag("Q27_LS_MLP_NV", false);
+                // Q27_LS_MLP_STAGE: expand ONLY the current layer's MLP into the reusable arena,
+                // then run the same int8 consumers the frozen fast path used. Neither extreme:
+                // not 4.23 GiB of permanent mirrors, and not decoding NVFP4 inside every tile.
+                static const int  mstage_mode = q27_env_int("Q27_LS_MLP_STAGE", 0);
+                static const bool mlpstage = mstage_mode != 0;
+                // Q27_LS_MLP_RB: run THIS layer's MLP through the rocBLAS/Tensile int8 GEMMs, with
+                // the weights in the layer-local arena requantized in place to per-ROW scales. Same
+                // consumer and same representation as the persistent-mirror bl_mlp path, which is
+                // the only thing the 1263-class engine ever needed that the 262144 budget could not
+                // hold: 4.23 GiB/card of mirrors. The arena is 1.07 GiB and holds four layers, which
+                // is exactly the ring's reuse distance, so each layer is expanded once per prefill.
+                static const bool mlp_rb = q27_env_int("Q27_LS_MLP_RB", 0) != 0;
                 static const bool q8r8 = q27_env_flag("Q27_Q8_R8", false);       // 8x4 register tile: measured 2214 vs 1498 ms (register pressure); off
                 static const bool q8bl = q27_env_flag("Q27_Q8_RB", true);        // stage 3: rocBLAS int8 GEMMs (1024-group scales both operands, int32 slabs) + fused epilogues
                 static const int q8blm = q27_env_int("Q27_Q8_RBM", 7);            // which GEMM families take the rocBLAS path: 1 attention q/k/v/o, 2 GDN in/out, 4 MLP
-                const bool bl_att = q8bl && (q8blm & 1), bl_gdn = q8bl && (q8blm & 2), bl_mlp = q8bl && (q8blm & 4);
+                // bl_mlp (the rocBLAS-blocked MLP) reads the PER-ROW int8 MLP mirrors, which only exist on
+                // the full-int8-mirror configuration. With Q27_LS_MLP_NV the MLP runs on the nvfp4 originals,
+                // so the blocked path must be off with it -- otherwise the sweep declines its first gemm and
+                // aborts ("rb gate gemm declined (L0 Cch=8)").
+                const bool bl_att = q8bl && (q8blm & 1), bl_gdn = q8bl && (q8blm & 2), bl_mlp = q8mlp && q8bl && (q8blm & 4);
                 static const bool q8noinv = q27_env_flag("Q27_Q8_NOINV", true);   // input norm computes its sum of squares on the device: no host inv handoff, no second norm launch
                 static const bool q8redb1 = q27_env_flag("Q27_Q8_REDB1", false);  // keep the red_b1 copy+sumsq kernel (control); default: the down epilogue writes pend directly
                 static const int q8gs = q27_env_int("Q27_Q8_GS", 0);              // K-group size of the rocBLAS path: 0 = full K (per-row / per-token scales, one call per GEMM: 1002 ms) or 1024 (1255 ms, same coherence)
@@ -4076,7 +6888,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 auto ls_q8_layer = [&](int L, int p0, int Cch, const Q8Scr& S, hipStream_t sk, int par, hipEvent_t evA, int stage) {   // stage: 0 = A (norm..o/out_proj), 1 = B (post-norm..red_b1), 2 = both
                     const int fsl = L >> 2;
                     const int gsl = L - fsl;
-                    const q27_layer_t* lay = q27_layer_ls(m, L, d.id);
+                    const q27_layer_t* lay = g_sr ? sr_layer_view(d, m, L, sk) : q27_layer_ls(m, L, d.id);   // Q27_LS_SR: this layer's transient mirrors, materialised on the compute stream
                     const q27_layer_t* nxt = (L + 1 < L1) ? q27_layer_ls(m, L + 1, d.id) : nullptr;
                     const int isf = Q27_IS_FULL(L);
                     const float in_scl = isf ? lay->q_proj.in_scale : lay->in_qkv.in_scale;
@@ -4093,8 +6905,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             (const void*)lay->gate8.w, (const void*)lay->down8.w, (const void*)lay->q_proj.w);
                     };
                     const bool old_attn = (q8old & 1), old_gdn = (q8old & 2), old_res = (q8old & 4), old_l0 = (q8old & 16), old_mlp = (q8old & 32);
-                    auto die = [&](const char* what) { std::fprintf(stderr, "Q27_LS_Q8: %s declined (L%d Cch=%d); aborting\n", what, L, Cch); std::exit(1); };
-                    auto tr = [&](int L2, int ph) { if (q8trace) { CK(hipStreamSynchronize(sk)); std::fprintf(stderr, "Q8T g=%d L=%d ph=%d ok\n", g, L2, ph); } };
+                    // OWNERSHIP IS PART OF THE DIAGNOSIS. "declined" on a layer this card does
+                    // not own is not a kernel fault, it is the sweep enumerating layers by the
+                    // SYMMETRIC range [g*q8blk, ...) while residency was dealt by the oracle.
+                    auto die = [&](const char* what) {
+                        std::fprintf(stderr, "Q27_LS_Q8: %s declined (L%d Cch=%d) card=%d owner=%d owned=%d; aborting\n",
+                                     what, L, Cch, g, q27_ls_block_owner(L / q8blk, ndev),
+                                     q27_ls_owned(L, g, ndev));
+                        std::exit(1); };
+                    auto tr = [&](int L2, int ph) { if (pf_profile_on()) g_pfp[g].mark(sk, L2, ph); if (q8trace) { CK(hipStreamSynchronize(sk)); std::fprintf(stderr, "Q8T g=%d L=%d ph=%d ok\n", g, L2, ph); } };
                     // stage codes: 0/2 = A (whole), 1 = MLP, 10 = A1 (norm + projections), 11 = B (attention / conv + scan), 12 = A2 (o/out_proj + MLP)
                     const bool doA1 = (stage == 0 || stage == 2 || stage == 10), doB = (stage == 0 || stage == 2 || stage == 11);
                     const bool doA2 = (stage == 0 || stage == 2 || stage == 12), doMLP = (stage == 1 || stage == 2 || stage == 12);
@@ -4139,7 +6958,18 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                 (const void*)lay->q_proj.w, (const void*)lay->o_proj.w, (const void*)lay->q_norm, (const void*)lay->k_norm,
                                 (const void*)S.qkva8, (const void*)S.qkvas, (const void*)S.qh);
                         }
-                        const int OLb = Q27_OROWS;
+                        // OLb IS A STRIDE, NOT A WIDTH. It is passed as `ostride` to the attention
+                        // chunk, which writes the mixer output at `Q_t + c * ostride` (q8 branch) and
+                        // at `out_t + c * ostride` (legacy branch). Both of those buffers are sized
+                        // `Q27_GDN_Z / pf_div` wide, and pf_div is 1 under layer-split but **ndev**
+                        // without it (q27_main.cpp:1571) -- so with Q27_LAYER_SPLIT=0 the full-width
+                        // 6144 strides a 1536-wide allocation and walks off the end of it. That is
+                        // the boot-prefix `Memory access fault … on address 0x66000` (measured
+                        // 2026-09-16 01:33, batched + KVP2P + KEEP_FP8): 4x overrun per chunk row, on
+                        // the very buffer the o_proj consumes next. The sibling batched path at
+                        // :6797 documents the same identity -- `OLb == (Q27_GDN_Z / ndev)`.
+                        // Q27_OROWS == Q27_GDN_Z == 6144, so this is unchanged under layer-split.
+                        const int OLb = g_ls ? Q27_OROWS : (Q27_OROWS / ndev);
                         const int qstride = QLb + 2 * KVLb;
                         if (old_attn) {   // legacy: fp8 wide q/k/v with bf16 out -> bf16 chunk attention
                             if (!(q27_proj_fp8_wideb(&lay->q_proj, S.xqin, S.xsin, d.qkva_slots, Cch, qstride, 8, sk) &&
@@ -4147,8 +6977,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                   q27_proj_fp8_wideb(&lay->v_proj, S.xqin, S.xsin, d.qkva_slots + QLb + KVLb, Cch, qstride, 8, sk))) die("q/k/v (legacy fp8)");
                             tr(L, 1);
                             if (!q27_attn_chunk_tp(d.qkva_slots, qstride, lay->q_norm, lay->k_norm,
-                                                   d.kc + (size_t)fsl * d.tp_kv, d.ks + (size_t)fsl * d.tp_kvs,
-                                                   d.vc + (size_t)fsl * d.tp_kv, d.vs + (size_t)fsl * d.tp_kvs,
+                                                   d.kc + d.kv_off[fsl], d.ks + d.kvs_off[fsl],
+                                                   d.vc + Q27_VOFF(d.kv_off[fsl]), d.vs + Q27_VSOFF(d.kvs_off[fsl]),
                                                    S.qh, d.mix_tile, OLb, p0, Cch, 1,
                                                    S.mixq_slots, S.mixs_slots, lay->o_proj.in_scale, g_att_hpw, g_att_pf,
                                                    S.pob, S.pml, sk)) die("attention chunk (legacy)");
@@ -4177,12 +7007,32 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             }
                             tr(L, 1);
                             if (doB) {
-                            if (!q27_attn_chunk_q8(S.qkva8, S.qkvas, qstride, lay->q_norm, lay->k_norm,
-                                                   d.kc + (size_t)fsl * d.tp_kv, d.ks + (size_t)fsl * d.tp_kvs,
-                                                   d.vc + (size_t)fsl * d.tp_kv, d.vs + (size_t)fsl * d.tp_kvs,
+                            // Q27_PF_P2P: the four KV head-quarters of this layer, one per card.
+                            // Peer access is already enabled, so the sweep reads the three remote
+                            // quarters in place instead of the owner keeping a full-width copy.
+                            q27_kvquad_t QQ; QQ.on = 0;
+                            for (int h = 0; h < 4; ++h) { QQ.kc[h] = nullptr; QQ.ks[h] = nullptr; QQ.vc[h] = nullptr; QQ.vs[h] = nullptr; }
+                            if (g_pf_kvp2p) { QQ.on = 1;
+                                for (int h = 0; h < ndev; ++h) {
+                                    QQ.kc[h] = D[h].kc + D[h].kv_off[fsl]; QQ.ks[h] = D[h].ks + D[h].kvs_off[fsl];
+                                    QQ.vc[h] = D[h].vc + Q27_VOFF(D[h].kv_off[fsl]); QQ.vs[h] = D[h].vs + Q27_VSOFF(D[h].kvs_off[fsl]); } }
+                            int pfblas_rc = 0;
+                            if (q27_pfblas_should_run(p0, Cch)) {
+                                static const bool pfblas_serial = !q27_env_flag("Q27_Q8_SPLIT", false);
+                                pfblas_rc = q27_attn_chunk_q8_pfblas(d.id, pfblas_serial,
+                                    S.qkva8, S.qkvas, qstride, lay->q_norm, lay->k_norm,
+                                    d.kc + d.kv_off[fsl], d.ks + d.kvs_off[fsl],
+                                    d.vc + Q27_VOFF(d.kv_off[fsl]), d.vs + Q27_VSOFF(d.kvs_off[fsl]),
+                                    S.qh, OLb, p0, Cch, S.mixq_slots, S.mixs_slots, lay->o_proj.in_scale,
+                                    S.pob, S.pob_bytes, q8g64 ? 1 : 0, sk, &QQ);
+                                if (pfblas_rc < 0) die("bounded FP32 attention");
+                            }
+                            if (!pfblas_rc && !q27_attn_chunk_q8(S.qkva8, S.qkvas, qstride, lay->q_norm, lay->k_norm,
+                                                   d.kc + d.kv_off[fsl], d.ks + d.kvs_off[fsl],
+                                                   d.vc + Q27_VOFF(d.kv_off[fsl]), d.vs + Q27_VSOFF(d.kvs_off[fsl]),
                                                    S.qh, nullptr, OLb, p0, Cch, 1,
                                                    S.mixq_slots, S.mixs_slots, lay->o_proj.in_scale, g_att_hpw, g_att_pf,
-                                                   S.pob, S.pml, 0, q8g64 ? 1 : 0, sk)) die("attention chunk");
+                                                   S.pob, S.pml, 0, q8g64 ? 1 : 0, sk, &QQ)) die("attention chunk");
                             }   // doB: attention
                         }
                         tr(L, 2);
@@ -4207,10 +7057,10 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             tr(L, 5);
                             if (!q27_bf16_gemv2_tile(lay->in_a, lay->in_b, d.norm_slots, Q27_HID, d.ab_tile, d.bb_tile, Q27_GDN_VH, Q27_HID, Cch, sk)) die("a/b gemv (legacy)");
                             tr(L, 6);
-                            q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Cch, d.conv + (size_t)gsl * d.tp_conv, lay->conv1d, 0, 1, sk);
+                            q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Cch, d.conv + d.conv_off[gsl], lay->conv1d, 0, 1, sk);
                             tr(L, 7);
                             q27_gdn_scan2_tp(d.qkv_slots, QKVLb, d.zbuf_slots, ZLb, d.ab_tile, d.bb_tile, Q27_GDN_VH,
-                                             lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + (size_t)gsl * d.tp_s, d.mix_tile, ZLb,
+                                             lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + d.s_off[gsl], d.mix_tile, ZLb,
                                              0, 1, Cch, S.mixq_tile, S.mixs_tile, lay->out_proj.in_scale, sk);
                             tr(L, 8);
                         } else {          // in_qkv/in_z -> int8 + scales; int8 a/b GEMV, conv (in place), scan
@@ -4250,15 +7100,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             tr(L, 6); dumpf("a32", L, S.a32, 4); dumpf("b32", L, S.b32, 4);
                             static const bool q8convp = q27_env_flag("Q27_Q8_CONVP", true);   // position-parallel conv, out of place
                             const signed char* scan_q8 = q8convp ? S.qkvc8 : S.qkv8; const float* scan_qs = q8convp ? S.qkvcs : S.qkvs;
-                            if (q8convp) q27_gdn_conv_q8_par(S.qkv8, S.qkvs, S.qkvc8, S.qkvcs, QKVLb, Cch, d.conv + (size_t)gsl * d.tp_conv, lay->conv1d, 0, 1, sk);
-                            else q27_gdn_conv_q8_tile(S.qkv8, S.qkvs, QKVLb, Cch, d.conv + (size_t)gsl * d.tp_conv, lay->conv1d, 0, 1, sk);
+                            if (q8convp) q27_gdn_conv_q8_par(S.qkv8, S.qkvs, S.qkvc8, S.qkvcs, QKVLb, Cch, d.conv + d.conv_off[gsl], lay->conv1d, 0, 1, sk);
+                            else q27_gdn_conv_q8_tile(S.qkv8, S.qkvs, QKVLb, Cch, d.conv + d.conv_off[gsl], lay->conv1d, 0, 1, sk);
                             tr(L, 7); dumpq("conv8", L, S.qkv8, S.qkvs, 8);
                             p2dump(S);
                             q27_gdn_scan2_q8(scan_q8, scan_qs, QKVLb, S.z8, S.zs, ZLb, S.a32, S.b32, Q27_GDN_VH,
-                                             lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + (size_t)gsl * d.tp_s,
+                                             lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + d.s_off[gsl],
                                              nullptr, ZLb, 0, 1, Cch, S.mixq_tile, S.mixs_tile, lay->out_proj.in_scale, 0, q8g64 ? 1 : 0, par, sk);
                             }   // doB: conv + scan
-                            tr(L, 8); dumpq("mixq", L, S.mixq_tile, S.mixs_tile, 8); dumpf("S", L, d.S + (size_t)gsl * d.tp_s, 4);
+                            tr(L, 8); dumpq("mixq", L, S.mixq_tile, S.mixs_tile, 8); dumpf("S", L, d.S + d.s_off[gsl], 4);
                         }
                         // out_proj on the fp8 weights; residual = the fp32 layer input (or the bf16 copy under the legacy switch)
                         if (doA2) {
@@ -4277,37 +7127,132 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     if (evA) CK(hipEventRecord(evA, sk));   // stage A done: the next chunk may enter this layer
                     }   // stage A
                     if (doMLP) {
+                    // LAYER-LOCAL INT8 MLP. The arena holds one layer; re-expand when it does not
+                    // already hold this one. The conversion is ~423 MiB of traffic against a chunk
+                    // of MLP GEMMs that reads the same weights for every token in the chunk, so it
+                    // amortises -- and it is the whole reason the fast int8 consumer is reachable
+                    // at ctx=262144 at all.
+                    const bool mstage = mlpstage && d.mlp8_w && d.mlp8_s && lay->gate.w && lay->up.w && lay->down.w;
+                    const int mslot = L & (Dev::MLP8_SLOTS - 1);
+                    // This layer's MLP on the rocBLAS/Tensile path, from the arena (rb8) or from the
+                    // persistent mirrors (bl_mlp). Everything downstream keys off BL so a layer whose
+                    // representation came from the arena is indistinguishable from one whose
+                    // representation was loaded -- which is the entire point of the arena.
+                    const bool rb8 = mlp_rb && mstage_mode != 2 && mstage && d.mlp8_rs;
+                    // PER-LAYER rocBLAS MLP: bl_mlp is the engine-wide "the mirrors are the
+                    // configured representation" flag, which is false on the NVFP4 configuration.
+                    // A layer is on the rocBLAS path whenever its PER-ROW mirror actually exists --
+                    // which is the persistent mirror set (Q27_LS_MLP_I8K layers) or the arena slot.
+                    const bool bl_l = q8bl && (q8blm & 4) && lay->gate8r.w && lay->up8r.w && lay->down8r.w;
+                    const bool L_ex_mlp = lay->ex_gate.live() && lay->ex_up.live() && lay->ex_down.live();
+                    const bool BL  = (bl_mlp || bl_l || rb8) && !old_res && !old_mlp;
+                    const q27_i8r_t* G8 = rb8 ? &d.mlp8_gate_r : &lay->gate8r;
+                    const q27_i8r_t* U8 = rb8 ? &d.mlp8_up_r   : &lay->up8r;
+                    const q27_i8r_t* D8 = rb8 ? &d.mlp8_down_r : &lay->down8r;
+                    if (mstage && d.mlp8_layer[mslot] != L) {
+                        const size_t gw = (size_t)Q27_INTER * Q27_HID, gs_ = (size_t)Q27_INTER * (Q27_HID / 64);
+                        const size_t dw_slot = (mstage_mode == 2) ? gw : (2 * gw + gw);
+                        const size_t ds_slot = (mstage_mode == 2) ? gs_ : (2 * gs_ + gs_);
+                        signed char* wp = d.mlp8_w + (size_t)mslot * dw_slot;
+                        float*       sp = d.mlp8_s + (size_t)mslot * ds_slot;
+                        if (mstage_mode == 2) {
+                            if (!q27_nvfp4_to_i8g64_into(&lay->down, &d.mlp8_down, wp, sp, sk))
+                                die("MLP stage expand (down)");
+                        } else if (!q27_nvfp4_to_i8g64_into(&lay->gate, &d.mlp8_gate, wp,          sp,           sk) ||
+                                   !q27_nvfp4_to_i8g64_into(&lay->up,   &d.mlp8_up,   wp + gw,     sp + gs_,     sk) ||
+                                   !q27_nvfp4_to_i8g64_into(&lay->down, &d.mlp8_down, wp + 2 * gw, sp + 2 * gs_, sk))
+                            die("MLP stage expand");
+                        if (rb8) {   // same slot, requantized in place to the per-ROW form
+                            float* rs = d.mlp8_rs + (size_t)mslot * (size_t)(2 * Q27_INTER + Q27_HID);
+                            if (!q27_i8g64_rowify(&d.mlp8_gate, &d.mlp8_gate_r, rs,               sk) ||
+                                !q27_i8g64_rowify(&d.mlp8_up,   &d.mlp8_up_r,   rs + Q27_INTER,     sk) ||
+                                !q27_i8g64_rowify(&d.mlp8_down, &d.mlp8_down_r, rs + 2*Q27_INTER,   sk))
+                                die("MLP stage rowify");
+                        }
+                        d.mlp8_layer[mslot] = L;
+                    }
+                    if (rb8 && !d.mlp8_gate_r.w) die("MLP arena row handles are empty");
                     // post-norm: fp32 h' in, int8 permuted MLP activations out; h' itself (part_slots) is the
                     // down's residual; only the last layer keeps an fp32 copy for the head
-                    if (q8g64 && !old_res && !old_mlp) {
+                    // NOTE: bl_l MUST be in this condition, not just q8mlp. When the int8 MLP mirrors
+                    // are present on only SOME layers (Q27_LS_MLP_I8K), q8mlp is false engine-wide, so
+                    // a rocBLAS layer that fell through to the permuted form would feed the GEMM
+                    // permuted activations. That is fluent-looking garbage -- it degenerates into
+                    // repetition, not into a fault.
+                    if (BL) {
                         if (fuse_pn) { /* post norm already produced by the fused o/out_proj epilogue */ }
-                        else if (bl_mlp) { if (!q27_red_rn_tok_b1(S.part, lay->post_norm, (L == nlayer - 1) ? S.hid32c : nullptr, S.xq1, S.xst1, Q27_HID, 1, lay->gate.in_scale, Cch, q8gs, sk)) die("post norm tok"); }
+                        else if (!q27_red_rn_tok_b1(S.part, lay->post_norm, (L == nlayer - 1) ? S.hid32c : nullptr, S.xq1, S.xst1, Q27_HID, 1, lay->gate.in_scale, Cch, q8gs, sk)) die("post norm tok");
+                    } else
+                    if (q8mlp && !old_res && !old_mlp) {
+                        if (fuse_pn) { /* fused epilogue already produced it */ }
                         else if (!q27_red_rn_g64_b1(S.part, lay->post_norm, (L == nlayer - 1) ? S.hid32c : nullptr, S.xq1, S.xs1, Q27_HID, 1, lay->gate.in_scale, Cch, sk)) die("post norm g64");
                     } else
                     if (!q27_red_rn_perm_b1(S.part, lay->post_norm, old_res ? hid_bf : nullptr, (L == nlayer - 1) ? S.hid32c : nullptr,
                                             S.xq1, S.xs1, Q27_HID, 1, lay->gate.in_scale, Cch, sk)) die("post norm");
                     tr(L, 10); dumpq("xq1", L, S.xq1, S.xs1, 8);
+                    // ---- Q27_EXL3: the MLP on the resident trellis ----
+                    // This is THE 4-bit surface of prefill: in the incumbent the
+                    // attention projections are already q27_fp8_t (8-bit) and only
+                    // gate/up/down are NVFP4. The post-norm above is left in place --
+                    // it still produces S.hid32c for the head on the last layer -- and
+                    // EXL3 takes its own bf16 norm off the same fp32 partial rather
+                    // than trying to un-permute the quantized one.
+                    bool ex_mlp_done = false;
+                    if (L_ex_mlp) {
+                        void* xw = exl3_ws(d, Q27_EXL3_WMAX, Q27_EXL3_WMAX, Cch);
+                        if (!xw) die("EXL3 workspace");
+                        unsigned short* nb  = q27_exl3_ws_norm(xw, Cch);
+                        unsigned short* act = q27_exl3_ws_act(xw, lay->ex_down.in, Cch, lay->ex_down.out);
+                        if (!q27_exl3_rmsnorm_bf16(S.part, lay->post_norm, nb, Q27_HID, Cch, Q27_HID, Q27_HID, sk)) die("EXL3 post norm");
+                        // Q27_INTER IS THE WRONG WIDTH HERE. S.pa/S.pb are d.pa_mlp/d.pb_mlp,
+                        // allocated with a PER-CARD row stride (mlp_len = Q27_INTER/ndev). Passing
+                        // the full 17408 wrote each row 4x too far apart on ndev=4 -- past the end
+                        // of the allocation -- and the swiglu then read 17408 columns out of a
+                        // 4352-wide row. The sibling batched site (the chunk MLP) already used the
+                        // shard width; this one did not, and nothing caught it because every
+                        // TENSOR verifies and the M=1 decode MLP is exact (measured 2026-09-19:
+                        // gate 22.82 dB, down 19.53 dB against the live input). Prefill corrupted
+                        // the state the correct decode then read.
+                        const int EXIL = lay->ex_gate.out;
+                        if (EXIL != lay->ex_up.out || EXIL != lay->ex_down.in || EXIL != mlp_len(d.id))
+                            die("EXL3 MLP shard width disagrees with the chunk buffers");
+                        if (!exl3_f32(d, lay->ex_gate, nb, S.pa, Cch, sk, Q27_HID, EXIL)) die("EXL3 gate");
+                        if (!exl3_f32(d, lay->ex_up,   nb, S.pb, Cch, sk, Q27_HID, EXIL)) die("EXL3 up");
+                        if (!q27_exl3_swiglu_bf16(S.pa, S.pb, act, EXIL, Cch, EXIL, EXIL, sk)) die("EXL3 swiglu");
+                        if (!exl3_f32(d, lay->ex_down, act, S.mixer, Cch, sk, EXIL, Q27_HID)) die("EXL3 down");
+                        // the incumbent down folds the fp32 residual (S.part) into its
+                        // epilogue with share 1.0; EXL3's epilogue is the output
+                        // Hadamard, so it rides as its own pass.
+                        if (!q27_exl3_add_res_f32(S.mixer, S.part, 1.0f, Q27_HID, Cch, Q27_HID, Q27_HID, sk)) die("EXL3 down residual");
+                        ex_mlp_done = true;
+                    }
+                    if (!ex_mlp_done) {
                     if (old_mlp) { if (!q27_wide_gu(&lay->gate, &lay->up, S.xq1, S.xs1, S.pa, S.pb, Cch, g_pf_wide_kg, sk)) die("gate+up (legacy)"); }
-                    else if (bl_mlp && !old_res) { const q27_i8r_t* wg = &lay->gate8r; const q27_i8r_t* wu = &lay->up8r; const int w_gs = wg->gs; int* ag = S.acc; int* au = S.acc + (size_t)Cch * wg->rows * wg->ng;
+                    else if (BL) { const q27_i8r_t* wg = G8; const q27_i8r_t* wu = U8; const int w_gs = wg->gs; int* ag = S.acc; int* au = S.acc + (size_t)Cch * wg->rows * wg->ng;
                         if (!q27_rb_gemm_i8g(d.id, wg->w, wg->rows, wg->K, S.xq1, Cch, ag, w_gs, sk)) die("rb gate gemm");
                         if (!q27_rb_gemm_i8g(d.id, wu->w, wu->rows, wu->K, S.xq1, Cch, au, w_gs, sk)) die("rb up gemm");
                         if (!q27_epi_swiglu_tok(ag, au, wg->rows, wg->s, wu->s, wg->ng, S.xst1, wg->alpha, wu->alpha, 1.0f / lay->down.in_scale, S.xq2, S.xst2, Cch, q8gs, sk)) die("rb swiglu"); }
-                    else if (q8g64 && !old_res) { if (!(q8r8 ? q27_wide_gu_i8g64r8(&lay->gate8, &lay->up8, S.xq1, S.xs1, S.pa, S.pb, Cch, sk) : q27_wide_gu_i8g64(&lay->gate8, &lay->up8, S.xq1, S.xs1, S.pa, S.pb, Cch, sk))) die("gate+up i8g64"); }
+                    else if (mstage && mstage_mode != 2) { if (!q27_wide_gu_i8g64(&d.mlp8_gate, &d.mlp8_up, S.xq1, S.xs1, S.pa, S.pb, Cch, sk)) die("gate+up i8g64 (staged)"); }
+                    else if (q8mlp && !old_res) { if (!(q8r8 ? q27_wide_gu_i8g64r8(&lay->gate8, &lay->up8, S.xq1, S.xs1, S.pa, S.pb, Cch, sk) : q27_wide_gu_i8g64(&lay->gate8, &lay->up8, S.xq1, S.xs1, S.pa, S.pb, Cch, sk))) die("gate+up i8g64"); }
                     else if (!q27_wide_gu(&lay->gate, &lay->up, S.xq1, S.xs1, S.pa, S.pb, Cch, g_pf_wide_kg, sk)) die("gate+up");
                     tr(L, 11); dumpf("pa", L, S.pa, 4); dumpf("pb", L, S.pb, 4);
-                    if (!bl_mlp && q8g64 && !old_res && !old_mlp) { if (!q27_swiglu_quant_b_g64(S.pa, S.pb, S.xq2, S.xs2, Q27_INTER, lay->down.in_scale, Cch, sk)) die("swiglu g64"); }
+                    if (BL) { /* the gate/up epilogue (q27_epi_swiglu_tok) already wrote the per-token S.xq2 */ }
+                    else if (mstage) { if (!q27_swiglu_quant_b_g64(S.pa, S.pb, S.xq2, S.xs2, Q27_INTER, lay->down.in_scale, Cch, sk)) die("swiglu g64 (staged)"); }   // g64 form feeds the i8g down in both modes
+                    else if (!bl_mlp && q8mlp && !old_res && !old_mlp) { if (!q27_swiglu_quant_b_g64(S.pa, S.pb, S.xq2, S.xs2, Q27_INTER, lay->down.in_scale, Cch, sk)) die("swiglu g64"); }
                     else if (!bl_mlp && !q27_swiglu_quant_b(S.pa, S.pb, S.xq2, S.xs2, Q27_INTER, lay->down.in_scale, Cch, sk)) die("swiglu");
                     tr(L, 12); dumpq("xq2", L, S.xq2, S.xs2, 8);
                     if (old_mlp) { if (!old_res) die("Q27_Q8_OLD=32 needs 4"); if (!q27_wide_down(&lay->down, S.xq2, S.xs2, S.mixer, Cch, hid_bf, 1.0f, g_pf_wide_kd, sk)) die("down (legacy wide)"); }
                     else if (old_res) { if (!q27_wide_down_rb2p(&lay->down, S.xq2, S.xs2, S.mixer, Cch, hid_bf, 1.0f, 4, sk)) die("down (legacy)"); }
-                    else if (bl_mlp) { const q27_i8r_t* w = &lay->down8r; const int w_gs = w->gs;
+                    else if (BL) { const q27_i8r_t* w = D8; const int w_gs = w->gs;
                         if (!q27_rb_gemm_i8g(d.id, w->w, w->rows, w->K, S.xq2, Cch, S.acc, w_gs, sk)) die("rb down gemm");
                         if (!q27_epi_f32r(S.acc, w->rows, w->s, w->ng, S.xst2, w->alpha, (q8noinv && !q8redb1) ? pend : S.mixer, S.part, 1.0f, Cch, sk)) die("rb down epi"); }   // NOINV: the new residual goes straight to pend (no red_b1 copy, inv unused)
-                    else if (q8g64) { if (!(q8r8 ? q27_wide_i8g64r8_f32r(&lay->down8, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk) : q27_wide_down_i8g64_f32r(&lay->down8, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk))) die("down i8g64"); }
+                    else if (mstage) { if (!q27_wide_down_i8g64_f32r(&d.mlp8_down, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk)) die("down i8g64 (staged)"); }
+                    else if (q8mlp) { if (!(q8r8 ? q27_wide_i8g64r8_f32r(&lay->down8, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk) : q27_wide_down_i8g64_f32r(&lay->down8, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk))) die("down i8g64"); }
                     else if (!(q8rbd ? q27_wide_down_rb_f32r(&lay->down, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, sk)
                                     : q27_wide_down_f32r(&lay->down, S.xq2, S.xs2, S.mixer, Cch, S.part, 1.0f, q8kd, sk))) die("down");
+                    }   // !ex_mlp_done
                     tr(L, 13); dumpf("mixer", L, S.mixer, 4);
-                    if (!(bl_mlp && q8noinv && !q8redb1)) q27_red_b1(S.mixer, pend, d.inv_slots + (p0 - sb), Q27_HID, Cch, sk);
+                    if (!(BL && q8noinv && !q8redb1)) q27_red_b1(S.mixer, pend, d.inv_slots + (p0 - sb), Q27_HID, Cch, sk);
                     tr(L, 14);
                     }   // stage B
                 };
@@ -4324,13 +7269,23 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     // One stream per card, jobs (k, r) ordered by readiness key k + r*ndev (ties: lower k).
                     // Cross-card: the producer records evdone[pos] when it ENQUEUES job pos and publishes
                     // pos in ls_rec; the consumer spins for that (short) and waits on the device.
-                    const int nround = LPP / q8blk, njobs = nch * nround, nblk = nround * ndev;
-                    // block lists per card (balanced ownership rotates by one card every other round); a job is (chunk k, block b)
+                    // nround WAS `LPP / q8blk` -- the UNIFORM blocks-per-card -- while cblk is
+                    // built from the ownership oracle. Under Q27_LS_OWN those disagree: at
+                    // 28,12,12,12 with blk=4 the oracle deals 7,3,3,3, so card 0 silently DROPPED
+                    // 3 of its blocks and cards 1-3 indexed cblk[g][3] on a 3-element vector --
+                    // an out-of-bounds read whose garbage block sent every one of them to layer 0
+                    // ("input norm g64 declined (L0) card=3 owner=0 owned=0"). That is the crash
+                    // the 09-19 pool note records as the blocker for uneven ownership.
+                    // The per-card count is cblk[g].size(); nothing else may stand in for it.
+                    const int nblk = nlayer / q8blk;
                     std::vector<std::vector<int>> cblk((size_t)ndev);
                     for (int b = 0; b < nblk; ++b) cblk[(size_t)blk_owner(b)].push_back(b);
+                    const int myblk = (int)cblk[(size_t)g].size();   // THIS card's blocks, not LPP/q8blk
+                    const int njobs = nch * myblk;
+                    if (myblk <= 0) { std::fprintf(stderr, "Q27_LS_OWN: card %d owns no layer blocks; aborting\n", g); std::exit(1); }
                     auto jobkey = [&](int k, int b) { return (long long)(k + b) * nch + k; };   // readiness: stage k + b, ties by chunk
-                    std::vector<std::pair<long long, int>> ord; ord.reserve(njobs);   // this card: second = k * nround + i (i = index into cblk[g])
-                    for (int k = 0; k < nch; ++k) for (int i = 0; i < nround; ++i) ord.push_back({jobkey(k, cblk[(size_t)g][(size_t)i]), k * nround + i});
+                    std::vector<std::pair<long long, int>> ord; ord.reserve(njobs);   // this card: second = k * myblk + i (i = index into cblk[g])
+                    for (int k = 0; k < nch; ++k) for (int i = 0; i < myblk; ++i) ord.push_back({jobkey(k, cblk[(size_t)g][(size_t)i]), k * myblk + i});
                     std::sort(ord.begin(), ord.end());
                     auto jobpos = [&](int card, int k, int b) {   // position of job (k, b) in card's (sorted) order
                         const long long key = jobkey(k, b); int pos = 0;
@@ -4339,9 +7294,24 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     std::vector<hipEvent_t>& evd = g_ls_evdone[g];
                     evd.assign((size_t)njobs, nullptr);
                     for (int j = 0; j < njobs; ++j) CK(hipEventCreateWithFlags(&evd[j], hipEventDisableTiming));
+                    if (q8trace) std::fprintf(stderr, "Q27_Q8_RING g=%d sw=[%d,%d) nwin=%d sb=%d nch=%d myblk=%d njobs=%d ev0=%p\n",
+                                 g, sw_beg, sw_end, nwin, sb, nch, myblk, njobs, (void*)evd[0]);
+                    if (q8trace) std::fprintf(stderr, "Q27_Q8_EV g=%d n=%zu e0=%p e1=%p\n", g, evd.size(),
+                                 (void*)evd[0], njobs > 1 ? (void*)evd[1] : nullptr);
                     if (g == 0) MS("T6_events_done");
+                    // THE RING RECORD MUST BE RESET BETWEEN TWO BARRIERS, NOT BEFORE BOTH OF THEM.
+                    // ls_rec[g] is a MONOTONIC per-card job counter that peers spin on: `while (ls_rec[src] < pos) {}`.
+                    // Resetting it to -1 before b1 lets a card that has finished its round drive the counter BACKWARDS
+                    // while a peer is still spinning on it for the OLD round -- that peer's condition can then never
+                    // be satisfied and it never reaches any barrier again. Measured 2026-09-16, deterministic on the
+                    // SERVE_RESET -> SERVE_GROW -> sweep path: "FATAL TpBar ... arrived 2", with card2/card3 at gen=3318
+                    // job=-1 (already reset, one round ahead) and card0/card1 at gen=3317 job=3 (still consuming).
+                    // b1 = every card has left the previous round, so nobody is still reading these cells.
+                    // b2 = every reset is visible before any producer publishes, so nobody reads a STALE-HIGH cell.
+                    // Both hazards are real; the code had only the second fence.
+                    C.b1.wait();
                     C.ls_rec[g].store(-1, std::memory_order_release);
-                    C.b1.wait(); C.b2.wait();                       // every card's event table exists
+                    C.b2.wait();                                   // every card's event table exists
                     hipStream_t sk = d.hs[0];
                     // peer-store handoff (Q27_Q8_PEERW): the producer writes the block residual into the NEXT ring card's
                     // pend buffer with a copy kernel through the peer mapping; the consumer only waits on the event.
@@ -4382,17 +7352,18 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             const int src = blk_owner(b - 1);
                             const int pos = jobpos(src, k, b - 1);
                             while (C.ls_rec[src].load(std::memory_order_acquire) < pos) { }
+                            Q27_LS_EVCHK("handoff", src, pos);
                             CK(hipStreamWaitEvent(sk, g_ls_evdone[src][pos], 0));
-                            CK(hipMemcpyPeerAsync(d.pend_slots + (size_t)(p0 - sb) * Q27_HID, d.id,
-                                                  D[src].pend_slots + (size_t)(p0 - sb) * Q27_HID, D[src].id,
-                                                  (size_t)Cch * Q27_HID * 4, sk));
+                            if (!q27_xcopy(d.pend_slots + (size_t)(p0 - sb) * Q27_HID, d.id,
+                                              D[src].pend_slots + (size_t)(p0 - sb) * Q27_HID, D[src].id,
+                                              (size_t)Cch * Q27_HID * 4, sk, "ring")) { std::fprintf(stderr, "Q27_XCOPY ring failed g=%d src=%d\n", g, src); std::fflush(stderr); std::exit(1); }
                             if (!q8noinv) CK(hipMemcpyAsync(d.inv_slots + (p0 - sb), D[src].inv_slots + (p0 - sb), (size_t)Cch * 4, hipMemcpyHostToHost, sk));
                         };
                         for (int j0 = 0; j0 < njobs; j0 += 2) {
                             const int nj = (j0 + 1 < njobs) ? 2 : 1;
                             int kk[2] = {0, 0}, bb[2] = {0, 0}, pp[2] = {0, 0}, cc[2] = {0, 0};
                             for (int t = 0; t < nj; ++t) {
-                                const int j = j0 + t; kk[t] = ord[j].second / nround; bb[t] = cblk[(size_t)g][(size_t)(ord[j].second % nround)];
+                                const int j = j0 + t; kk[t] = ord[j].second / myblk; bb[t] = cblk[(size_t)g][(size_t)(ord[j].second % myblk)];
                                 pp[t] = sw_beg + lsoff(kk[t]); const int cwk = lschw(kk[t]); cc[t] = (sw_end - pp[t] < cwk) ? (sw_end - pp[t]) : cwk;
                             }
                             handoff(kk[0], bb[0], pp[0], cc[0]);
@@ -4416,7 +7387,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         last_set = (njobs - 1) & 1;
                     } else
                     for (int j = 0; j < njobs; ++j) {
-                        const int k = ord[j].second / nround, b = cblk[(size_t)g][(size_t)(ord[j].second % nround)];
+                        const int k = ord[j].second / myblk, b = cblk[(size_t)g][(size_t)(ord[j].second % myblk)];
                         const int p0 = sw_beg + lsoff(k);
                         const int cwk = lschw(k);
                         const int Cch = (sw_end - p0 < cwk) ? (sw_end - p0) : cwk;
@@ -4427,10 +7398,11 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             // Q27_Q8_PFIN: the input copy runs on the COPY stream as soon as the producer signals, so it
                             // overlaps the previous job's compute; the compute stream only waits for the copy's event.
                             hipStream_t sc = (q8pfin && !peerw) ? d.hs[1] : sk;
+                            Q27_LS_EVCHK("jobin", src, pos);
                             CK(hipStreamWaitEvent(sc, g_ls_evdone[src][pos], 0));
-                            if (!peerw) CK(hipMemcpyPeerAsync(d.pend_slots + (size_t)(p0 - sb) * Q27_HID, d.id,
-                                                  D[src].pend_slots + (size_t)(p0 - sb) * Q27_HID, D[src].id,
-                                                  (size_t)Cch * Q27_HID * 4, sc));
+                            if (!peerw) if (!q27_xcopy(d.pend_slots + (size_t)(p0 - sb) * Q27_HID, d.id,
+                                              D[src].pend_slots + (size_t)(p0 - sb) * Q27_HID, D[src].id,
+                                              (size_t)Cch * Q27_HID * 4, sc, "ring")) { std::fprintf(stderr, "Q27_XCOPY ring failed g=%d src=%d\n", g, src); std::fflush(stderr); std::exit(1); }
                             if (!q8noinv) CK(hipMemcpyAsync(d.inv_slots + (p0 - sb), D[src].inv_slots + (p0 - sb), (size_t)Cch * 4,
                                               hipMemcpyHostToHost, sc));
                             if (sc != sk) { CK(hipEventRecord(evin[j], sc)); CK(hipStreamWaitEvent(sk, evin[j], 0)); }
@@ -4453,8 +7425,10 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             q27_f2bf_vec(P.fin32, P.finbf, Cch * Q27_HID, sk);
                             CK(hipMemcpyAsync(g_mtp_hall + (size_t)(p0 - sb) * Q27_HID, P.finbf, (size_t)Cch * Q27_HID * 2, hipMemcpyDeviceToHost, sk));
                         }
-                        if (peerw && b + 1 < nround * ndev)   // push the block residual to the next ring card
+                        if (peerw && b + 1 < nblk)   // push the block residual to the next ring card
                             if (!q27_copy_f32(d.pend_slots + (size_t)(p0 - sb) * Q27_HID, D[(g + 1) % ndev].pend_slots + (size_t)(p0 - sb) * Q27_HID, (size_t)Cch * Q27_HID, sk)) { std::fprintf(stderr, "Q27_Q8_PEERW: peer copy declined\n"); std::exit(1); }
+                        if (q8trace && j < 2) std::fprintf(stderr, "Q27_Q8_REC g=%d j=%d n=%zu e=%p\n", g, j, evd.size(), (void*)evd[j]);
+                        if (pf_profile_on()) g_pfp[g].mark(sk, -1, 99);   // job end
                         CK(hipEventRecord(evd[j], sk));
                         C.ls_rec[g].store(j, std::memory_order_release);
                         if (q8trace && g == 1) { CK(hipStreamSynchronize(sk)); std::fprintf(stderr, "Q8T g=%d JOBEND k=%d b=%d ok\n", g, k, b); }
@@ -4463,31 +7437,43 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     // second stream as soon as the owner's last-chunk job for that block is enqueued (device-side
                     // event wait), instead of after the barrier on the finals' stream. Only the filled KV prefix.
                     static const bool q8exp = q27_env_flag("Q27_Q8_EXPOVL", true);
-                    if (q8exp) {
+                    if (q8exp && !g_sr) {   // Q27_LS_SR: nothing to export -- no card decodes a layer it does not own
                         hipStream_t sx = d.hs[1];
+                        if (pf_profile_on()) g_pfp[g].mark(sx, -1, 98);   // export begin
                         for (int L = 0; L < nlayer; ++L) {
                             const int owner = lay_owner(L);
                             if (owner == g) continue;
+                            // EXPORT OF A LAYER THIS CARD DOES NOT OWN. The owner holds the layer
+                            // full width; this card stores -- and decode reads -- only head-quarter
+                            // g. So the transfer is the quarter, strided out of the owner's rows,
+                            // not the whole row. Three quarters of the old copy were bytes nothing
+                            // ever read.
                             const int pos = jobpos(owner, nch - 1, L / q8blk);
                             while (C.ls_rec[owner].load(std::memory_order_acquire) < pos) { }
+                            Q27_LS_EVCHK("export", owner, pos);
                             CK(hipStreamWaitEvent(sx, g_ls_evdone[owner][pos], 0));
                             const int fsc = L >> 2, gsc = L - fsc;
+                            // Q27_PF_P2P: prep already wrote every head straight into the card that
+                            // OWNS it, so there is nothing to export -- and exporting would be WRONG:
+                            // the owner no longer has full-width rows, so the strided read would copy
+                            // data shifted by this card's head offset over its own correct quarter.
+                            // The GDN state below is still owner-resident and must still be copied.
                             if (Q27_IS_FULL(L)) {
-                                const size_t kvb = (size_t)sw_end * Q27_KVROWS, ksb = (size_t)sw_end * (Q27_KVROWS / 16) * 4;   // [pos][rows] prefix
-                                CK(hipMemcpyPeerAsync(d.kc + (size_t)fsc * d.tp_kv, d.id, D[owner].kc + (size_t)fsc * d.tp_kv, D[owner].id, kvb, sx));
-                                CK(hipMemcpyPeerAsync(d.vc + (size_t)fsc * d.tp_kv, d.id, D[owner].vc + (size_t)fsc * d.tp_kv, D[owner].id, kvb, sx));
-                                CK(hipMemcpyPeerAsync(d.ks + (size_t)fsc * d.tp_kvs, d.id, D[owner].ks + (size_t)fsc * d.tp_kvs, D[owner].id, ksb, sx));
-                                CK(hipMemcpyPeerAsync(d.vs + (size_t)fsc * d.tp_kvs, d.id, D[owner].vs + (size_t)fsc * d.tp_kvs, D[owner].id, ksb, sx));
+                                if (!g_pf_kvp2p) q27_export_kv_quarter(d, D[owner], fsc, sw_beg, sw_end, sx);
                             } else {
-                                CK(hipMemcpyPeerAsync(d.S + (size_t)gsc * d.tp_s, d.id, D[owner].S + (size_t)gsc * d.tp_s, D[owner].id, d.tp_s * 4, sx));
-                                CK(hipMemcpyPeerAsync(d.conv + (size_t)gsc * d.tp_conv, d.id, D[owner].conv + (size_t)gsc * d.tp_conv, D[owner].id, d.tp_conv * 2, sx));
+                                CK(hipMemcpyPeerAsync(d.S + d.s_off[gsc], d.id,
+                                                      D[owner].S + D[owner].s_off[gsc] + (size_t)q27_tp_shard(g)->gv_h0 * Q27_GDN_D * Q27_GDN_D,
+                                                      D[owner].id, d.s_bytes[gsc], sx));
+                                q27_copy_conv_quarter(D[owner], d, gsc, g, ndev, false, sx);
                             }
                         }
+                        if (pf_profile_on()) g_pfp[g].mark(sx, -1, 97);   // export end
                         export_done = true;
                     }
                     CK(hipStreamSynchronize(sk));
                     if (q8split) { CK(hipStreamSynchronize(sB)); }
                     if (q8pfin) { CK(hipStreamSynchronize(d.hs[1])); }
+                    if (pf_profile_on()) { CK(hipStreamSynchronize(d.hs[1])); pf_profile_report(g, sw_beg, sw_end); }
                     if (g == last_card) MS("T6b_loop_done");
                     if (g_df2_draft) {   // DFlash2: gather the prompt taps (each card owns some boundaries) -> every card gets the full set
                         static const int PTAP2[5] = {5, 19, 33, 47, 61};
@@ -4529,8 +7515,19 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     std::vector<hipEvent_t> evA((size_t)2 * LPP, nullptr), evB((size_t)2 * LPP, nullptr);
                     for (int i = 0; i < 2 * LPP; ++i) { CK(hipEventCreateWithFlags(&evA[i], hipEventDisableTiming)); CK(hipEventCreateWithFlags(&evB[i], hipEventDisableTiming)); }
                     hipStream_t hi = d.q8hi, lo = d.q8lo;
+                    // THE RING RECORD MUST BE RESET BETWEEN TWO BARRIERS, NOT BEFORE BOTH OF THEM.
+                    // ls_rec[g] is a MONOTONIC per-card job counter that peers spin on: `while (ls_rec[src] < pos) {}`.
+                    // Resetting it to -1 before b1 lets a card that has finished its round drive the counter BACKWARDS
+                    // while a peer is still spinning on it for the OLD round -- that peer's condition can then never
+                    // be satisfied and it never reaches any barrier again. Measured 2026-09-16, deterministic on the
+                    // SERVE_RESET -> SERVE_GROW -> sweep path: "FATAL TpBar ... arrived 2", with card2/card3 at gen=3318
+                    // job=-1 (already reset, one round ahead) and card0/card1 at gen=3317 job=3 (still consuming).
+                    // b1 = every card has left the previous round, so nobody is still reading these cells.
+                    // b2 = every reset is visible before any producer publishes, so nobody reads a STALE-HIGH cell.
+                    // Both hazards are real; the code had only the second fence.
+                    C.b1.wait();
                     C.ls_rec[g].store(-1, std::memory_order_release);
-                    C.b1.wait(); C.b2.wait();                       // every card's event table exists
+                    C.b2.wait();                                   // every card's event table exists
                     auto handoff = [&](int k) {                     // this card's input for chunk k, on hi
                         if (g == 0) return;
                         const int p0 = sw_beg + lsoff(k);
@@ -4587,8 +7584,19 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     for (int k = 0; k < nch; ++k) CK(hipEventCreateWithFlags(&evd[k], hipEventDisableTiming));
                     std::vector<hipEvent_t> evA((size_t)2 * LPP, nullptr);
                     for (int i = 0; i < 2 * LPP; ++i) CK(hipEventCreateWithFlags(&evA[i], hipEventDisableTiming));
+                    // THE RING RECORD MUST BE RESET BETWEEN TWO BARRIERS, NOT BEFORE BOTH OF THEM.
+                    // ls_rec[g] is a MONOTONIC per-card job counter that peers spin on: `while (ls_rec[src] < pos) {}`.
+                    // Resetting it to -1 before b1 lets a card that has finished its round drive the counter BACKWARDS
+                    // while a peer is still spinning on it for the OLD round -- that peer's condition can then never
+                    // be satisfied and it never reaches any barrier again. Measured 2026-09-16, deterministic on the
+                    // SERVE_RESET -> SERVE_GROW -> sweep path: "FATAL TpBar ... arrived 2", with card2/card3 at gen=3318
+                    // job=-1 (already reset, one round ahead) and card0/card1 at gen=3317 job=3 (still consuming).
+                    // b1 = every card has left the previous round, so nobody is still reading these cells.
+                    // b2 = every reset is visible before any producer publishes, so nobody reads a STALE-HIGH cell.
+                    // Both hazards are real; the code had only the second fence.
+                    C.b1.wait();
                     C.ls_rec[g].store(-1, std::memory_order_release);
-                    C.b1.wait(); C.b2.wait();                       // every card's event table exists
+                    C.b2.wait();                                   // every card's event table exists
                     for (int k = 0; k < nch; ++k) {
                         const int par = k & 1;
                         hipStream_t sk = q8one ? d.hs[0] : d.hs[par];
@@ -4706,11 +7714,26 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                   q27_proj_fp8_wideb(&lay->v_proj, d.xqin_slots, d.xsin_slots, d.qkva_slots + QLb + KVLb, Cch, qstride, g_pf_x4w, d.stream)))
                                 { std::fprintf(stderr, "Q27_LS: wide q/k/v declined (L%d) qK=%d qrows=%d qw=%p x4w=%d M=%d; aborting\n", L, lay->q_proj.K, lay->q_proj.rows, (const void*)lay->q_proj.w, g_pf_x4w, Cch); std::exit(1); }
                             lsp(1);
+                            // Q27_PF_KVP2P: hand the sweep the four cards' KV head-quarters for this
+                            // layer. Each card stores exactly the quarter its TP decode reads, so the
+                            // owner's attention reads the three remote quarters out of the peers
+                            // instead of keeping a duplicate full-width row (worth 1.875 GiB/card at
+                            // ctx=262144). Null when the flag is off -- then this is the old kernel.
+                            q27_kvquad_t QQ; QQ.on = 0;
+                            for (int i = 0; i < 4; ++i) { QQ.kc[i] = nullptr; QQ.ks[i] = nullptr; QQ.vc[i] = nullptr; QQ.vs[i] = nullptr; }
+                            if (g_pf_kvp2p) {
+                                QQ.on = 1;
+                                for (int h = 0; h < ndev; ++h) {
+                                    QQ.kc[h] = D[h].kc + D[h].kv_off[fsl]; QQ.ks[h] = D[h].ks + D[h].kvs_off[fsl];
+                                    QQ.vc[h] = D[h].vc + Q27_VOFF(D[h].kv_off[fsl]); QQ.vs[h] = D[h].vs + Q27_VSOFF(D[h].kvs_off[fsl]);
+                                }
+                            }
                             if (!(g_pf_att_chunk &&
                                   q27_attn_chunk_tp(d.qkva_slots, qstride, lay->q_norm, lay->k_norm,
-                                                    d.kc + (size_t)fsl * d.tp_kv, d.ks + (size_t)fsl * d.tp_kvs, d.vc + (size_t)fsl * d.tp_kv, d.vs + (size_t)fsl * d.tp_kvs,
+                                                    d.kc + d.kv_off[fsl], d.ks + d.kvs_off[fsl], d.vc + Q27_VOFF(d.kv_off[fsl]), d.vs + Q27_VSOFF(d.kvs_off[fsl]),
                                                     d.qh_slots, d.mix_tile, OLb, p0, Cch, 1,
-                                                    d.mixq_slots, d.mixs_slots, lay->o_proj.in_scale, g_att_hpw, g_att_pf, d.attn_pob, d.attn_pml, d.stream)))
+                                                    d.mixq_slots, d.mixs_slots, lay->o_proj.in_scale, g_att_hpw, g_att_pf, d.attn_pob, d.attn_pml, d.stream,
+                                                    g_pf_kvp2p ? &QQ : nullptr)))
                                 { std::fprintf(stderr, "Q27_LS: attn chunk declined (L%d); aborting\n", L); std::exit(1); }
                             lsp(2);
                             // o_proj -> part_slots; nd=1 so the residual share is 1.0, not 1/ndev
@@ -4795,7 +7818,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                     CK(hipMemcpy(vv2, d.qkv_slots + 4096, 16, hipMemcpyDeviceToHost));
                                     std::vector<float> av = q27_d2h_bf16(d.ab_tile, 4);
                                     std::vector<float> zv = q27_d2h_bf16(d.zbuf_slots, 4);
-                                    CK(hipMemcpy(sv, d.S + (size_t)gsl * d.tp_s, 16, hipMemcpyDeviceToHost));
+                                    CK(hipMemcpy(sv, d.S + d.s_off[gsl], 16, hipMemcpyDeviceToHost));
                                     std::vector<float> kv = q27_d2h_bf16(d.qkv_slots + 2048, 2);
                                     std::vector<float> al = q27_d2h_bf16(lay->A_log, 2);
                                     std::vector<float> db = q27_d2h_bf16(lay->dt_bias, 2);
@@ -4809,14 +7832,14 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                 }
                                 if (q27_env_flag("Q27_LS_DBG", false)) { CK(hipStreamSynchronize(d.stream)); std::fprintf(stderr, "LS_DBG ph gemv g=%d k=%d L=%d\n", g, k, L); }
                                 lsp(6);
-                                q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Cch, d.conv + (size_t)gsl * d.tp_conv, lay->conv1d, 0, 1, d.stream);
+                                q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Cch, d.conv + d.conv_off[gsl], lay->conv1d, 0, 1, d.stream);
                                 if (q27_env_flag("Q27_LS_DBG", false) && (L == 1 || L == 2)) {
                                     CK(hipStreamSynchronize(d.stream));
                                     float tv[12];
                                     const int pe = p0 + Cch - 1 - sb;
                                     CK(hipMemcpy(tv, d.qkv_slots + (size_t)pe * QKVLb, 48, hipMemcpyDeviceToHost));
-                                    CK(hipMemcpy(tv + 4, d.S + (size_t)gsl * d.tp_s, 16, hipMemcpyDeviceToHost));
-                                    CK(hipMemcpy(tv + 8, d.S + (size_t)gsl * d.tp_s + 4000, 16, hipMemcpyDeviceToHost));
+                                    CK(hipMemcpy(tv + 4, d.S + d.s_off[gsl], 16, hipMemcpyDeviceToHost));
+                                    CK(hipMemcpy(tv + 8, d.S + d.s_off[gsl] + 4000, 16, hipMemcpyDeviceToHost));
                                     std::fprintf(stderr, "LS_DBG L%d ph-conv qE=%.3f %.3f %.3f %.3f S0=%.4g %.4g %.4g %.4g S4k=%.4g %.4g %.4g %.4g\n",
                                         L, (double)tv[0],(double)tv[1],(double)tv[2],(double)tv[3],
                                         (double)tv[4],(double)tv[5],(double)tv[6],(double)tv[7],
@@ -4828,7 +7851,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                     std::fprintf(stderr, "LS_SDBG gs=%d fs=%d tp_s=%zu tp_kv=%zu L=%d\n",
                                                  gs, fs, d.tp_s, d.tp_kv, L);
                                 (g_pf_gdn_scan2 ? q27_gdn_scan2_tp : q27_gdn_scan_tp)(d.qkv_slots, QKVLb, d.zbuf_slots, ZLb, d.ab_tile, d.bb_tile, Q27_GDN_VH,
-                                                lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + (size_t)gsl * d.tp_s, d.mix_tile, ZLb,
+                                                lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + d.s_off[gsl], d.mix_tile, ZLb,
                                                 0, 1, Cch, d.mixq_tile, d.mixs_tile, lay->out_proj.in_scale, d.stream);
                                 if (q27_env_flag("Q27_LS_DBG", false) && (L == 1 || L == 2)) {
                                     CK(hipStreamSynchronize(d.stream));
@@ -5030,30 +8053,20 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 // ---- hand the prefill state to the decode path, which keeps the TP layout:
                 // copy each layer's full-width KV / GDN-S / conv state from its owner to every
                 // other card at the same (full-size, nd=1-allocated) offsets. One-time ~200 MB.
-                for (int L = 0; L < (export_done ? 0 : nlayer); ++L) {   // skipped when the ring schedule exported early
+                for (int L = 0; L < ((export_done || g_sr) ? 0 : nlayer); ++L) {   // skipped when the ring schedule exported early; Q27_LS_SR: no card decodes a layer it does not own, nothing to hand over
                     const int owner = lay_owner(L);   // rotating layer blocks (Q27_LS_BLK), balanced ownership (Q27_LS_BAL)
                     if (owner == g) continue;
                     const int fsc = L >> 2, gsc = L - fsc;   // pure functions of L
                     if (Q27_IS_FULL(L)) {
-                        CK(hipMemcpyPeerAsync(d.kc + (size_t)fsc * d.tp_kv, d.id,
-                                              D[owner].kc + (size_t)fsc * d.tp_kv, D[owner].id,
-                                              d.tp_kv, d.stream));
-                        CK(hipMemcpyPeerAsync(d.vc + (size_t)fsc * d.tp_kv, d.id,
-                                              D[owner].vc + (size_t)fsc * d.tp_kv, D[owner].id,
-                                              d.tp_kv, d.stream));
-                        CK(hipMemcpyPeerAsync(d.ks + (size_t)fsc * d.tp_kvs, d.id,
-                                              D[owner].ks + (size_t)fsc * d.tp_kvs, D[owner].id,
-                                              d.tp_kvs * 4, d.stream));
-                        CK(hipMemcpyPeerAsync(d.vs + (size_t)fsc * d.tp_kvs, d.id,
-                                              D[owner].vs + (size_t)fsc * d.tp_kvs, D[owner].id,
-                                              d.tp_kvs * 4, d.stream));
+                        // the sweep's prefix only: positions past sw_end hold nothing yet, and the
+                        // old copy moved the whole ctx-sized plane on every request.
+                        // Q27_PF_P2P: nothing to export (see the ring path above).
+                        if (!g_pf_kvp2p) q27_export_kv_quarter(d, D[owner], fsc, sw_beg, sw_end, d.stream);
                     } else {
-                        CK(hipMemcpyPeerAsync(d.S + (size_t)gsc * d.tp_s, d.id,
-                                              D[owner].S + (size_t)gsc * d.tp_s, D[owner].id,
-                                              d.tp_s * 4, d.stream));
-                        CK(hipMemcpyPeerAsync(d.conv + (size_t)gsc * d.tp_conv, d.id,
-                                              D[owner].conv + (size_t)gsc * d.tp_conv, D[owner].id,
-                                              d.tp_conv * 2, d.stream));
+                        CK(hipMemcpyPeerAsync(d.S + d.s_off[gsc], d.id,
+                                              D[owner].S + D[owner].s_off[gsc] + (size_t)q27_tp_shard(g)->gv_h0 * Q27_GDN_D * Q27_GDN_D,
+                                              D[owner].id, d.s_bytes[gsc], d.stream));
+                        q27_copy_conv_quarter(D[owner], d, gsc, g, ndev, false, d.stream);
                     }
                 }
                 // ---- LS finals: the whole head runs on the LAST card; one barrier round shares
@@ -5072,11 +8085,70 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             if (c_last < 0 || c_last >= lschw(nch - 1)) { std::fprintf(stderr, "Q27_LS_Q8: head position outside the last chunk; aborting\n"); std::exit(1); }
                             float* hrow = d.q8s[last_set].hid32c + (size_t)c_last * Q27_HID;
                             const float* pendp32 = d.pend_slots + (size_t)(p - sb) * Q27_HID;
+                            if (q27_env_flag("Q27_LS_FINDBG", false) && g == last_card) {
+                                // The finals read set `last_set`, whose hid32c is written only by the
+                                // job that ran the LAST layer of the LAST chunk. The comment at
+                                // `last_set = (nch-1)&1` says the paired schedule keys it on job
+                                // PARITY, so the two need not agree. Dump BOTH sets: the residual the
+                                // head consumes is h' + pend, so a set that was never written shows up
+                                // as hrow == 0 while its pend is not.
+                                float a[4] = {0,0,0,0}, b4[4] = {0,0,0,0}, c4[4] = {0,0,0,0};
+                                CK(hipMemcpy(a, hrow, sizeof a, hipMemcpyDeviceToHost));
+                                CK(hipMemcpy(b4, pendp32, sizeof b4, hipMemcpyDeviceToHost));
+                                const float* oth = d.q8s[last_set ^ 1].hid32c
+                                                   ? d.q8s[last_set ^ 1].hid32c + (size_t)c_last * Q27_HID : nullptr;
+                                if (oth) CK(hipMemcpy(c4, oth, sizeof c4, hipMemcpyDeviceToHost));
+                                std::fprintf(stderr, "Q27_LS_FINDBG g=%d nch=%d last_set=%d c_last=%d p=%d sw_beg=%d sw_end=%d sb=%d "
+                                             "hid32c_set%d=[%.6f %.6f %.6f %.6f] hid32c_set%d=[%.6f %.6f %.6f %.6f] pend=[%.6f %.6f %.6f %.6f]\n",
+                                             g, nch, last_set, c_last, p, sw_beg, sw_end, sb,
+                                             last_set, (double)a[0],(double)a[1],(double)a[2],(double)a[3],
+                                             last_set ^ 1, (double)c4[0],(double)c4[1],(double)c4[2],(double)c4[3],
+                                             (double)b4[0],(double)b4[1],(double)b4[2],(double)b4[3]);
+                                std::fflush(stderr);
+                            }
+                            // Q27_LS_FIN_BF16=1: reproduce the NON-layer-split finals arithmetic --
+                            // h' rounded to BF16, then BF16 += fp32 pend, then q27_rmsnorm +
+                            // q27_quant_perm -- instead of feeding the fp32 residual straight into
+                            // q27_red_b1 + q27_rmsnorm_hostss_perm. The TP path keeps its residual in
+                            // hidden_slots (BF16) while the LS path keeps it fp32, so the two pipelines
+                            // are NOT the same numerical function; the authoritative token stream
+                            // (tests/reference_tokens.txt) was recorded on the BF16 one.
+                            if (q27_env_flag("Q27_LS_FINAL_COMPLETE", true)) {
+                                // Every LS down epilogue includes S.part with share
+                                // 1.0. pend is therefore the complete layer output.
+                                // Normalize it once, using the existing fp32 RMS
+                                // producer, without another residual add or a host
+                                // round trip for the inverse RMS.
+                                if (!q27_red_rn_perm_b1(pendp32, GL->final_norm, d.norm, nullptr,
+                                        d.xq, d.xs, Q27_HID, 1, GL->lm_head.in_scale, 1, d.stream)) {
+                                    std::fprintf(stderr, "Q27_LS complete final norm declined\n"); std::abort();
+                                }
+                            } else if (q27_env_flag("Q27_LS_FIN_BF16", false)) {
+                                q27_f2bf_vec(hrow, d.norm, Q27_HID, d.stream);
+                                q27_add_inplace(d.norm, pendp32, Q27_HID, d.stream);
+                                q27_rmsnorm(d.norm, GL->final_norm, d.hidden, Q27_HID, 1, d.stream);
+                                q27_quant_perm(d.hidden, d.xq, d.xs, Q27_HID, GL->lm_head.in_scale, d.stream);
+                            } else {
+                            if (q27_env_flag("Q27_FIN_DUMP", false) && g == last_card) {
+                                // the two SUMMANDS, not the sum: h' of the last layer (hid32c) and the
+                                // pending residual, so the discrepancy can be attributed to one of them
+                                static std::vector<float> fh(Q27_HID), fpp(Q27_HID);
+                                CK(hipMemcpy(fh.data(), hrow, (size_t)Q27_HID * 4, hipMemcpyDeviceToHost));
+                                CK(hipMemcpy(fpp.data(), pendp32, (size_t)Q27_HID * 4, hipMemcpyDeviceToHost));
+                                FILE* fp = std::fopen("/tmp/q27_fin_ls_h.bin", "wb");
+                                if (fp) { std::fwrite(fh.data(), 4, Q27_HID, fp); std::fclose(fp); }
+                                fp = std::fopen("/tmp/q27_fin_ls_p.bin", "wb");
+                                if (fp) { std::fwrite(fpp.data(), 4, Q27_HID, fp); std::fclose(fp); }
+                            }
                             q27_add_f32(hrow, pendp32, Q27_HID, d.stream);
                             q27_red_b1(hrow, d.mix3, d.inv_slots + (p - sb), Q27_HID, 1, d.stream);
-                            if (!q27_rmsnorm_hostss_perm(hrow, GL->final_norm, nullptr, nullptr, d.xq, d.xs, Q27_HID, 1,
+                            if (!q27_rmsnorm_hostss_perm(hrow, GL->final_norm, nullptr, d.norm, d.xq, d.xs, Q27_HID, 1,
                                                          GL->lm_head.in_scale, d.inv_slots + (p - sb), d.stream))
                                 { std::fprintf(stderr, "Q27_LS_Q8: final norm declined; aborting\n"); std::exit(1); }
+                            }
+                            // EXL3 needs the bf16 norm, so the hostss call above now emits it
+                            // (it was dropping it into nullptr) instead of only the quantized copy.
+                            if (!exl3_head(d, GL, d.norm, d.pa, 1, d.stream))
                             q27_proj_nvfp4(&GL->lm_head, d.xq, d.xs, d.pa, d.stream);
                             q27_argmax_val(d.pa, d.dtok, d.dval, GL->lm_head.rows, d.stream);
                             CK(hipStreamSynchronize(d.stream));
@@ -5102,6 +8174,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         else             q27_add_inplace(hidp, (const float*)pendp, Q27_HID, d.stream);
                         q27_rmsnorm(hidp, GL->final_norm, d.norm, Q27_HID, 1, d.stream);
                         q27_quant_perm(d.norm, d.xq, d.xs, Q27_HID, GL->lm_head.in_scale, d.stream);
+                        if (!exl3_head(d, GL, d.norm, d.pa, 1, d.stream))
                         q27_proj_nvfp4(&GL->lm_head, d.xq, d.xs, d.pa, d.stream);
                         q27_argmax_val(d.pa, d.dtok, d.dval, GL->lm_head.rows, d.stream);
                         CK(hipStreamSynchronize(d.stream));
@@ -5128,20 +8201,48 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 }
                 if (g == last_card) MS("T6b_finals_done");
                 if (export_done) CK(hipStreamSynchronize(d.hs[1]));   // the overlapped decode-state export must land before decode
-                if (g_spec && g_mtp_pp && g_ls_q8 && g_mtppp[g].ready && sw_end - 1 > sw_beg) {   // Q27_MTP_PP: prompt-condition the draft layer
+                // THE PROMPT CONDITIONING WRITES DRAFT-KV ROWS FOR [sw_beg, sw_end), SO THE DRAFT
+                // CAPACITY HAS TO COVER THE WINDOW. mtp_prompt_pass calls q27_attn_kvprep_nr at
+                // absolute position p0 with no cap check of its own, and d.mtp_cap is PER CARD: a
+                // card that could not fund its paged draft grow keeps a shorter cache than its peers
+                // (measured: card 3 held 65,536 while the others reached 131,072 and the next window
+                // ended at 133,465). Without this gate that card writes ~15 MB past its draft cache
+                // -- silently corrupting whatever the allocator put there and hanging all four ring
+                // threads with no error at all. Skipping the conditioning costs the draft quality for
+                // this window (decode falls back to plain target rounds) and nothing else.
+                const bool mtp_pp_fits = q27_mtp_within_cap(D, ndev, sw_end);
+                // K=0 (non-speculative): the draft layer is never read, so its prompt conditioning is
+                // pure overhead and is skipped -- but only for K=0; the shipped path is unchanged.
+                if (g_spec && g_spec_k > 0 && g_mtp_pp && g_ls_q8 && g_mtppp[g_sr ? g_sr_head : g].ready && sw_end - 1 > sw_beg && mtp_pp_fits) {   // Q27_MTP_PP: prompt-condition the draft layer
                     const double tpp0 = tp_now();
                     C.b1.wait(); C.b2.wait();               // the head card's exports landed before its stream sync above; publish to every card
+                    if (!g_sr || g == g_sr_head) {   // Q27_LS_SR: one draft layer, on the head card
                     mtp_prompt_pass(d, g, sw_beg, sw_end - 1, sb, sw_tok, sw_lo, prompt, emb, Q27_PF_TSLOT);
                     CK(hipMemcpy(d.nr_hprev, g_mtp_hall + (size_t)(sw_end - 1 - sb) * Q27_HID, (size_t)Q27_HID * 2, hipMemcpyHostToDevice));
+                    }
                     d.nr_have_h = 1; d.nr_mtp_base = 0; d.nr_ncatch = 0;   // the first decode step is a speculative round
                     C.b1.wait(); C.b2.wait();
                     g_mtppp[g].t_ms += tp_now() - tpp0; g_mtppp[g].npos += (sw_end - 1 - sw_beg);
                     if (g == 0) std::printf("Q27_MTP_PREFILL positions=%d ms=%.1f\n", sw_end - 1 - sw_beg, tp_now() - tpp0);
                 }
-                if (g == 0) { MS("T6b_sweep_end"); t_prefill = tp_now() - t_sw0; }
+                else if (g_spec && g_spec_k > 0 && g_mtp_pp && g_ls_q8 && g_mtppp[g_sr ? g_sr_head : g].ready && sw_end - 1 > sw_beg && g == 0) {
+                    int worst = 0; for (int q = 0; q < ndev; ++q) if (D[q].mtp_cap < sw_end) { worst = q; break; }
+                    std::fprintf(stderr, "Q27_MTP_PP skipped: card %d draft cap %d < window end %d -- "
+                                         "no draft conditioning for this window (speculation stays off)\n",
+                                 worst, D[worst].mtp_cap, sw_end);
+                    std::fflush(stderr);
+                }
+                if (g == 0) {
+                    std::fprintf(stderr,"Q27_PHASE req=%d phase=prefill edge=end monotonic_ms=%.6f\n",req,tp_now());
+                    MS("T6b_sweep_end"); t_prefill = tp_now() - t_sw0;
+                }
                 if (g_ls_q8 && q8blk < LPP) {   // deferred ring-schedule teardown (after the timing stop; the peers finished their waits at the barrier above)
                     C.b1.wait(); C.b2.wait();
-                    for (size_t i = 0; i < g_ls_evdone[g].size(); ++i) CK(hipEventDestroy(g_ls_evdone[g][i]));
+                    if (q8trace) std::fprintf(stderr, "Q27_Q8_TEARDOWN g=%d nev=%zu ring_late=%zu\n", g, g_ls_evdone[g].size(), ring_late.size());
+                    for (size_t i = 0; i < g_ls_evdone[g].size(); ++i) {
+                        if (q8trace && i < 2) std::fprintf(stderr, "Q27_Q8_DEST g=%d i=%zu e=%p\n", g, i, (void*)g_ls_evdone[g][i]);
+                        CK(hipEventDestroy(g_ls_evdone[g][i]));
+                    }
                     g_ls_evdone[g].clear();
                     for (size_t i = 0; i < ring_late.size(); ++i) CK(hipEventDestroy(ring_late[i]));
                     ring_late.clear();
@@ -5258,6 +8359,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             for (int L = 0; L < nlayer; ++L) {
                 const q27_layer_t* lay = q27_layer_tp(m, L, d.id);
                 if (!lay) { std::fprintf(stderr, "Q27_TP_NOT_RESIDENT layer %d card %d\n", L, g); std::exit(1); }
+                // Q27_TPSR: this layer's MLP shard -> per-row int8 (once per layer per sweep), stream-ordered before its first chunk
+                if (g_tpsr && !tpsr_mlp_view(d, lay, d.stream)) { std::fprintf(stderr, "Q27_TPSR: MLP shard view failed (L%d card %d)\n", L, g); std::exit(1); }
                 // The previous layer's last chunk collective #2 must land in pend_slots before ANY
                 // prologue of this layer reads it: a prompt that fits in one tile has that chunk in
                 // the first tile. One chunk of overlap lost per layer, ordering kept.
@@ -5270,6 +8373,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 // version) left layers 1..63 reading stale pend_slots and broke the tokens.
                 while (ws_n > 0) drain_slice(true);   // the boundary where they MUST be in pend_slots
                 const int isf = Q27_IS_FULL(L);
+                if (g_tpsr_proj_rb && !tpsr_proj_view(d, lay, isf, d.stream)) { std::fprintf(stderr, "Q27_TPSR_PROJ_RB: projection mirror view failed (L%d card %d)\n", L, g); std::exit(1); }
                 const q27_layer_t* nxt = (L + 1 < nlayer) ? q27_layer_tp(m, L + 1, d.id) : nullptr;
                 if (pf_batch && g_rn_epi) {
                     // Q27_PF_WIDE: WHERE THIS CHUNK'S MLP INPUT LIVES. With the tile-wide FFN the
@@ -5333,7 +8437,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             std::fprintf(stderr, "Q27_PF_WIDE: gate+up declined (L%d Cch=%d)\n", L, Cch_all);
                           ++wide_gu_calls;
                           if (!q27_swiglu_quant_b(d.pa_mlp, d.pb_mlp, d.xq2_slots, d.xs2_slots,
-                                                  Q27_INTER / ndev, layx->down.in_scale, Cch_all, d.stream))
+                                                  mlp_len(d.id), layx->down.in_scale, Cch_all, d.stream))
                             std::fprintf(stderr, "Q27_PF_WIDE: swiglu declined (L%d Cch=%d)\n", L, Cch_all);
                           const unsigned short* lradd = g_hostss_neg ? nullptr
                               : (d.hidden_slots + (size_t)(p0 - sb) * Q27_HID);
@@ -5343,6 +8447,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                           ++wide_dn_calls; ++wide_tiles;
                           CK(hipEventRecord(C.ev_w1[g], d.stream));
                           if (g_pf_p2p && g_pf_p2p_mix) {
+                              g_p2p_mix_calls.fetch_add(1, std::memory_order_relaxed);
                               // GPU-resident mixer collective #2: assemble the 4 partial MLP outputs
                               // right after the down kernel. The old path D2H'd here and reduced on the
                               // host one chunk later; pend_slots/inv_slots feed the next layer's input
@@ -5381,7 +8486,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                            Ct, g_pf_wide_kg, d.stream))
                             std::fprintf(stderr, "Q27_PF_WIDE: gate+up declined (L%d Ct=%d kg=%d)\n", L, Ct, g_pf_wide_kg);
                           ++wide_gu_calls;
-                          if (!q27_swiglu_quant_b(d.pa_t, d.pb_t, d.xq2_t, d.xs2_t, Q27_INTER / ndev,
+                          if (!q27_swiglu_quant_b(d.pa_t, d.pb_t, d.xq2_t, d.xs2_t, mlp_len(d.id),
                                                   layx->down.in_scale, Ct, d.stream))
                             std::fprintf(stderr, "Q27_PF_WIDE: swiglu declined (L%d Ct=%d)\n", L, Ct);
                           const unsigned short* wradd = g_hostss_neg ? nullptr
@@ -5421,6 +8526,62 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             std::printf("MLP_M=%d gateup_calls=%d down_calls=%d collective2_width=%d\n",
                                         Ct, 1, 1, Ct);
                         }
+                      } else if (layx->ex_gate.live() && layx->ex_up.live() && layx->ex_down.live()) {
+                        // ---- Q27_EXL3: THE BATCHED PREFILL MLP ON THE RESIDENT TRELLIS ----
+                        // This is the FOURTH MLP path in the engine (M=1 decode, the nr verify
+                        // rows, the layer-split wide sweep, and this batched chunk path), and the
+                        // one the codebase already names at q27_main.cpp's upload comment: a
+                        // dropped NVFP4 gate/up leaves q27_proj_nvfp4_gu_b13 reading w=NULL on the
+                        // first chunk of layer 0 -- the "batched path's small-address fault".
+                        // Structure mirrors the TPSR arm below exactly: expand the bf16 residual,
+                        // norm it, gate/up, swiglu, down, fold the 0.25 residual share. Only the
+                        // three GEMMs and the activation currency differ -- EXL3 rotates its own
+                        // input, so nothing here is quantized.
+                        const Q8Scr& Q = d.q8s[0];
+                        const int Cch = Cch_all;
+                        const int IL = mlp_len(d.id);
+                        const unsigned short* hrow = d.hidden_slots + (size_t)(p0 - sb) * Q27_HID;
+                        auto xdie = [&](const char* w) { std::fprintf(stderr, "Q27_EXL3 prefill MLP: %s declined (L%d card %d M=%d)\n", w, L, g, Cch); std::fflush(stderr); std::exit(1); };
+                        if (!q27_bf16_to_f32(hrow, Q.hid32c, (size_t)Cch * Q27_HID, d.stream)) xdie("residual expand");
+                        void* xw = exl3_ws(d, Q27_EXL3_WMAX, Q27_EXL3_WMAX, Cch);
+                        if (!xw) xdie("workspace");
+                        unsigned short* nb  = q27_exl3_ws_norm(xw, Cch);
+                        unsigned short* act = q27_exl3_ws_act(xw, layx->ex_down.in, Cch, layx->ex_down.out);
+                        if (!q27_exl3_rmsnorm_bf16(Q.hid32c, layx->post_norm, nb, Q27_HID, Cch, Q27_HID, Q27_HID, d.stream)) xdie("post norm");
+                        if (!exl3_f32(d, layx->ex_gate, nb, d.pa_mlp, Cch, d.stream, Q27_HID, IL)) xdie("gate");
+                        if (!exl3_f32(d, layx->ex_up,   nb, d.pb_mlp, Cch, d.stream, Q27_HID, IL)) xdie("up");
+                        if (!q27_exl3_swiglu_bf16(d.pa_mlp, d.pb_mlp, act, IL, Cch, IL, IL, d.stream)) xdie("swiglu");
+                        if (!exl3_f32(d, layx->ex_down, act, d.mixer_slots, Cch, d.stream, IL, Q27_HID)) xdie("down");
+                        if (g_rn_hostss && !g_hostss_neg)
+                            q27_exl3_add_res(d.mixer_slots, hrow, 0.25f, Q27_HID, Cch, Q27_HID, Q27_HID, d.stream);
+                        ++b13_calls;
+                      } else if (g_tpsr && d.tpsr_mlayer == L && d.tpsr_g8r.w && d.tpsr_u8r.w && d.tpsr_d8r.w) {
+                        // ---- Q27_TPSR: THE MLP ON rocBLAS INT8 FROM THE TRANSIENT PER-ROW SHARD ----------
+                        // The same three GEMMs + two epilogues the layer-split sweep runs (ls_q8_layer), on this
+                        // card's 1/ndev rows of gate/up and its K-slice of down, expanded once per layer per sweep
+                        // from the resident block-scaled FP8 (tpsr_mlp_view at the layer head). The per-token
+                        // natural int8 of the post-norm is re-derived from the bf16 residual the post-norm above
+                        // wrote into hidden_slots (VRAM), so the pinned collective result is read once, not twice.
+                        // The down output is this card's K-partial with the 0.25 residual share folded in, exactly
+                        // what the NVFP4 kernels handed collective #2 -- the rest of post_mlp runs unchanged.
+                        const Q8Scr& Q = d.q8s[0];
+                        const int Cch = Cch_all;
+                        const q27_i8r_t* G8 = &d.tpsr_g8r; const q27_i8r_t* U8 = &d.tpsr_u8r; const q27_i8r_t* D8 = &d.tpsr_d8r;
+                        const unsigned short* hrow = d.hidden_slots + (size_t)(p0 - sb) * Q27_HID;
+                        auto tdie = [&](const char* w) { std::fprintf(stderr, "Q27_TPSR prefill MLP: %s declined (L%d card %d M=%d)\n", w, L, g, Cch); std::fflush(stderr); std::exit(1); };
+                        if (!q27_bf16_to_f32(hrow, Q.hid32c, (size_t)Cch * Q27_HID, d.stream)) tdie("residual expand");
+                        const float gate_scale = layx->f8_gate.w ? layx->f8_gate.in_scale : layx->gate.in_scale;
+                        const float down_scale = layx->f8_down.w ? layx->f8_down.in_scale : layx->down.in_scale;
+                        if (!q27_red_rn_tok_b1(Q.hid32c, layx->post_norm, nullptr, Q.xqt, Q.xst, Q27_HID, 1, gate_scale, Cch, 0, d.stream)) tdie("post norm tok");
+                        int* ag = Q.acc; int* au = Q.acc + (size_t)Cch * G8->rows;
+                        if (!q27_rb_gemm_i8g(d.id, G8->w, G8->rows, G8->K, Q.xqt, Cch, ag, G8->gs, d.stream)) tdie("gate gemm");
+                        if (!q27_rb_gemm_i8g(d.id, U8->w, U8->rows, U8->K, Q.xqt, Cch, au, U8->gs, d.stream)) tdie("up gemm");
+                        if (!q27_epi_swiglu_tok_small(ag, au, G8->rows, G8->s, U8->s, 1, Q.xst, G8->alpha, U8->alpha,
+                                                      1.0f / down_scale, Q.xq2, Q.xst2, Cch, d.stream)) tdie("swiglu epilogue");
+                        if (!q27_rb_gemm_i8g(d.id, D8->w, D8->rows, D8->K, Q.xq2, Cch, Q.acc, D8->gs, d.stream)) tdie("down gemm");   // acc reused: the swiglu epilogue consumed ag/au (stream order)
+                        if (!q27_epi_f32r_bf(Q.acc, D8->rows, D8->s, 1, Q.xst2, D8->alpha, d.mixer_slots,
+                                             (g_rn_hostss && !g_hostss_neg) ? hrow : nullptr, 0.25f, Cch, d.stream)) tdie("down epilogue");
+                        ++b13_calls;
                       } else if (!g_pf_wide_noffn) {
                       const bool TLb = (C.ev_pre[0][g] != nullptr);
                       const int tlparb = (int)(C.tl_round[g] & 1);
@@ -5432,8 +8593,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         const int hidx = h0 / Q27_PF_MC;
                         hipStream_t hs_ = (hstr && hidx >= 1 && hidx <= 4) ? d.hs[hidx - 1] : d.stream;
                         signed char* xq1h = pq1 + (size_t)h0 * Q27_HID;   float* xs1h = ps1 + (size_t)h0 * (Q27_HID / 16);
-                        signed char* xq2h = d.xq2_slots + (size_t)h0 * (Q27_INTER / ndev);   float* xs2h = d.xs2_slots + (size_t)h0 * ((Q27_INTER / ndev) / 16);
-                        float* pah = d.pa_mlp + (size_t)h0 * (Q27_INTER / ndev);   float* pbh = d.pb_mlp + (size_t)h0 * (Q27_INTER / ndev);
+                        signed char* xq2h = d.xq2_slots + (size_t)h0 * mlp_len(d.id);   float* xs2h = d.xs2_slots + (size_t)h0 * (mlp_len(d.id) / 16);
+                        float* pah = d.pa_mlp + (size_t)h0 * mlp_len(d.id);   float* pbh = d.pb_mlp + (size_t)h0 * mlp_len(d.id);
                         float* mixh = d.mixer_slots + (size_t)h0 * Q27_HID;
                         if (!(g_pf_mlp14 && q27_proj_nvfp4_gu_b14(&layx->gate, &layx->up, xq1h, xs1h,
                                                                  pah, pbh, Cch, g_pf_mlp14, hs_)) &&
@@ -5464,13 +8625,13 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         q27_proj_nvfp4_gu_b(&layx->gate, &layx->up, xq1h, xs1h,
                                             pah, pbh, Cch, hs_);
                         if (!(g_pf_mlp2 && q27_swiglu_quant_b(pah, pbh, xq2h, xs2h,
-                                                              Q27_INTER / ndev, layx->down.in_scale, Cch, hs_)))
+                                                              mlp_len(d.id), layx->down.in_scale, Cch, hs_)))
                         for (int c = 0; c < Cch; ++c) {
-                            q27_swiglu_quant(pah + (size_t)c * (Q27_INTER / ndev),
-                                             pbh + (size_t)c * (Q27_INTER / ndev),
-                                             xq2h + (size_t)c * (Q27_INTER / ndev),
-                                             xs2h + (size_t)c * ((Q27_INTER / ndev) / 16),
-                                             Q27_INTER / ndev, layx->down.in_scale, hs_);
+                            q27_swiglu_quant(pah + (size_t)c * mlp_len(d.id),
+                                             pbh + (size_t)c * mlp_len(d.id),
+                                             xq2h + (size_t)c * mlp_len(d.id),
+                                             xs2h + (size_t)c * (mlp_len(d.id) / 16),
+                                             mlp_len(d.id), layx->down.in_scale, hs_);
                         }
                         q27_nvfp4_set_res((g_rn_hostss && !g_hostss_neg)
                                               ? (d.hidden_slots + (size_t)(p0 - sb + h0) * Q27_HID) : nullptr, 0.25f);
@@ -5645,7 +8806,31 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                 // Q27_PF_X4W: q/k/v through the WIDE fp8 projection GEMM -- one launch per
                                 // projection at the whole chunk M (128 rows x 64 tokens per block, M in the
                                 // grid), replacing ceil(Qch/8) 8-wide launches.
-                                if (g_pf_x4w && Qch > Q27_PF_MC) {
+                                // This is the ONE wide-fp8 call site that did not read its return
+                                // value. The others are written as `!(g_pf_x4w && wide(...)) &&
+                                // fallback`, so a decline falls through correctly; here a decline
+                                // left q/k/v silently uncomputed. Guard the branch instead, so a
+                                // card whose fp8 originals are gone takes the 8-wide path rather
+                                // than launching a kernel on a null weight pointer.
+                                if (g_tpsr_proj_rb) {
+                                    // ---- Q27_TPSR_PROJ_RB: q/k/v on rocBLAS int8 from the transient per-row
+                                    // mirror stack. The per-token input is re-derived from the bf16 raw residual
+                                    // hidden_slots (exactly post_mlp's precedent), one stacked GEMM (N = qstride)
+                                    // then three per-shard epilogues (each its own mirror alpha/row scales) into
+                                    // an fp32 scratch and one f2bf into qkva_slots. Set 1 scratch, so the MLP's
+                                    // set 0 is untouched under the pipe1 lookahead.
+                                    const Q8Scr& Q1 = d.q8s[1];
+                                    auto tdie = [&](const char* w) { std::fprintf(stderr, "Q27_TPSR_PROJ_RB qkv: %s declined (L%d card %d M=%d)\n", w, L, g, Qch); std::fflush(stderr); std::exit(1); };
+                                    if (!q27_bf16_to_f32(d.hidden_slots + (size_t)(q0 - sb) * Q27_HID, Q1.hid32c, (size_t)Qch * Q27_HID, d.stream)) tdie("residual expand");
+                                    if (!q27_red_rn_tok_b1(Q1.hid32c, lay->input_norm, nullptr, Q1.xqt, Q1.xst, Q27_HID, 1, lay->q_proj.in_scale, Qch, 0, d.stream)) tdie("input norm tok");
+                                    if (!q27_rb_gemm_i8g(d.id, d.tpsr_q8r.w, qstride, Q27_HID, Q1.xqt, Qch, Q1.acc, Q27_HID, d.stream)) tdie("qkv gemm");
+                                    float* F = Q1.mixer;
+                                    if (!q27_epi_f32r_ld(Q1.acc, qstride, QLb, d.tpsr_q8r.s, 1, Q1.xst, d.tpsr_q8r.alpha, F, qstride, Qch, d.stream)) tdie("q epilogue");
+                                    if (!q27_epi_f32r_ld(Q1.acc + QLb, qstride, KVLb, d.tpsr_k8r.s, 1, Q1.xst, d.tpsr_k8r.alpha, F + QLb, qstride, Qch, d.stream)) tdie("k epilogue");
+                                    if (!q27_epi_f32r_ld(Q1.acc + QLb + KVLb, qstride, KVLb, d.tpsr_v8r.s, 1, Q1.xst, d.tpsr_v8r.alpha, F + QLb + KVLb, qstride, Qch, d.stream)) tdie("v epilogue");
+                                    q27_f2bf_vec(F, d.qkva_slots, (size_t)Qch * qstride, d.stream);
+                                } else if (g_pf_x4w && Qch > Q27_PF_MC &&
+                                    lay->q_proj.w && lay->k_proj.w && lay->v_proj.w) {
                                     q27_proj_fp8_wideb(&lay->q_proj, d.xqin_slots, d.xsin_slots, d.qkva_slots, Qch, qstride, g_pf_x4w, d.stream);
                                     q27_proj_fp8_wideb(&lay->k_proj, d.xqin_slots, d.xsin_slots, d.qkva_slots + QLb, Qch, qstride, g_pf_x4w, d.stream);
                                     q27_proj_fp8_wideb(&lay->v_proj, d.xqin_slots, d.xsin_slots, d.qkva_slots + QLb + KVLb, Qch, qstride, g_pf_x4w, d.stream);
@@ -5673,7 +8858,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                 }
                                 if (g_pf_att_chunk &&
                                     q27_attn_chunk_tp(d.qkva_slots, qstride, lay->q_norm, lay->k_norm,
-                                                      d.kc + (size_t)fs * d.tp_kv, d.ks + (size_t)fs * d.tp_kvs, d.vc + (size_t)fs * d.tp_kv, d.vs + (size_t)fs * d.tp_kvs,
+                                                      d.kc + d.kv_off[fs], d.ks + d.kvs_off[fs], d.vc + Q27_VOFF(d.kv_off[fs]), d.vs + Q27_VSOFF(d.kvs_off[fs]),
                                                       d.qh_slots, d.mix_tile, OLb, q0, Qch, ndev,
                                                       d.mixq_slots, d.mixs_slots, lay->o_proj.in_scale, g_att_hpw, g_att_pf, d.attn_pob, d.attn_pml, d.stream)) {
                                     // Q27_PF_ATT_CHUNK: prep / decode / combine(+fused quantize into the chunk slots)
@@ -5690,7 +8875,17 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                                  pout + (size_t)c * Q27_HID, nullptr, nullptr,
                                                  d.mixq_slots + (size_t)c * OLb, d.mixs_slots + (size_t)c * (OLb / 16));
                                 }
-                                if (!(g_pf_x4w && q27_proj_fp8_wide(&lay->o_proj, d.mixq_slots, d.mixs_slots, pout, Qch, Q27_HID,
+                                if (g_tpsr_proj_rb) {
+                                    // ---- Q27_TPSR_PROJ_RB: o_proj on rocBLAS int8. Requant the per-16 mixer to
+                                    // per-token (the one new kernel), GEMM (5120,1536), then the bf16-residual-fold
+                                    // epilogue into pout exactly where the fp8 m2_res3 wrote it.
+                                    const Q8Scr& Q1 = d.q8s[1];
+                                    auto tdie = [&](const char* w) { std::fprintf(stderr, "Q27_TPSR_PROJ_RB o_proj: %s declined (L%d card %d M=%d)\n", w, L, g, Qch); std::fflush(stderr); std::exit(1); };
+                                    if (!q27_requant_g16_tok(d.mixq_slots, d.mixs_slots, Q1.mixq_t, Q1.mixs_t, OLb, OLb, Qch, d.stream)) tdie("mixer requant");
+                                    if (!q27_rb_gemm_i8g(d.id, d.tpsr_o8r.w, d.tpsr_o8r.rows, d.tpsr_o8r.K, Q1.mixq_t, Qch, Q1.acc, d.tpsr_o8r.gs, d.stream)) tdie("o gemm");
+                                    if (!q27_epi_f32r_bf(Q1.acc, d.tpsr_o8r.rows, d.tpsr_o8r.s, 1, Q1.mixs_t, d.tpsr_o8r.alpha, pout,
+                                                         d.hidden_slots + (size_t)(q0 - sb) * Q27_HID, 0.25f, Qch, d.stream)) tdie("o epilogue");
+                                } else if (!(g_pf_x4w && q27_proj_fp8_wide(&lay->o_proj, d.mixq_slots, d.mixs_slots, pout, Qch, Q27_HID,
                                                     d.hidden_slots + (size_t)(q0 - sb) * Q27_HID, Q27_HID, 0.25f, g_pf_x4w, d.stream)) &&
                                     !(g_pf_m2f2 && (g_pf_m2f3 ? q27_proj_fp8_m2_res3 : q27_proj_fp8_m2_res2)(&lay->o_proj, d.mixq_slots, d.mixs_slots, pout, Qch, Q27_HID,
                                                     d.hidden_slots + (size_t)(q0 - sb) * Q27_HID, Q27_HID, 0.25f, g_pf_m2f2, d.stream)) &&
@@ -5725,6 +8920,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                     (double)mq[0],(double)mq[1],(double)mq[2],(double)mq[3]);
                             }
                             if (g_pf_p2p && g_pf_p2p_rn) {
+                                g_p2p_rn_calls.fetch_add(1, std::memory_order_relaxed);
                                 // GPU-resident collective #1: own + peer partials, fused rmsnorm+quant.
                                 for (int k = 0; k < ndev; ++k) if (k != g)
                                     CK(hipStreamWaitEvent(d.stream, C.ev1[par][k], 0));
@@ -5764,8 +8960,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                             d.hidden_slots + (size_t)(p0 - sb) * Q27_HID, nullptr,
                                             pq1, ps1, Q27_HID, 1, lay->gate.in_scale,
                                             C.inv_hbb[par] + (size_t)g * TpColl::BC, Cch, d.stream);
-                            }
-                        } else
+                    }
+                } else
                         if (lay->is_full && !full_serial) {                 // batched q/k/v on top of the batched MLP
                             for (int c = 0; c < Cch; ++c) {
                                 const int p = p0 + c;
@@ -5945,7 +9141,21 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                                              d.xsin_slots + (size_t)c * (Q27_HID / 16),
                                                              nullptr, d.norm_slots + (size_t)c * Q27_HID);
                                             }
-                                            if (!(g_pf_x4w && q27_proj_fp8_wideb(&lay->in_qkv, d.xqin_slots, d.xsin_slots, d.qkv_slots, Ct, QKVLb, g_pf_x4w, d.stream)
+                                            if (g_tpsr_proj_rb) {
+                                                // ---- Q27_TPSR_PROJ_RB: GDN in_qkv/in_z on rocBLAS int8 (stacked [4096][HID]).
+                                                const Q8Scr& Q1 = d.q8s[1];
+                                                auto tdie = [&](const char* w) { std::fprintf(stderr, "Q27_TPSR_PROJ_RB gdn in: %s declined (L%d card %d M=%d)\n", w, L, g, Ct); std::fflush(stderr); std::exit(1); };
+                                                if (!q27_bf16_to_f32(d.hidden_slots + (size_t)(tbq - sb) * Q27_HID, Q1.hid32c, (size_t)Ct * Q27_HID, d.stream)) tdie("residual expand");
+                                                if (!q27_red_rn_tok_b1(Q1.hid32c, lay->input_norm, nullptr, Q1.xqt, Q1.xst, Q27_HID, 1, lay->in_qkv.in_scale, Ct, 0, d.stream)) tdie("input norm tok");
+                                                const int ntot = d.tpsr_iqkv8r.rows + d.tpsr_iz8r.rows;
+                                                if (!q27_rb_gemm_i8g(d.id, d.tpsr_iqkv8r.w, ntot, Q27_HID, Q1.xqt, Ct, Q1.acc, Q27_HID, d.stream)) tdie("iqkv/iz gemm");
+                                                const int iqR = d.tpsr_iqkv8r.rows, izR = d.tpsr_iz8r.rows;
+                                                float* Fq = Q1.mixer; float* Fz = Q1.mixer + (size_t)Ct * iqR;
+                                                if (!q27_epi_f32r_ld(Q1.acc, ntot, iqR, d.tpsr_iqkv8r.s, 1, Q1.xst, d.tpsr_iqkv8r.alpha, Fq, iqR, Ct, d.stream)) tdie("iqkv epilogue");
+                                                if (!q27_epi_f32r_ld(Q1.acc + iqR, ntot, izR, d.tpsr_iz8r.s, 1, Q1.xst, d.tpsr_iz8r.alpha, Fz, izR, Ct, d.stream)) tdie("iz epilogue");
+                                                q27_f2bf_vec(Fq, d.qkv_slots, (size_t)Ct * iqR, d.stream);
+                                                q27_f2bf_vec(Fz, d.zbuf_slots, (size_t)Ct * izR, d.stream);
+                                            } else if (!(g_pf_x4w && q27_proj_fp8_wideb(&lay->in_qkv, d.xqin_slots, d.xsin_slots, d.qkv_slots, Ct, QKVLb, g_pf_x4w, d.stream)
                                                                 && q27_proj_fp8_wideb(&lay->in_z,   d.xqin_slots, d.xsin_slots, d.zbuf_slots, Ct, ZLb, g_pf_x4w, d.stream)) &&
                                                 !(g_pf_mk2r && (g_pf_mk2r2 ? q27_proj_fp8_m2r2 : q27_proj_fp8_m2r)(&lay->in_qkv, d.xqin_slots, d.xsin_slots, d.qkv_slots, Ct, QKVLb, 0, g_pf_mk2r, d.stream)
                                                             && (g_pf_mk2r2 ? q27_proj_fp8_m2r2 : q27_proj_fp8_m2r)(&lay->in_z,   d.xqin_slots, d.xsin_slots, d.zbuf_slots, Ct, ZLb, 0, g_pf_mk2r, d.stream)) &&
@@ -5964,9 +9174,9 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                                 // scan's fused quantize lands the mixers in the tile-wide chunk-slot layout.
                                                 q27_bf16_gemv2_tile(lay->in_a, lay->in_b, d.norm_slots, Q27_HID, d.ab_tile, d.bb_tile,
                                                                     Q27_GDN_VH / ndev, Q27_HID, Ct, d.stream);
-                                                q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Ct, d.conv + (size_t)gs * d.tp_conv, lay->conv1d, g, ndev, d.stream);
+                                                q27_gdn_conv_tp_tile(d.qkv_slots, QKVLb, Ct, d.conv + d.conv_off[gs], lay->conv1d, g, ndev, d.stream);
                                                 (g_pf_gdn_scan2 ? q27_gdn_scan2_tp : q27_gdn_scan_tp)(d.qkv_slots, QKVLb, d.zbuf_slots, ZLb, d.ab_tile, d.bb_tile, Q27_GDN_VH / ndev,
-                                                                lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + (size_t)gs * d.tp_s, d.mix_tile, ZLb,
+                                                                lay->A_log, lay->dt_bias, lay->gdn_norm, d.S + d.s_off[gs], d.mix_tile, ZLb,
                                                                 g, ndev, Ct, d.mixq_tile, d.mixs_tile, lay->out_proj.in_scale, d.stream);
                                                 C.pre_in[g] = 0;
                                             }
@@ -5986,7 +9196,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                                         }
                                         const signed char* mq = g_pf_gdn_scan ? d.mixq_tile + (size_t)(q0 - tbq) * ZLb : d.mixq_slots;
                                         const float*       ms = g_pf_gdn_scan ? d.mixs_tile + (size_t)(q0 - tbq) * (ZLb / 16) : d.mixs_slots;
-                                        if (!(g_pf_x4w && q27_proj_fp8_wide(&lay->out_proj, mq, ms, pout, Qch, Q27_HID,
+                                        if (g_tpsr_proj_rb) {
+                                            // ---- Q27_TPSR_PROJ_RB: GDN out_proj on rocBLAS int8 (same pattern as o_proj).
+                                            const Q8Scr& Q1 = d.q8s[1];
+                                            auto tdie = [&](const char* w) { std::fprintf(stderr, "Q27_TPSR_PROJ_RB gdn out: %s declined (L%d card %d M=%d)\n", w, L, g, Qch); std::fflush(stderr); std::exit(1); };
+                                            if (!q27_requant_g16_tok(mq, ms, Q1.mixq_t, Q1.mixs_t, ZLb, ZLb, Qch, d.stream)) tdie("mixer requant");
+                                            if (!q27_rb_gemm_i8g(d.id, d.tpsr_op8r.w, d.tpsr_op8r.rows, d.tpsr_op8r.K, Q1.mixq_t, Qch, Q1.acc, d.tpsr_op8r.gs, d.stream)) tdie("out gemm");
+                                            if (!q27_epi_f32r_bf(Q1.acc, d.tpsr_op8r.rows, d.tpsr_op8r.s, 1, Q1.mixs_t, d.tpsr_op8r.alpha, pout,
+                                                                 (!g_hostss_neg) ? (d.hidden_slots + (size_t)(q0 - sb) * Q27_HID) : nullptr, 0.25f, Qch, d.stream)) tdie("out epilogue");
+                                        } else if (!(g_pf_x4w && q27_proj_fp8_wide(&lay->out_proj, mq, ms, pout, Qch, Q27_HID,
                                                             (!g_hostss_neg) ? (d.hidden_slots + (size_t)(q0 - sb) * Q27_HID) : nullptr,
                                                             Q27_HID, 0.25f, g_pf_x4w, d.stream)) &&
                                             !(g_pf_m2f2 && (g_pf_m2f3 ? q27_proj_fp8_m2_res3 : q27_proj_fp8_m2_res2)(&lay->out_proj, mq, ms, pout, Qch, Q27_HID,
@@ -6276,6 +9494,20 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             // asks for it.
             const q27_globals_t* G = q27_globals(m, d.id);
             const bool head_all = swpl || (orc != nullptr);
+            if (g_tpsr && g_spec && g_spec_k > 0 && g_mtp_pp && g_mtp_hall && g_mtppp[g].ready) {
+                // ---- Q27_TPSR / Q27_MTP_PP: every prompt position's FINAL residual -> the pinned hall, with the
+                // finals' own arithmetic (bf16 hidden of layer 63 + its collective-#2 result), BEFORE the finals
+                // below fold the last position in place. The layer-split ring exports the same quantity per chunk. ----
+                MtpPP& P = g_mtppp[g];
+                for (int p0 = sw_beg; p0 < sw_end; p0 += Q27_PF_TSLOT) {
+                    const int Cp = (sw_end - p0 < Q27_PF_TSLOT) ? (sw_end - p0) : Q27_PF_TSLOT;
+                    if (!q27_bf16_to_f32(d.hidden_slots + (size_t)(p0 - sb) * Q27_HID, P.fin32, (size_t)Cp * Q27_HID, d.stream)) { std::fprintf(stderr, "Q27_TPSR: hall expand declined\n"); std::exit(1); }
+                    q27_add_f32(P.fin32, d.pend_slots + (size_t)(p0 - sb) * Q27_HID, Cp * Q27_HID, d.stream);
+                    q27_f2bf_vec(P.fin32, P.finbf, Cp * Q27_HID, d.stream);
+                    CK(hipMemcpyAsync(g_mtp_hall + (size_t)(p0 - sb) * Q27_HID, P.finbf, (size_t)Cp * Q27_HID * 2, hipMemcpyDeviceToHost, d.stream));
+                    CK(hipStreamSynchronize(d.stream));   // fin32/finbf are reused by the next tile
+                }
+            }
             for (int p = head_all ? sw_beg : sw_end - 1; p < sw_end; ++p) {
                 const double t0 = tp_now();
                 unsigned short* hidp = d.hidden_slots + (size_t)(p - sb) * Q27_HID;
@@ -6289,6 +9521,16 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         (double)h0[4],(double)h0[5],(double)h0[6],(double)h0[7],
                         (double)p0[0],(double)p0[1],(double)p0[2],(double)p0[3],
                         (double)p0[4],(double)p0[5],(double)p0[6],(double)p0[7]);
+                }
+                if (q27_env_flag("Q27_FIN_DUMP", false) && g == 0) {
+                    // the same two summands on the authoritative (BF16) arm
+                    std::vector<float> fh = q27_d2h_bf16(hidp, Q27_HID);
+                    static std::vector<float> fpp(Q27_HID);
+                    CK(hipMemcpy(fpp.data(), pendp, (size_t)Q27_HID * 4, hipMemcpyDeviceToHost));
+                    FILE* fp = std::fopen("/tmp/q27_fin_tp_h.bin", "wb");
+                    if (fp) { std::fwrite(fh.data(), 4, Q27_HID, fp); std::fclose(fp); }
+                    fp = std::fopen("/tmp/q27_fin_tp_p.bin", "wb");
+                    if (fp) { std::fwrite(fpp.data(), 4, Q27_HID, fp); std::fclose(fp); }
                 }
                 if (g_coll_bf16) q27_add_inplace_bf16(hidp, (const unsigned short*)pendp, Q27_HID, d.stream);
                 else             q27_add_inplace(hidp, (const float*)pendp, Q27_HID, d.stream);
@@ -6306,10 +9548,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             else             q27_add_inplace(hidc, (const float*)pendc, Q27_HID, d.stream);
                             q27_rmsnorm(hidc, G->final_norm, d.norm, Q27_HID, 1, d.stream);
                         }
+                        // d.norm is reused per slot, so the bf16 EXL3 wants is copied
+                        // into the per-slot buffer the batched head reads.
+                        if (G->ex_head.live())
+                            CK(hipMemcpyAsync(d.norm_slots + (size_t)c * Q27_HID, d.norm, (size_t)Q27_HID * 2, hipMemcpyDeviceToDevice, d.stream));
                         q27_quant_perm(d.norm, d.xq_slots + (size_t)c * Q27_HID,
                                        d.xs_slots + (size_t)c * (Q27_HID / 16),
                                        Q27_HID, G->lm_head.in_scale, d.stream);
                     }
+                    if (!exl3_head(d, G, d.norm_slots, d.pa_slots, Cch, d.stream))
                     q27_proj_nvfp4_b(&G->lm_head, d.xq_slots, d.xs_slots, d.pa_slots, Cch, d.stream);
                     for (int c = 0; c < Cch; ++c) {
                         q27_argmax_val(d.pa_slots + (size_t)c * G->lm_head.rows, d.dtok, d.dval,
@@ -6319,7 +9566,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         CK(hipMemcpy(&li, d.dtok, 4, hipMemcpyDeviceToHost));
                         CK(hipMemcpy(&lv, d.dval, 4, hipMemcpyDeviceToHost));
                         C.hval[g] = lv;
-                        C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li);
+                        C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);
                         C.b1.wait();
                         unsigned nx = C.hidx[0]; float bv = C.hval[0];
                         for (int k = 1; k < ndev; ++k)
@@ -6340,14 +9587,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     continue;
                 }
                 q27_quant_perm(d.norm, d.xq, d.xs, Q27_HID, G->lm_head.in_scale, d.stream);
-                q27_proj_nvfp4(&G->lm_head, d.xq, d.xs, d.pa, d.stream);
+                if (!exl3_head(d, G, d.norm, d.pa, 1, d.stream))
+                        q27_proj_nvfp4(&G->lm_head, d.xq, d.xs, d.pa, d.stream);
                 q27_argmax_val(d.pa, d.dtok, d.dval, G->lm_head.rows, d.stream);
                 CK(hipStreamSynchronize(d.stream));
                 unsigned li; float lv;
                 CK(hipMemcpy(&li, d.dtok, 4, hipMemcpyDeviceToHost));
                 CK(hipMemcpy(&lv, d.dval, 4, hipMemcpyDeviceToHost));
                 C.hval[g] = lv;
-                C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li);
+                C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);
                 C.b1.wait();
                 unsigned nx = C.hidx[0]; float bv = C.hval[0];
                 for (int k = 1; k < ndev; ++k)
@@ -6364,7 +9612,38 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 C.b1.wait();       // every card leaves the position with the same tok/pi/done
                 C.b2.wait();
             }
-            if (g == 0) { MS("T6b_sweep_end"); t_prefill = tp_now() - t_sw0; }   // the WHOLE prompt phase
+            if (g_tpsr && g_spec && g_spec_k > 0 && g_mtp_pp && g_mtp_hall && g_mtppp[g].ready && sw_end - 1 > sw_beg) {
+                // ---- Q27_TPSR / Q27_MTP_PP: prompt-condition the (replicated) draft layer on every card from the hall,
+                // exactly as the layer-split sweep does after its ring; gated on the draft KV cap of EVERY card. ----
+                const bool mtp_pp_fits = q27_mtp_within_cap(D, ndev, sw_end);
+                if (mtp_pp_fits) {
+                    const double tpp0 = tp_now();
+                    C.b1.wait(); C.b2.wait();
+                    mtp_prompt_pass(d, g, sw_beg, sw_end - 1, sb, sw_tok, sw_lo, prompt, emb, Q27_PF_TSLOT);
+                    CK(hipMemcpy(d.nr_hprev, g_mtp_hall + (size_t)(sw_end - 1 - sb) * Q27_HID, (size_t)Q27_HID * 2, hipMemcpyHostToDevice));
+                    d.nr_have_h = 1; d.nr_mtp_base = 0; d.nr_ncatch = 0;   // the first decode step is a speculative round
+                    C.b1.wait(); C.b2.wait();
+                    g_mtppp[g].t_ms += tp_now() - tpp0; g_mtppp[g].npos += (sw_end - 1 - sw_beg);
+                    if (g == 0) std::printf("Q27_MTP_PREFILL positions=%d ms=%.1f\n", sw_end - 1 - sw_beg, tp_now() - tpp0);
+                } else if (g == 0) {
+                    int worst = 0; for (int q = 0; q < ndev; ++q) if (D[q].mtp_cap < sw_end) { worst = q; break; }
+                    std::fprintf(stderr, "Q27_MTP_PP skipped: card %d draft cap %d < window end %d -- "
+                                         "no draft conditioning for this window (speculation stays off)\n",
+                                 worst, D[worst].mtp_cap, sw_end);
+                    std::fflush(stderr);
+                }
+            }
+            if (g == 0) {
+                std::fprintf(stderr, "Q27_PHASE req=%d phase=prefill edge=end monotonic_ms=%.6f\n", req, tp_now());
+                MS("T6b_sweep_end"); t_prefill = tp_now() - t_sw0;   // the WHOLE prompt phase
+                // WHICH COLLECTIVE ACTUALLY RAN. host=0 with p2p>0 means the prefill was
+                // GPU-resident end to end; host>0 with p2p=0 means the flag was inert and any
+                // throughput quoted against it is the host-staged number wearing a P2P label.
+                std::printf("Q27_COLL_PROOF p2p_rn=%lld p2p_mix=%lld host=%lld\n",
+                            g_p2p_rn_calls.load(), g_p2p_mix_calls.load(),
+                            g_host_coll_calls.load());
+                std::fflush(stdout);
+            }
             if (g == 0) std::printf("Q27_SWEEP_COLL positions=%d collectives=%lld host_coll_ms=%.1f  "
                                     "(pipelined: event_wait %.1f reduce %.1f ms; unpipelined phases need Q27_COLL_PROF=1; card 0)\n",
                                     nwin, (long long)C.n_coll[g], C.t_coll[g], C.c_d2h[g], C.c_red[g]);
@@ -6379,18 +9658,60 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             }   // !g_ls: the layer-major TP sweep above stays the frozen default
         }
 
+        // PREFILL-ONLY REQUEST: the sweep above has written KV and recurrent state for exactly these
+        // positions, and the caller's next request is the REST OF THE SAME PROMPT. Skipping decode
+        // here is what keeps pos_cur equal to the number of positions the caller handed over -- no
+        // generated tokens inside the prompt, so every later step lands where it belongs. `done` is
+        // shared by all four card threads and every card reaches this line with the same flag.
+        if (req_pf_only) done = true;
         int pos = pos0;
+        bool ck_pf_done = false;            // Q27_REWIND_CK: post-prefill bank taken once per request
         for (; pos < ctx && !done; ++pos) {
             const bool is_decode = (pi >= prompt.size());
+            g_timeline_req = req; g_timeline_pos = pos;
+            g_timeline_sample = getenv("Q27_TIMELINE_ROOT") && is_decode && n_rounds >= 2 && n_rounds < 5;
+            // Q27_REWIND_CK: THE PREFILL->DECODE BOUNDARY IS THE CHECKPOINT THAT MATTERS. A client
+            // that re-renders the previous assistant turn -- the reasoning-block case this server
+            // already works to avoid -- diverges exactly HERE: at the position where the prompt
+            // ended and generation began. A bank taken at the request's start is therefore always
+            // too early (measured: divergence at 6122 with the only bank at 0) and one taken at its
+            // end is always too late, because the generated tokens are what the client replaced.
+            // Queued on d.stream without a sync: stream order already puts this copy ahead of the
+            // decode kernels that overwrite d.S, and a rewind does its own synchronise.
+            if (is_decode && !ck_pf_done && q27_rewind_ck() > 0) {
+                ck_pf_done = true;
+                const int cks = (req * 2 + 1) % q27_rewind_ck();
+                CK(hipMemcpyAsync(d.ck_S + (size_t)cks * (d.s_bytes_total / sizeof(float)), d.S,
+                                  d.s_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                CK(hipMemcpyAsync(d.ck_conv + (size_t)cks * (d.conv_bytes_total / sizeof(unsigned short)),
+                                  d.conv, d.conv_bytes_total, hipMemcpyDeviceToDevice, d.stream));
+                if (g == 0) g_ck_pos[cks] = pos;
+            }
             const double t0 = tp_now();
+            if (g == 0) std::fprintf(stderr, "Q27_PHASE req=%d phase=%s edge=begin pos=%d monotonic_ms=%.6f\n", req, is_decode ? "decode" : "prefill-tail", pos, t0);
             double mark = t0;
             if (g_tp_lead) g_tpev[g].token_start(d.stream);   // stream idle: previous token drained
             // ---- Q27_SPEC: a speculative round (draft 1, verify 2 rows) replaces the plain step ----
             unsigned nx = 0;
             int sp_ncommit = 0; unsigned sp_tok[8] = {0u,0u,0u,0u,0u,0u,0u,0u};
-            const bool sp_round = (g_spec && !g_sampler && is_decode && d.nr_have_h && pos + g_spec_k < ctx);   // greedy only
+            // K=0 (Q27_SPEC_K=0, the NON-SPECULATIVE measurement configuration): a round still runs,
+            // but it is one trunk row with no draft, so it must NOT depend on draft state. nr_have_h
+            // is the "h_prev captured" flag the draft consumes, and q27_mtp_within_cap is a draft-KV
+            // bound; neither is reachable at K=0, and requiring them would silently drop K=0 back
+            // into the plain Q27_SPEC=0 path (which is not a working configuration).
+            // LEAVE THE DRAFT BEHIND WITHOUT LEAVING THE ROW PATH. The draft KV is a per-card bound, so
+            // a long generation walks out of it (measured: cap 65,536, position 65,388). Dropping to
+            // the plain step there is what faulted the GPU -- see the spec_round comment. Degrade to
+            // K=0 instead: no draft, no MTP pass, NR=1 trunk row through the shipped int8 row path.
+            int eff_k = g_spec_k;
+            if (g_spec && !g_sampler && is_decode && eff_k > 0 &&
+                !(d.nr_have_h && q27_mtp_within_cap(D, ndev, pos + eff_k)))
+                eff_k = 0;
+            const bool sp_round = (g_spec && !g_sampler && is_decode && (eff_k == 0 || d.nr_have_h)
+                                   && pos + eff_k < ctx);   // greedy only, and only where every card's draft cache can hold these positions
             if (sp_round) {
-                sp_ncommit = spec_round(d, m, emb, nlayer, pos, tok, g, ndev, C, &mark, sp_tok);
+                sp_ncommit = g_sr ? spec_round_sr(d, m, emb, nlayer, pos, tok, g, ndev, C, &mark, sp_tok, eff_k)
+                                  : spec_round(d, m, emb, nlayer, pos, tok, g, ndev, C, &mark, sp_tok, eff_k);
                 nx = sp_tok[sp_ncommit - 1];
             } else {
             // embedding: the same 10 KiB row H2D on every card, straight out of the mmap
@@ -6465,7 +9786,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 d.nr_have_h = 1;
             }
             q27_quant_perm(d.norm, d.xq, d.xs, Q27_HID, G->lm_head.in_scale, d.stream);
-            q27_proj_nvfp4(&G->lm_head, d.xq, d.xs, d.pa, d.stream);
+            if (!exl3_head(d, G, d.norm, d.pa, 1, d.stream))
+                        q27_proj_nvfp4(&G->lm_head, d.xq, d.xs, d.pa, d.stream);
             // nx: declared before the Q27_SPEC branch
             if (g_sampler) {
                 // Gather this card's 62080-logit shard into the shared pinned buffer, then let b1
@@ -6492,7 +9814,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             C.t_comp[g] += tp_now() - mark;
             const double tc0 = tp_now();
             C.hval[g] = lv;
-            C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li);   // GLOBAL id
+            C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);   // GLOBAL id
             C.b1.wait();
             nx = C.hidx[0]; float bv = C.hval[0];
             for (int k = 1; k < ndev; ++k)                       // ties -> lowest global index
@@ -6538,7 +9860,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     CK(hipMemcpy(&lv, d.dval, 4, hipMemcpyDeviceToHost));
                     const double t_d = tp_now();
                     C.hval[g] = lv;
-                    C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li);
+                    C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);
                     C.b1.wait();
                     unsigned dt = C.hidx[0]; float dv = C.hval[0];
                     for (int k = 1; k < ndev; ++k)
@@ -6606,7 +9928,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                             CK(hipMemcpy(&li2, d.dtok, 4, hipMemcpyDeviceToHost));
                             CK(hipMemcpy(&lv2, d.dval, 4, hipMemcpyDeviceToHost));
                             C.hval[g] = lv2;
-                            C.hidx[g] = (unsigned)((long long)g * G->lm_head.rows + (long long)li2);
+                            C.hidx[g] = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li2);
                             C.b1.wait();
                             unsigned dt2 = C.hidx[0]; float dv2 = C.hval[0];
                             for (int k2 = 1; k2 < ndev; ++k2)
@@ -6649,13 +9971,15 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             }
 
             }   // !sp_round
+            g_plain_warmed = true;
             if (g_tp_profile) g_tpev[g].drain_into(g_tpf[g]);   // stream is idle here
             const double dt = tp_now() - t0;
+            if (g == 0) std::fprintf(stderr, "Q27_PHASE req=%d phase=%s edge=end pos=%d monotonic_ms=%.6f\n", req, is_decode ? "decode" : "prefill-tail", pos, t0 + dt);
             C.t_wall[g] += dt;                       // EVERY card, not just card 0
             if (g == 0) {
                 if (is_decode) {
-                    if (n_decode == 0) MS("T7_decode_begin");
-                    t_decode += dt; n_decode += sp_round ? sp_ncommit : 1;
+                    if (n_decode == 0) { MS("T7_decode_begin"); q27_lk_reset(); lk_skipped = 1; }
+                    t_decode += dt; n_decode += sp_round ? sp_ncommit : 1; ++n_rounds;
                     if ((n_decode & 7) == 0) {          // cadence every 8 tokens
                         char tg[32]; std::snprintf(tg, sizeof tg, "T8_decode_%d", n_decode);
                         MS(tg);
@@ -6664,7 +9988,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                     if (t_prefill == 0) MS("T6_prefill_begin");
                     t_prefill += dt;
                 }
-                if (!g_serve && pi >= prompt.size() && !d.pf_released) {   // prefill done: the sweep scratch dies, decode keeps only the NR row buffer
+                if (!g_serve && !q27_env_flag("Q27_KEEP_PF_BUFFERS", false)
+                    && pi >= prompt.size() && !d.pf_released) {   // optional standalone scratch shrink; the service retains these buffers
                     CK(hipStreamSynchronize(d.stream));
                     if (d.pend_slots) { CK(hipFree(d.pend_slots)); d.pend_slots = nullptr; }
                     if (d.hidden_slots) { CK(hipFree(d.hidden_slots)); d.hidden_slots = nullptr; }
@@ -6694,15 +10019,211 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
             C.b2.wait();
             if (sp_round) pos += sp_ncommit - 1;   // Q27_SPEC: the round committed sp_ncommit positions
         }
+        // Decode updates TP quarters while LS prefill reads full owner state. Join the
+        // producers, then gather updated quarters once at the request boundary. No device
+        // synchronize; the adapter maps co-resident workers to D2D on nonblocking streams.
+        if (g_ls && !g_sr && pos > pos0) {
+            CK(hipEventRecord(d.ev_state_ready, d.stream));
+            C.b1.wait(); C.b2.wait();
+            for (int peer = 0; peer < ndev; ++peer) if (peer != g) {
+                CK(hipStreamWaitEvent(d.stream, D[peer].ev_state_ready, 0));
+                for (int L = 0; L < nlayer; ++L) {
+                    if (!q27_ls_owned(L, g, ndev)) continue;
+                    const int fs = L >> 2, gs = L - fs;
+                    if (Q27_IS_FULL(L)) {
+                        if (!g_pf_kvp2p) q27_gather_kv_quarter(d, D[peer], fs, pos0, pos, d.stream);
+                    } else {
+                        const size_t count = (size_t)q27_tp_shard(peer)->VHL * Q27_GDN_D * Q27_GDN_D;
+                        CK(hipMemcpyPeerAsync(d.S + d.s_off[gs] + (size_t)q27_tp_shard(peer)->gv_h0 * Q27_GDN_D * Q27_GDN_D, d.id,
+                            D[peer].S + D[peer].s_off[gs], D[peer].id, count * sizeof(float), d.stream));
+                        q27_copy_conv_quarter(d, D[peer], gs, peer, ndev, true, d.stream);
+                    }
+                }
+            }
+            CK(hipStreamSynchronize(d.stream));
+            C.b1.wait(); C.b2.wait();
+        }
         pos_cur = pos;
+        C.b1.wait();
+        if(g==0){q27_transfer_receipt(req,false);char label[64];snprintf(label,sizeof label,"req%d-pos%d",req,pos_cur);q27_memory_receipt(label);}
+        C.b2.wait();
+        if(q27_env_flag("Q27_VALIDATE_STATE",false)) {
+            unsigned* flags=nullptr; unsigned bad[5]={0};
+            CK(hipMalloc((void**)&flags,sizeof bad));CK(hipMemsetAsync(flags,0,sizeof bad,d.stream));
+            q27_finite_check(d.S,d.s_bytes_total/4,0,flags,0,d.stream);
+            q27_finite_check(d.conv,d.conv_bytes_total/2,1,flags,1,d.stream);
+            for(int fs=0;fs<Q27_LAYERS/4;++fs) {
+                const size_t count=(size_t)pos_cur*(size_t)(d.kv_rowstride[fs]/16);
+                q27_finite_check(d.ks+d.kvs_off[fs],count,2,flags,2,d.stream);
+                q27_finite_check(d.vs+Q27_VSOFF(d.kvs_off[fs]),Q27_VSOFF(count),2,flags,2,d.stream);
+            }
+            q27_finite_check(d.nr_pa,(size_t)8*Q27_VOCAB,0,flags,3,d.stream);
+            q27_finite_check(d.pa,Q27_VOCAB,0,flags,3,d.stream);
+            q27_finite_check(d.hidden_slots,(size_t)8*Q27_HID,1,flags,4,d.stream);
+            CK(hipMemcpyAsync(bad,flags,sizeof bad,hipMemcpyDeviceToHost,d.stream));
+            CK(hipStreamSynchronize(d.stream));CK(hipFree(flags));
+            std::fprintf(stderr,"Q27_FINITE req=%d logical=%d pos=%d state=%u conv=%u kvscale=%u logits_scratch=%u hidden=%u\n",req,g,pos_cur,bad[0],bad[1],bad[2],bad[3],bad[4]);
+            if(bad[0]||bad[1]||bad[2]||bad[3]||bad[4]){std::fprintf(stderr,"FATAL nonfinite state\n");std::abort();}
+        }
+        C.b1.wait();C.b2.wait();
+        g_timeline_sample = false;
+        if (!g_coll_points.empty()) {
+            char name[2048]; std::snprintf(name,sizeof name,"%s/collective-req%d-logical%d.tsv",getenv("Q27_TIMELINE_ROOT"),req,g);
+            FILE* f=std::fopen(name,"w");
+            if (!f) { std::fprintf(stderr,"Cannot write collective timeline\n");std::abort(); }
+            std::fprintf(f,"request\tposition\tsite\tproducer_observed_ms\tstaged_ms\tall_arrived_ms\treduced_ms\tpublished_ms\treturned_ms\n");
+            for (const auto& v:g_coll_points) std::fprintf(f,"%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",v.req,v.pos,v.site,v.enter,v.staged,v.arrived,v.reduced,v.published,v.returned);
+            std::fclose(f);g_coll_points.clear();
+        }
+        // the tokens this request GENERATED are resident too, and they are part of what the next
+        // render has to match; without them the LCP would falsely stop at the end of the prompt
+        if (g == 0 && lcp_on && !out.empty()) lcp_hist.insert(lcp_hist.end(), out.begin(), out.end() - 1);
         if (!g_serve) break;
         if (g == 0) {
             if (g_text) { std::printf("\n"); std::fflush(stdout); }
             const double ttft = t_prefill;      // the sweep computes the first token at its last position
-            std::printf("Q27_REQ %d prompt_tokens=%d prefill_ms=%.1f ttft_ms=%.1f gen_tokens=%d decode_ms_per_tok=%.3f "
-                        "decode_tok_s=%.2f pos_end=%d\n", req, (int)(req == 0 ? prompt.size() : req_ids.size()),
-                        t_prefill, ttft, (int)out.size(), n_decode ? t_decode / n_decode : 0.0,
-                        (n_decode && t_decode > 0) ? 1000.0 * n_decode / t_decode : 0.0, pos_cur);
+            // PER-REQUEST DECODE LEDGER (Q27_TP_PROFILE=1). The end-of-run report at the bottom of
+            // this function only fires when the engine EXITS, so in serve mode it never printed and
+            // the ledger was unreachable from real Harness traffic. Dump it per request instead and
+            // zero the accumulators, so every Harness turn yields its own attribution.
+            // ATTRIBUTION ONLY: each stage is measured with its own hipEvent pair, the stream still
+            // pipelines, and overlapping stages double-count -- the SHARES rank the work, the total
+            // is not a token time. Never quote a tok/s from this.
+            // COMBINE NUMERICS GATE (Q27_VGATE=1). Reports what a bf16 partial payload WOULD cost,
+            // measured on this request's real data: the combine accumulated the same sum twice,
+            // once from the fp32 partials and once from those partials round-tripped through bf16,
+            // and kept the worst relative deviation of the final gated output. Run this BEFORE
+            // narrowing q27_attn_part_o, not after.
+            if (q27_env_flag("Q27_VGATE", false) && n_decode > 0) {
+                float vmx = 0.f, vref = 0.f; q27_vgate_read(&vmx, &vref, 1);
+                std::fprintf(stderr, "Q27_VGATE req=%d steps=%d max_abs_dev=%.3e scale=%.3e rel_linf=%.3e "
+                                     "(bf16 partials vs fp32, real data, card 0)\n",
+                             req, n_decode, (double)vmx, (double)vref,
+                             vref > 0.f ? (double)(vmx / vref) : 0.0);
+            }
+            if (g_tp_profile && n_decode > 0) {
+                int crit = 0; double best = -1;
+                for (int gg = 0; gg < ndev; ++gg) { double s = 0;
+                    for (int b = 0; b < TPF_N; ++b) s += g_tpf[gg][b];
+                    if (s > best) { best = s; crit = gg; } }
+                std::fprintf(stderr, "Q27_DECLEDGER req=%d steps=%d card=%d (attribution only, shares rank the work)\n",
+                            req, n_decode, crit);
+                for (int b = 0; b < TPF_N; ++b)
+                    std::fprintf(stderr, "Q27_DECLEDGER   %-20s %8.4f ms/token  %5.1f%%\n", TPF_NAME[b],
+                                g_tpf[crit][b] / n_decode, best > 0 ? 100.0 * g_tpf[crit][b] / best : 0.0);
+                std::fprintf(stderr, "Q27_DECLEDGER   %-20s %8.4f ms/token\n", "profiled sum", best / n_decode);
+                for (int gg = 0; gg < ndev; ++gg) for (int b = 0; b < TPF_N; ++b) g_tpf[gg][b] = 0;
+            }
+            {   // E2 (2026-09-17): the generated-token stream's identity, on the request line.
+                // FNV-1a over the ids this request produced. A TELEMETRY IDENTIFIER, NOT A GATE:
+                // two requests with the same prompt and the same engine state must report the same
+                // tokhash, because the shipped decode is greedy (Q27_TEMP unset -> device argmax).
+                // A differing hash is the observation that localizes a state defect; it never
+                // decides whether an answer is right.
+                unsigned long long th = 1469598103934665603ULL;
+                for (unsigned t : out) { th ^= (unsigned long long)t; th *= 1099511628211ULL; }
+                const char* fin = req_pf_only ? "prefill"
+                                : ((int)out.size() >= req_maxn ? "length" : "stop");
+                const long rq_dr = d.nr_drafts - rq_drafts0;
+                // TRANSPORT RECEIPT. host/p2p are this request's site counts, differenced from the
+                // counters the two transport implementations increment themselves. nr is the row
+                // count a site actually saw. These three make the arm self-evidencing: a "P2P arm"
+                // whose p2p= stays 0 never happened, whatever the environment claimed.
+                const long cs_h = g_coll_host_sites[g] - rq_collh0;
+                const long cs_1 = g_coll_p2p_sites[g][1] - rq_collp0[1];
+                const long cs_2 = g_coll_p2p_sites[g][2] - rq_collp0[2];
+                const long cs_3 = g_coll_p2p_sites[g][3] - rq_collp0[3];
+                const long cs_4 = g_coll_p2p_sites[g][4] - rq_collp0[4];
+                if (g_nr_p2p == 4 && C.nrp_err[g] && C.nrp_err[g][0]) {   // an LL word never arrived: the reduce proceeded on stale data
+                    std::fprintf(stderr, "FATAL Q27_NR_P2P=4 card %d: spin timeout at seq %u (word %u, peer slot %u, saw seq %u); the request's output is invalid. Aborting.\n",
+                                 g, C.nrp_err[g][0], C.nrp_err[g][1], C.nrp_err[g][2], C.nrp_err[g][3]);
+                    std::abort();
+                }
+                std::printf("Q27_REQ %d prompt_tokens=%d prefill_ms=%.1f ttft_ms=%.1f gen_tokens=%d decode_ms_per_tok=%.3f "
+                            "decode_tok_s=%.2f rounds=%d ms_per_round=%.4f tok_per_round=%.4f acc_p1=%.3f acc_p2=%.3f dup=%d arm=%d "
+                            "coll_host=%ld coll_p2p=%ld coll_push=%ld coll_pull=%ld coll_sdma=%ld coll_ll=%ld epi=%ld/%ld nr_eff=%d p2p_min=%d "
+                            // exl3_calls / exl3_rows were already being PASSED here with no format
+                            // specifiers for them -- computed, appended, and silently dropped by
+                            // printf. They are the only receipt that says how much of a request
+                            // actually ran on the trellis, so they are printed now. m1= is the
+                            // share that went through the M=1 GEMV rather than the banded GEMM.
+                            "pos_end=%d spec=%d spec_k=%d finish=%s tokhash=%016llx bin=%s "
+                            "exl3_calls=%llu exl3_rows=%llu exl3_m1=%llu "
+                            "ex_o=%llu ex_op=%llu ex_qkv=%llu ex_z=%llu\n",
+                            req, (int)(req == 0 ? prompt.size() : req_ids.size()),
+                            t_prefill, ttft, (int)out.size(), n_decode ? t_decode / n_decode : 0.0,
+                            (n_decode && t_decode > 0) ? 1000.0 * n_decode / t_decode : 0.0,
+                            n_rounds, n_rounds ? t_decode / n_rounds : 0.0,
+                            n_rounds ? (double)n_decode / (double)n_rounds : 0.0,
+                            rq_dr ? (double)(d.nr_acc_hist[1] - rq_acc1_0) / (double)rq_dr : 0.0,
+                            rq_dr ? (double)(d.nr_acc_hist[2] - rq_acc2_0) / (double)rq_dr : 0.0,
+                            g_nr_dup, g_ab_arm,
+                            cs_h, cs_1 + cs_2 + cs_3 + cs_4, cs_1, cs_2, cs_3, cs_4, g_ll_epi_taken[g], g_ll_epi_armed[g], g_coll_nr_eff[g], g_nr_p2p_min,
+                            pos_cur, g_spec, g_spec_k, fin, th, q27_binstamp8(),
+                (unsigned long long)g_exl3_calls.load(std::memory_order_relaxed),
+                (unsigned long long)g_exl3_rows.load(std::memory_order_relaxed),
+                (unsigned long long)g_exl3_calls_m1.load(std::memory_order_relaxed),
+                (unsigned long long)g_ex_site_o.load(std::memory_order_relaxed),
+                (unsigned long long)g_ex_site_op.load(std::memory_order_relaxed),
+                (unsigned long long)g_ex_site_qkv.load(std::memory_order_relaxed),
+                (unsigned long long)g_ex_site_z.load(std::memory_order_relaxed));
+                (void)rq_hits0;
+                if (cs_h > 0 && n_rounds > 0) {
+                    // HOST-COLLECTIVE PHASE LEDGER. us/site is the per-rendezvous cost; ms/round is
+                    // that times sites/round, i.e. the share of the round each phase actually owns.
+                    // stage_wait blocks on the GPU finishing the PRECEDING segment, so it prices
+                    // that segment's execution (attention / GDN / MLP / norms), NOT the collective:
+                    // the collective proper is b1 + reduce + b2 + invN. Reading stage_wait as
+                    // rendezvous overhead would overstate the collective by an order of magnitude.
+                    const double S = (double)cs_h, Rr = (double)n_rounds;
+                    double ph[5];
+                    for (int j = 0; j < 5; ++j) ph[j] = g_collt[g][j] - rq_collt0[j];
+                    const double coll = ph[1] + ph[2] + ph[3] + ph[4];
+                    std::fprintf(stderr,
+                        "Q27_COLLT %d sites=%ld sites/round=%.1f | us/site: stage_wait=%.2f b1=%.2f "
+                        "reduce=%.2f b2=%.2f invN=%.2f | ms/round: stage_wait=%.4f collective=%.4f "
+                        "(b1=%.4f reduce=%.4f b2=%.4f invN=%.4f)\n",
+                        req, cs_h, S / Rr,
+                        1000.0 * ph[0] / S, 1000.0 * ph[1] / S, 1000.0 * ph[2] / S,
+                        1000.0 * ph[3] / S, 1000.0 * ph[4] / S,
+                        ph[0] / Rr, coll / Rr,
+                        ph[1] / Rr, ph[2] / Rr, ph[3] / Rr, ph[4] / Rr);
+                    std::fflush(stderr);
+                    // The residual the ledger cannot attribute: layers minus the GPU execution it
+                    // blocked on minus the collective it performed. This is the quantity the launch
+                    // counter is testing, so it is computed here and handed straight to the dump.
+                    const double layers_ms = (d.sp_t[3] - rq_spt0[3]) / Rr;
+                    const double resid = layers_ms - ph[0] / Rr - coll / Rr;
+                    q27_lk_dump(req, n_rounds - lk_skipped, Q27_LAYERS, resid, 12);
+                }
+                if (g_spec && rq_dr > 0) {
+                    const double R = (double)rq_dr;
+                    // stderr, NOT stdout: the server stdout pump logs only a whitelist of prefixes
+                    // (Q27_REQ / Q27_MS / Q27_VRAM / Q27_TOKENS ...) and silently DROPS everything
+                    // else -- which is why the engine has been accumulating a per-phase speculative
+                    // ledger for weeks that never reached a single log line. stderr is pumped whole.
+                    std::fprintf(stderr, "Q27_SPECT %d rounds=%ld ms/round: draft=%.4f draft_xchg=%.4f embed=%.4f "
+                                "layers=%.4f head_sync=%.4f head_xchg=%.4f tail=%.4f total=%.4f\n",
+                                req, rq_dr,
+                                (d.sp_t[0] - rq_spt0[0]) / R, (d.sp_t[1] - rq_spt0[1]) / R,
+                                (d.sp_t[2] - rq_spt0[2]) / R, (d.sp_t[3] - rq_spt0[3]) / R,
+                                (d.sp_t[4] - rq_spt0[4]) / R, (d.sp_t[5] - rq_spt0[5]) / R,
+                                (d.sp_t[6] - rq_spt0[6]) / R, (d.sp_t[7] - rq_spt0[7]) / R);
+                }
+                if (g_sr && g_sr_time && d.sr_rounds_t > 0) {   // Q27_SR_TIME: GPU time of this card's blocks per round (event-timed), every card
+                    const double Rt = (double)d.sr_rounds_t;
+                    std::fprintf(stderr, "Q27_SRT %d card %d rounds=%ld ms/round: blk=%.3f+%.3f+%.3f+%.3f=%.3f draft=%.3f head=%.3f wall=%.3f\n",
+                                 req, g, d.sr_rounds_t, d.sr_ms_blk[0] / Rt, d.sr_ms_blk[1] / Rt, d.sr_ms_blk[2] / Rt, d.sr_ms_blk[3] / Rt,
+                                 (d.sr_ms_blk[0] + d.sr_ms_blk[1] + d.sr_ms_blk[2] + d.sr_ms_blk[3]) / Rt,
+                                 d.sr_ms_draft / Rt, d.sr_ms_head / Rt, d.sr_ms_wall / Rt);
+                    if (g_sr_time >= 2)
+                        std::fprintf(stderr, "Q27_SRT %d card %d stages ms/round (16 layers): norm+inproj=%.3f attn/gdn=%.3f outproj=%.3f postnorm+gateup=%.3f swiglu+down=%.3f sum=%.3f\n",
+                                     req, g, d.sr_ms_st[0] / Rt, d.sr_ms_st[1] / Rt, d.sr_ms_st[2] / Rt, d.sr_ms_st[3] / Rt, d.sr_ms_st[4] / Rt, d.sr_ms_st[5] / Rt);
+                    for (int v = 0; v < 4; ++v) d.sr_ms_blk[v] = 0; d.sr_ms_draft = d.sr_ms_head = d.sr_ms_wall = 0; d.sr_rounds_t = 0;
+                    for (int k = 0; k < 6; ++k) d.sr_ms_st[k] = 0;
+                    std::fflush(stderr);
+                }
+            }
             std::printf("Q27_TOKENS"); for (unsigned t : out) std::printf(" %u", t); std::printf("\n");
             std::fflush(stdout);
             if (g_text) { std::fprintf(g_text_out, "\n(%d tokens | prompt %d tok, prefill %.0f ms | decode %.1f tok/s | context %d)\n",
@@ -6746,6 +10267,9 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                         g, w, cp, cl, w - cp - cl, C.n_coll[g] / steps);
             if (C.t_wall[g] > C.t_wall[crit]) crit = g;
         }
+        for (int g = 0; g < ndev; ++g)   // host-site phases (tp_allreduce_nr brackets), ms/token, per card
+            std::printf("  Q27_COLLT_RUN card %d ms/token: stage_wait %.3f b1 %.3f reduce %.3f b2 %.3f invN %.3f\n", g,
+                        g_collt[g][0] / steps, g_collt[g][1] / steps, g_collt[g][2] / steps, g_collt[g][3] / steps, g_collt[g][4] / steps);
         // The critical path is the card with the largest wall time. Its own compute/collective/
         // residual is a decomposition of an execution that actually happened.
         const double wall = C.t_wall[crit] / steps;
@@ -6833,8 +10357,8 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
                 std::printf("\n");
             }
         }
-        std::printf("Q27_TP_TIMING prefill_ms=%.1f (%zu tokens)  decode_ms=%.1f (%d tokens)\n",
-                    t_prefill, prompt.size() - 1, t_decode, n_decode);
+        std::printf("Q27_TP_TIMING prefill_ms=%.1f (%zu tokens)  decode_ms=%.1f (%d tokens)  epi=%ld/%ld\n",
+                    t_prefill, prompt.size() - 1, t_decode, n_decode, g_ll_epi_taken[0], g_ll_epi_armed[0]);
         std::printf("Q27_RNQ_FALLBACK total=%lld  (0 = the fused norm+quant ran everywhere)\n",
                     (long long)g_rnq_fb.load());
         std::printf("Q27_KV_FUSE mode=%d fused_calls=%lld  (expect 16/token when on)\n",
@@ -6878,7 +10402,7 @@ static int run_tp(q27_model_t* m, int ndev, int ctx, int maxn,
 // and bytes -- the input the upload needs. It touches NO upload state, so it cannot break a load.
 // The checkpoint's hf_quant_config lists exclude_modules ["mtp*", "mtp.layers.0*"], i.e. the draft
 // layer is stored UNQUANTIZED BF16, which is why its shapes are the raw ones.
-//   usage: Q27_MTP_PROBE=1 ./q27_gen /data/qwen38-27b/model
+//   usage: Q27_MTP_PROBE=1 ./q27_gen ./model
 static const char* Q27_MTP_NAMES[15] = {
     "mtp.fc.weight",
     "mtp.pre_fc_norm_hidden.weight",
@@ -7121,6 +10645,54 @@ static int q27_mtp_upload(q27_model_t* m, MtpW* W, int id) {
         W->bytes += (long long)(wpk.size() + gs.size());
         return true;
     };
+    // Q27_MTP_TP slices: a ROW range [row0, row0+rows) of a [rtot][K] matrix (fp8 or nvfp4), and a COLUMN range of an fp8 matrix
+    auto load_fp8_rows = [&](const char* name, q27_fp8_t* h, int row0, int rows, int K) -> bool {
+        size_t bytes = 0; long long sh[Q27_MAX_DIMS]; int dt = 0, nd = 0;
+        const void* p = q27_host_ptr(m, name, &bytes, &dt, &nd, sh);
+        if (!p) { std::fprintf(stderr, "MTP_UPLOAD missing %s\n", name); return false; }
+        std::vector<unsigned short> src((size_t)rows * (size_t)K);
+        std::memcpy(src.data(), (const unsigned short*)p + (size_t)row0 * K, src.size() * 2);
+        std::vector<unsigned char> w; float wscale = 1.f;
+        q27_quant_fp8(src.data(), rows, K, w, &wscale);
+        unsigned char* dw = nullptr;
+        CK(hipMalloc((void**)&dw, w.size()));
+        CK(hipMemcpy(dw, w.data(), w.size(), hipMemcpyHostToDevice));
+        h->w = dw; h->wscale = wscale; h->in_scale = IN_SCALE; h->rows = rows; h->K = K;
+        W->bytes += (long long)w.size();
+        return true;
+    };
+    auto load_fp8_slice = [&](const char* name, q27_fp8_t* h, int rows, int Ktot, int koff, int Ksl) -> bool {
+        size_t bytes = 0; long long sh[Q27_MAX_DIMS]; int dt = 0, nd = 0;
+        const void* p = q27_host_ptr(m, name, &bytes, &dt, &nd, sh);
+        if (!p) { std::fprintf(stderr, "MTP_UPLOAD missing %s\n", name); return false; }
+        std::vector<unsigned short> sub((size_t)rows * (size_t)Ksl);
+        for (int r = 0; r < rows; ++r) std::memcpy(&sub[(size_t)r * Ksl], (const unsigned short*)p + (size_t)r * Ktot + koff, (size_t)Ksl * 2);
+        std::vector<unsigned char> w; float wscale = 1.f;
+        q27_quant_fp8(sub.data(), rows, Ksl, w, &wscale);
+        unsigned char* dw = nullptr;
+        CK(hipMalloc((void**)&dw, w.size()));
+        CK(hipMemcpy(dw, w.data(), w.size(), hipMemcpyHostToDevice));
+        h->w = dw; h->wscale = wscale; h->in_scale = IN_SCALE; h->rows = rows; h->K = Ksl;
+        W->bytes += (long long)w.size();
+        return true;
+    };
+    auto load_nv_rows = [&](const char* name, q27_nvfp4_t* h, int row0, int rows, int K) -> bool {
+        size_t bytes = 0; long long sh[Q27_MAX_DIMS]; int dt = 0, nd = 0;
+        const void* p = q27_host_ptr(m, name, &bytes, &dt, &nd, sh);
+        if (!p) { std::fprintf(stderr, "MTP_UPLOAD missing %s\n", name); return false; }
+        std::vector<unsigned short> src((size_t)rows * (size_t)K);
+        std::memcpy(src.data(), (const unsigned short*)p + (size_t)row0 * K, src.size() * 2);
+        std::vector<unsigned char> wpk, gs; float ws2 = 1.f;
+        q27_quant_nvfp4(src.data(), rows, K, wpk, gs, &ws2);
+        unsigned char *dw = nullptr, *dg = nullptr;
+        CK(hipMalloc((void**)&dw, wpk.size()));
+        CK(hipMalloc((void**)&dg, gs.size()));
+        CK(hipMemcpy(dw, wpk.data(), wpk.size(), hipMemcpyHostToDevice));
+        CK(hipMemcpy(dg, gs.data(), gs.size(), hipMemcpyHostToDevice));
+        h->w = dw; h->gs = dg; h->ws2 = ws2; h->in_scale = IN_SCALE; h->rows = rows; h->K = K;
+        W->bytes += (long long)(wpk.size() + gs.size());
+        return true;
+    };
     auto grab = [&](const char* name, const unsigned short** dst, int n) -> bool {
         size_t bytes = 0; long long sh[Q27_MAX_DIMS]; int dt = 0, nd = 0;
         const void* p = q27_host_ptr(m, name, &bytes, &dt, &nd, sh);
@@ -7134,6 +10706,18 @@ static int q27_mtp_upload(q27_model_t* m, MtpW* W, int id) {
     const char* B = "mtp.layers.0";
     char n[192];
     bool ok = true;
+    if (g_mtp_tp) {   // Q27_MTP_TP: the draft layer sharded exactly like a trunk full-attention layer (plan of card `id`)
+        const q27_tp_shard_t* T = q27_tp_shard(id);
+        snprintf(n, sizeof n, "%s.self_attn.q_proj.weight", B);  ok &= load_fp8_rows(n, &W->q, T->q_h0 * 512, T->QL, 5120);
+        snprintf(n, sizeof n, "%s.self_attn.k_proj.weight", B);  ok &= load_fp8_rows(n, &W->k, T->kv_h0 * Q27_HDIM, T->KVL, 5120); ok &= load_fp8(n, &W->k_full, 1024, 5120);
+        snprintf(n, sizeof n, "%s.self_attn.v_proj.weight", B);  ok &= load_fp8_rows(n, &W->v, T->kv_h0 * Q27_HDIM, T->KVL, 5120); ok &= load_fp8(n, &W->v_full, 1024, 5120);
+        snprintf(n, sizeof n, "%s.self_attn.o_proj.weight", B);  ok &= load_fp8_slice(n, &W->o, 5120, 6144, T->q_h0 * Q27_HDIM, T->OL);
+        snprintf(n, sizeof n, "%s.mlp.gate_proj.weight", B);     ok &= load_nv_rows(n, &W->gate, T->mlp_off, T->mlp_len, 5120);
+        snprintf(n, sizeof n, "%s.mlp.up_proj.weight", B);       ok &= load_nv_rows(n, &W->up,   T->mlp_off, T->mlp_len, 5120);
+        snprintf(n, sizeof n, "%s.mlp.down_proj.weight", B);     ok &= load_nv_slice(n, &W->down[0], 5120, 17408, T->mlp_off, T->mlp_len);
+        for (int j = 1; j < 4; ++j) W->down[j] = q27_nvfp4_t{};
+        std::printf("Q27_MTP_TP card %d: q rows [%d,+%d) kv rows [%d,+%d) o K-slice [%d,+%d) mlp [%d,+%d)\n", id, T->q_h0 * 512, T->QL, T->kv_h0 * Q27_HDIM, T->KVL, T->q_h0 * Q27_HDIM, T->OL, T->mlp_off, T->mlp_len);
+    } else {
     snprintf(n, sizeof n, "%s.self_attn.q_proj.weight", B);  ok &= load_fp8(n, &W->q, 12288, 5120);
     snprintf(n, sizeof n, "%s.self_attn.k_proj.weight", B);  ok &= load_fp8(n, &W->k,  1024, 5120);
     snprintf(n, sizeof n, "%s.self_attn.v_proj.weight", B);  ok &= load_fp8(n, &W->v,  1024, 5120);
@@ -7142,6 +10726,7 @@ static int q27_mtp_upload(q27_model_t* m, MtpW* W, int id) {
     snprintf(n, sizeof n, "%s.mlp.up_proj.weight", B);       ok &= load_nv(n, &W->up,   17408, 5120);
     snprintf(n, sizeof n, "%s.mlp.down_proj.weight", B);
     for (int j = 0; j < 4; ++j) ok &= load_nv_slice(n, &W->down[j], 5120, 17408, j * 4352, 4352);
+    }
     for (int j = 0; j < 2; ++j) ok &= load_nv_slice("mtp.fc.weight", &W->fc[j], 5120, 10240, j * 5120, 5120);
     snprintf(n, sizeof n, "%s.input_layernorm.weight", B);            ok &= grab(n, &W->in_norm, 5120);
     snprintf(n, sizeof n, "%s.post_attention_layernorm.weight", B);   ok &= grab(n, &W->post_norm, 5120);
@@ -7183,6 +10768,7 @@ static int q27_mtp_upload_probe(q27_model_t* m) {
 // the target head already uses.
 static int mtp_init(q27_model_t* m, int ndev) {
     for (int g = 0; g < ndev; ++g) {
+        if (g_sr && g != g_sr_head) continue;   // Q27_LS_SR: the draft layer is not replicated; the head card runs it
         MtpState& S = g_mtp[g];
         CK(hipSetDevice(g));
         if (q27_mtp_upload(m, &S.W, g)) return 1;
@@ -7203,7 +10789,7 @@ static int mtp_init(q27_model_t* m, int ndev) {
         // source of an H2D copy on cards 1-3 and the copy engine faulted reading it as if it were
         // device-accessible. A pageable H2D is always staged by the runtime and is correct on every
         // device; the payload is 10 KB per token, so the staging cost is noise.
-        if (g == 0) {
+        if (g == 0 || (g_sr && g == g_sr_head)) {   // Q27_LS_SR: the head card is the only draft card, so it owns the staging too
             // PINNED, not pageable. Round 29 switched this to std::malloc to work around a GPU fault
             // that turned out to be the NULL embed gather (0x54bf000 = 8678*10240), fixed separately.
             // The workaround was never needed and it is expensive: a pageable H2D/D2H pair per card
@@ -7225,8 +10811,8 @@ static int mtp_init(q27_model_t* m, int ndev) {
         // Handle-field A/B: the draft's handles are built by MY host quantizer, the lm_head's by the
         // ENGINE's own load-time converter. Same kernel consumes both, so any field that differs in
         // CONVENTION (not just in value) is the bug.
-        MtpW& A = g_mtp[0].W;
-        CK(hipSetDevice(0));
+        MtpW& A = g_mtp[g_sr ? g_sr_head : 0].W;   // Q27_LS_SR: the draft lives on the head card only
+        CK(hipSetDevice(g_sr ? g_sr_head : 0));
         std::printf("Q27_MTP_HANDLES\n");
         std::printf("  fc[0]  rows=%-6d K=%-6d ws2=%.6e in_scale=%.4f\n", A.fc[0].rows, A.fc[0].K, A.fc[0].ws2, A.fc[0].in_scale);
         std::printf("  fc[1]  rows=%-6d K=%-6d ws2=%.6e\n", A.fc[1].rows, A.fc[1].K, A.fc[1].ws2);
@@ -7407,7 +10993,8 @@ static void mtp_draft_step(Dev& d, MtpState& S, q27_globals_t* G, int dpos, int 
     q27_rmsnorm(S.nrm, S.W.mtp_norm, S.hid, Q27_HID, 1, s);
     if (dbgs) { hipStreamSynchronize(s); mtp_dump_rms("4_mtp_norm", S.hid, Q27_HID); g_mtp_dbg_used = 1; }
     q27_quant_perm(S.hid, S.xq, S.xs, Q27_HID, G->lm_head.in_scale, s);
-    q27_proj_nvfp4(&G->lm_head, S.xq, S.xs, S.dpa, s);             // this card's logit shard
+    if (!exl3_head(d, G, S.hid, S.dpa, 1, s))
+                        q27_proj_nvfp4(&G->lm_head, S.xq, S.xs, S.dpa, s);             // this card's logit shard
 }
 
 static void mtp_gold(q27_model_t* m, std::vector<Dev>& D, int ndev, const char* hfile, unsigned tok) {
@@ -7433,7 +11020,8 @@ static void mtp_gold(q27_model_t* m, std::vector<Dev>& D, int ndev, const char* 
             // reproduce the oracle's OWN next token, so it isolates the tail from the layer.
             q27_rmsnorm(d.hidden_slots, S.W.mtp_norm, S.hid, Q27_HID, 1, d.stream);
             q27_quant_perm(S.hid, S.xq, S.xs, Q27_HID, G->lm_head.in_scale, d.stream);
-            q27_proj_nvfp4(&G->lm_head, S.xq, S.xs, S.dpa, d.stream);
+            if (!exl3_head(d, G, S.hid, S.dpa, 1, d.stream))
+                        q27_proj_nvfp4(&G->lm_head, S.xq, S.xs, S.dpa, d.stream);
         } else {
             const double g0 = tp_now();
             mtp_draft_step(d, S, (q27_globals_t*)G, 0, 1);       // dpos=0: attends to itself alone
@@ -7466,7 +11054,7 @@ static void mtp_gold(q27_model_t* m, std::vector<Dev>& D, int ndev, const char* 
         unsigned li; float lv;
         CK(hipMemcpy(&li, d.dtok, 4, hipMemcpyDeviceToHost));
         CK(hipMemcpy(&lv, d.dval, 4, hipMemcpyDeviceToHost));
-        const unsigned gi = (unsigned)((long long)g * G->lm_head.rows + (long long)li);
+        const unsigned gi = (unsigned)((long long)q27_tp_shard(g)->voc_off + (long long)li);
         std::printf("Q27_MTP_GOLD card %d local=%u val=%.4f global=%u\n", g, li, lv, gi);
         if (lv > bv) { bv = lv; best = gi; }
     }
@@ -7474,8 +11062,39 @@ static void mtp_gold(q27_model_t* m, std::vector<Dev>& D, int ndev, const char* 
     std::fflush(stdout);
 }
 
+// ---- CRASH BACKTRACE. 2026-09-18. ----------------------------------------------------------
+// The layer-split sweep dies with a fault INSIDE libamdhip64 (+0x2E6218), i.e. HIP dereferencing
+// something the engine handed it. dmesg gives the faulting ip but not the CALLER, and the caller is
+// the only thing that identifies which handle was bad. -rdynamic is already on, so backtrace_symbols
+// resolves engine frames by name. Async-signal-safety: backtrace_symbols_fd writes straight to the
+// fd and allocates nothing, which is the one form that is legal here.
+static void q27_crash_bt(int sig, siginfo_t* si, void*) {
+    const char* nm = (sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGBUS) ? "SIGBUS" : "SIGFPE";
+    char hdr[160];
+    int n = snprintf(hdr, sizeof hdr, "\nQ27_CRASH %s at addr %p -- backtrace (engine frames are named):\n",
+                     nm, si ? si->si_addr : nullptr);
+    ssize_t w = write(2, hdr, (size_t)(n > 0 ? n : 0)); (void)w;
+    void* fr[64];
+    int k = backtrace(fr, 64);
+    backtrace_symbols_fd(fr, k, 2);
+    _exit(139);
+}
+static void q27_install_crash_bt() {
+    if (!q27_env_flag("Q27_CRASH_BT", true)) return;
+    struct sigaction sa; std::memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = q27_crash_bt;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+}
 int main(int argc, char** argv) {
+    if (const char* error = q27_candidate_flag_error()) {
+        std::fprintf(stderr, "FATAL Q27 candidate flags: %s\n", error);
+        return 2;
+    }
+    q27_pfblas_log_config();
     g_t0_wall = tp_now();
+    q27_install_crash_bt();
     MS("T0_start");
     if (q27_env_flag("Q27_FP8_CENSUS", false)) { CK(hipSetDevice(0)); q27_fp8_census(); return 0; }
     if (q27_env_flag("Q27_MK_BENCH", false)) { CK(hipSetDevice(0)); q27_mk_bench(); return 0; }
@@ -7493,12 +11112,20 @@ int main(int argc, char** argv) {
     const int   ndev = (argc>2)? atoi(argv[2]) : 4;
     const int   ctx  = (argc>3)? atoi(argv[3]) : 4096;
     const int   maxn = (argc>4)? atoi(argv[4]) : 24;
+    // Q27_MLP_WSHARE must be resolved before the first dev_alloc sizes an MLP scratch buffer and
+    // before tp_plan/q27_fp8_mlp_load slice a tensor, so it is parsed here and nowhere else.
+    mlp_wshare_init(ndev);
     const int   slots = (getenv("Q27_SLOTS") ? atoi(getenv("Q27_SLOTS")) : 1);
     const char* orc  = (argc>5)? argv[5] : nullptr;   // oracle vector dir -> run the ladder
     if (orc && (orc[0]==0 || !strcmp(orc,"none") || !strcmp(orc,"-"))) orc = nullptr;
     std::vector<unsigned> prompt;
     g_text  = q27_env_flag("Q27_TEXT", false);
     g_think = q27_env_flag("Q27_THINK", false);
+    // Read Q27_SERVE from the environment directly rather than from g_serve: the global is
+    // assigned in the env-init pass, and this runs in main() where that ordering is not
+    // guaranteed. On by default in serve mode; a reader that ignores Q27_TOK lines is unaffected.
+    g_stream_ids = q27_env_flag("Q27_SERVE", false) && !g_text
+                   && q27_env_flag("Q27_SERVE_STREAM", true);
     if (const char* sy = std::getenv("Q27_SYSTEM")) g_system = sy;
     if (g_text) {
         std::string text;
@@ -7541,7 +11168,47 @@ int main(int argc, char** argv) {
     if (q27_env_flag("Q27_MTP_WMAG", false)) return q27_mtp_wmag_probe(m);
     MS("T1_open_done");
 
+    // Q27_TP_DEVMAP="0,0,1,2" -- LOGICAL SHARD -> PHYSICAL DEVICE. 2026-09-18.
+    //
+    // Three cards cannot be an ndev=3 TP group: Q27_NKV=4 and Q27_HID=5120 do not divide by 3, and
+    // that gate is arithmetic, not caution. But the SHARD COUNT and the CARD COUNT do not have to be
+    // the same number. This keeps the 4-way shard geometry every kernel was written for and simply
+    // places two of those shards on one physical card -- the 32 GiB one, which has the capacity for
+    // a double share where a 16 does not.
+    //
+    // "0,0,1,2" at ndev=4 => shards 0 and 1 both live on physical device 0; shards 2 and 3 on
+    // devices 1 and 2. Three cards, four shards, no geometry change.
+    //
+    // COST, stated plainly: the card holding two shards does two shards of work, so it sets the
+    // barrier round. This BUYS capacity and SPENDS balance. It is the right trade only when the
+    // doubled card is also the fastest/biggest one.
+    //
+    // Collectives are host-staged (coll_p2p=0 on the shipped arm), so two shards sharing a device is
+    // just two stream sets on one GPU -- no peer mapping is involved. Do NOT combine with P2P.
     std::vector<int> devs(ndev); for (int i=0;i<ndev;++i) devs[i]=i;
+    if (const char* dm = getenv("Q27_TP_DEVMAP")) {
+        std::vector<int> m; int v = 0, d = 0;
+        for (const char* p = dm; ; ++p) {
+            if (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); d = 1; }
+            else { if (d) { m.push_back(v); v = 0; d = 0; } if (!*p) break; }
+        }
+        if ((int)m.size() != ndev) {
+            std::fprintf(stderr, "FATAL Q27_TP_DEVMAP: %zu entries for ndev=%d\n", m.size(), ndev);
+            return 1;
+        }
+        int ndevice = 0; CK(hipGetDeviceCount(&ndevice));
+        for (int i = 0; i < ndev; ++i) {
+            if (m[i] < 0 || m[i] >= ndevice) {
+                std::fprintf(stderr, "FATAL Q27_TP_DEVMAP: shard %d -> device %d, only %d visible\n",
+                             i, m[i], ndevice);
+                return 1;
+            }
+            devs[i] = m[i];
+        }
+        std::fprintf(stderr, "Q27_TP_DEVMAP: %d shards on %d physical device(s):", ndev, ndevice);
+        for (int i = 0; i < ndev; ++i) std::fprintf(stderr, " s%d->d%d", i, devs[i]);
+        std::fprintf(stderr, "\n"); std::fflush(stderr);
+    }
     // Q27_TP=1 selects the C1 tensor-parallel residency: every layer on every card, one shard
     // each. It is a different UPLOAD, so it is chosen here; the serial and pipeline paths below
     // are untouched.
@@ -7558,25 +11225,112 @@ int main(int argc, char** argv) {
         }
         hipSetDevice(devs[0]);
     }
+    q27_memory_receipt("before_weights");
     const double t_up0 = tp_now();
     if (tp) {
         if (q27_env_flag("Q27_LAYER_SPLIT", true)) {
             // dual residency: the TP shards stay for the untouched decode path; the layer-split
             // FULL-layer layout rides alongside for the prefill sweep. Q27_LS_NOTP=1 skips the
             // TP residency entirely (prefill-only: frees ~8 GB/card for the w8 preshuffle).
-            const bool ls_notp = q27_env_flag("Q27_LS_NOTP", false);
+            const bool ls_sr   = q27_env_flag("Q27_LS_SR", false);      // single residency: no TP upload at all (src/q27_sr_main.inc)
+            const bool ls_notp = q27_env_flag("Q27_LS_NOTP", false) || ls_sr;
+            if (ls_sr) q27_ls_mlp_i8k_set(0);   // no persistent int8 MLP mirrors: the prefill ring builds them per layer from the FP8 planes
+            // Q27_LS_MLP_I8K=-1: window-aware residency. The prefill slots cost 30,720 B per
+            // position on every card and scale with the prompt (g_pf_cap), so a long window buys
+            // itself out of the fast MLP. One int8 MLP layer costs the same as ~3,960 positions, so
+            // spend what this window leaves rather than a number tuned for one prompt length.
+            {
+                // A PER-CARD LIST ("16,10,10,10") is an explicit budget, so it bypasses the auto
+                // path entirely -- and it must be tested BEFORE q27_env_int, which fatals on a
+                // non-integer ("FATAL Q27_LS_MLP_I8K=... is not an integer"). q27_load's
+                // ls_mlp_i8k(card) owns the parsing; here we only need to not interfere.
+                const char* i8k_env = getenv("Q27_LS_MLP_I8K");
+                const bool i8k_list = i8k_env && *i8k_env && strchr(i8k_env, ',');
+                const int req = i8k_list ? 0 : q27_env_int("Q27_LS_MLP_I8K", 0);
+                if (req < 0) {
+                    // Mirror run_tp's slot sizing EXACTLY -- this is main(), where g_pf_cap is still
+                    // the compile-time default, so the window has to be derived from the prompt that
+                    // was actually handed to this engine.
+                    int win = Q27_PF_CAP;
+                    if ((int)prompt.size() > win) win = (int)prompt.size();
+                    if (q27_env_flag("Q27_SERVE", false)) {
+                        const int floor_ = q27_env_int("Q27_SERVE_SLOTS",
+                                                       q27_env_int("Q27_SERVE_MAXPROMPT", 8192));
+                        int cap = (int)prompt.size() + 256;
+                        if (cap < floor_) cap = floor_;
+                        if (cap > win) win = cap;
+                    }
+                    const int bonus = q27_env_int("Q27_V4_WIN_BONUS", Q27_V4_WIN_BONUS); const int over = win > (9216 + bonus) ? (win - (9216 + bonus)) : 0;
+                    // Per-layer cost with Q27_DEC_MLP_I8 on: the int8 mirror's 117 MB net minus the
+                    // 36 MB NVFP4 MLP shard the decode no longer needs = ~81 MB, i.e. ~2640 positions
+                    // of slot. Measured: at the 9,216 floor all 16 layers fit with 0.61 GiB free.
+                    const bool dec8 = q27_env_flag("Q27_DEC_MLP_I8", false) && !q27_env_flag("Q27_DEC_MLP_NV", false);
+                    const int per = dec8 ? 2640 : 3960;
+                    int k = (dec8 ? 16 : 13) + q27_env_int("Q27_V4_KBONUS", Q27_V4_KBONUS) - (over + per - 1) / per;   // V4 credit: 0.985 GiB|card / 117 MB per mirror = ~8 layers; take 3
+                    if (k < 0) k = 0; if (k > Q27_LAYERS) k = Q27_LAYERS;
+                    size_t fr = 0, tt = 0; hipSetDevice(devs[0]); hipMemGetInfo(&fr, &tt);
+                    q27_ls_mlp_i8k_set(k);
+                    std::fprintf(stderr, "Q27_LS_MLP_I8K auto: prompt=%zu window=%d -> %d of %d owned "
+                                         "layers on int8/Tensile (free before layer-split %.2f GiB)\n",
+                                 prompt.size(), win, k, Q27_LAYERS / ndev, (double)fr / 1073741824.0);
+                    std::fflush(stderr);
+                }
+            }
             if (!ls_notp && q27_upload_tp(m, devs.data(), ndev, err, sizeof err) != Q27_OK) {
                 std::fprintf(stderr,"Q27_UPLOAD_FAIL %s\n", err); return 1;
             }
             if (q27_upload_ls(m, devs.data(), ndev, err, sizeof err) != Q27_OK) {
                 std::fprintf(stderr,"Q27_UPLOAD_FAIL %s\n", err); return 1;
             }
-        } else if (q27_upload_tp(m, devs.data(), ndev, err, sizeof err) != Q27_OK) {
-            std::fprintf(stderr,"Q27_UPLOAD_FAIL %s\n", err); return 1;
+            if (ls_sr) {   // Q27_LS_SR: the MLP is the block-scaled FP8 checkpoint, full width on each layer's owner
+                const char* f8p = getenv("Q27_FP8_MLP");
+                if (!f8p || !*f8p) { std::fprintf(stderr, "FATAL Q27_LS_SR needs Q27_FP8_MLP=<dir of the FP8 checkpoint>\n"); return 1; }
+                const int nf8 = q27_fp8_mlp_load_sr(m, ndev, f8p);
+                std::printf("Q27_LS_SR: %d FP8 MLP projections resident on their owner cards\n", nf8);
+            }
+            if (!ls_sr) q27_resolve_tp_ls_mlp(m, ndev);   // Q27_ALIAS_MLP: TP MLP handles -> layer-split rows
+            // Q27_E4M3_FAST: certify the decode gate/up scale planes for the 2-instruction group
+            // decode. Default OFF so the A arm is the shipped path untouched; uncertified planes
+            // fall back regardless of the flag. Q27_DOWN_FS also triggers the pass (it certifies
+            // down_proj planes inside the same walk when set).
+            if (q27_env_flag("Q27_E4M3_FAST", false) || q27_env_flag("Q27_DOWN_FS", false)) q27_nvfp4_validate_gu(m, ndev);
+            // Q27_MXFP4_MLP: swap the decode gate/up shards to AMD Quark OCP-MXFP4 in place. Runs
+            // AFTER the E4M3 validator on purpose -- it clears gs_fast on anything it converts.
+            if (const char* mxp = getenv("Q27_MXFP4_MLP")) q27_mxfp4_sideload_mlp(m, ndev, mxp);
+            // Q27_FP8_MLP: block-scaled FP8 MLP resident alongside; decode prefers it when present.
+            if (const char* f8p = getenv("Q27_FP8_MLP")) { if (!ls_sr) q27_fp8_mlp_load(m, ndev, f8p); }
+            if (!ls_sr && q27_env_flag("Q27_LS_FP8_PREFILL", false)) {
+                const char* f8p = getenv("Q27_FP8_MLP");
+                if (!f8p || q27_fp8_ls_prefill_mirrors(m, ndev, f8p) != Q27_LAYERS * 3) {
+                    std::fprintf(stderr, "FATAL Q27_LS_FP8_PREFILL: incomplete owner mirrors\n"); return 1;
+                }
+            }
+            // Q27_EXL3_DIR: trellis weights (4bpw / 6bpw) attach to each card's OWNED layers,
+            // full width. Every projection dispatcher prefers a live EXL3 handle, so this
+            // takes over the layer without the incumbent residency being disturbed -- which is
+            // what lets the 8-bit arm stay the fallback authority while this is brought up.
+            if (const char* exd = getenv("Q27_EXL3_DIR"))
+                q27_exl3_sideload(m, devs.data(), ndev, exd);
+        } else {
+            if (q27_upload_tp(m, devs.data(), ndev, err, sizeof err) != Q27_OK) {
+                std::fprintf(stderr,"Q27_UPLOAD_FAIL %s\n", err); return 1;
+            }
+            // Q27_TPSR (2026-09-17 night): the block-scaled FP8 MLP -- gate/up ROW shards and, with
+            // Q27_FP8_MLP_DOWN=1, the down K-SLICE -- rides on the TP handles of the ONLY residency.
+            // Until now this loader was reachable from the layer-split branch alone, so a
+            // Q27_LAYER_SPLIT=0 boot under Q27_FP8_DROP_NV_GU dropped the NVFP4 gate/up and loaded
+            // nothing in their place: that null plane (q27_proj_nvfp4_gu_b13 on w=NULL, first chunk
+            // of layer 0) is the batched path's small-address fault after T6_embed_done.
+            if (const char* f8p = getenv("Q27_FP8_MLP")) q27_fp8_mlp_load(m, ndev, f8p);
+            // Q27_EXL3_DIR on the TP-only residency (Q27_LAYER_SPLIT=0). Refuses
+            // unless ndev==1, where a "shard" is the full projection.
+            if (const char* exd = getenv("Q27_EXL3_DIR"))
+                q27_exl3_sideload(m, devs.data(), ndev, exd);
         }
     } else if (q27_upload_split(m, devs.data(), ndev, /*want_embed=*/1, err, sizeof err) != Q27_OK) {
         std::fprintf(stderr,"Q27_UPLOAD_FAIL %s\n", err); return 1;
     }
+    q27_storage_finish();
     { char buf[4096]; q27_report(m, buf, sizeof buf); std::fputs(buf, stdout); }
     std::printf("Q27_UPLOAD_MS %.0f\n", tp_now() - t_up0);
     MS("T2_weights_resident");
@@ -7593,7 +11347,7 @@ int main(int argc, char** argv) {
     }
     if (g_df2_cond || g_df2_fwd || g_df2_sel || g_df2_draft) {   // DFlash2 diagnostics + integrated path: load + shard + ctx per card
         const char* df2path = getenv("Q27_DFLASH2_CKPT");   // drafter checkpoint; override for any layout
-        if (!df2path || !*df2path) df2path = "/data/qwen38-27b/dflash-aligned-v5/model.safetensors";
+        if (!df2path || !*df2path) df2path = "./models/dflash2/model.safetensors";
         q27_df2_t W{}; char derr[256] = {0};
         if (q27_df2_open(df2path, &W, derr, sizeof derr)) { std::fprintf(stderr, "Q27_DFLASH2_OPEN_FAIL %s\n", derr); return 1; }
         for (int g = 0; g < ndev; ++g) {
@@ -7692,7 +11446,8 @@ int main(int argc, char** argv) {
                     q27_rmsnorm(last.hidden_slots + (size_t)i*Q27_HID, G->final_norm,
                                 last.norm, Q27_HID, 1, last.stream);
                     q27_quant_perm(last.norm, last.xq, last.xs, Q27_HID, G->lm_head.in_scale, last.stream);
-                    q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
+                    if (!exl3_head(last, G, last.norm, last.pa, 1, last.stream))
+                        q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
                     q27_argmax(last.pa, last.dtok, Q27_VOCAB, last.stream);
                     CK(hipStreamSynchronize(last.stream));
                     unsigned nx; CK(hipMemcpy(&nx, last.dtok, 4, hipMemcpyDeviceToHost));
@@ -7804,7 +11559,8 @@ int main(int argc, char** argv) {
                     q27_rmsnorm(last.hidden_slots + (size_t)i*Q27_HID, G->final_norm,
                                 last.norm, Q27_HID, 1, last.stream);
                     q27_quant_perm(last.norm, last.xq, last.xs, Q27_HID, G->lm_head.in_scale, last.stream);
-                    q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
+                    if (!exl3_head(last, G, last.norm, last.pa, 1, last.stream))
+                        q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
                     unsigned* dt2; CK(hipMalloc(&dt2,4));
                     q27_argmax(last.pa, dt2, Q27_VOCAB, last.stream);
                     CK(hipStreamSynchronize(last.stream));
@@ -7877,7 +11633,8 @@ int main(int argc, char** argv) {
         const q27_globals_t* G = q27_globals(m, last.id);
         q27_rmsnorm(last.hidden_slots, G->final_norm, last.norm, Q27_HID, 1, last.stream);
         q27_quant_perm(last.norm, last.xq, last.xs, Q27_HID, G->lm_head.in_scale, last.stream);
-        q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
+        if (!exl3_head(last, G, last.norm, last.pa, 1, last.stream))
+                        q27_proj_nvfp4(&G->lm_head, last.xq, last.xs, last.pa, last.stream);
         if (const char* td = std::getenv("Q27_TOPK_DIR")) {          // first-token decision boundary
             static int dumped = 0;
             if (!dumped && pi >= prompt.size()) {

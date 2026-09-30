@@ -448,6 +448,117 @@ extern "C" void q27_gdn_conv_tp_tile(unsigned short* qkv, int qstride, int Ct, u
                        qkv, qstride, Ct, conv_state, cw, nq, nk, nv, g * nq, 2048 + g * nk, 4096 + g * nv, 0, (unsigned short*)nullptr, (size_t)0, 0);
 }
 
+// Ragged key-head range [kh0, kh0+khn) of the packed q|k|v shard (2026-09-28, Q27_TP3): the same
+// kernel as q27_gdn_conv_tp_tile2 with explicit q/k/v counts and full-width offsets.
+// Q27_GDN_AB_CONV: one launch for the GDN a/b GEMV (48 rows, was its own 5.5us*48 launch family)
+// plus the conv tile. Blocks [0, rows) compute a/b; remaining blocks run conv. The two workloads
+// are independent (a/b reads nr_norm, conv reads qkv) so they run concurrently in one grid.
+#ifndef Q27_GEMV2_NW
+#define Q27_GEMV2_NW 4
+#endif
+__global__ __launch_bounds__(256) void k_ab_conv_tile(
+    const unsigned short* __restrict__ wa, const unsigned short* __restrict__ wb,
+    const unsigned short* __restrict__ xt, int xstride,
+    unsigned short* __restrict__ ya, unsigned short* __restrict__ yb, int ab_rows, int ab_K,
+    unsigned short* __restrict__ qkv, int qstride, int Ct,
+    unsigned short* __restrict__ conv_state,
+    const unsigned short* __restrict__ cw,
+    int nq, int nk, int nv, int qbase, int kbase, int vbase, int sfull,
+    unsigned short* __restrict__ snap, size_t snap_stride, int snap_all, int conv_nt)
+{
+    if ((int)blockIdx.x < ab_rows) {
+        const int row = (int)blockIdx.x, t = (int)blockIdx.y;
+        const int lane = threadIdx.x & 63;
+        const int wv   = threadIdx.x >> 6;
+        const int KV   = ab_K >> 2;
+        const int per  = KV / Q27_GEMV2_NW;
+        const int beg  = wv * per;
+        const uint2* WA = (const uint2*)(wa + (size_t)row * ab_K);
+        const uint2* WB = (const uint2*)(wb + (size_t)row * ab_K);
+        const uint2* X  = (const uint2*)(xt + (size_t)t * xstride);
+        float aa = 0.f, bb = 0.f;
+        for (int i = beg + lane; i < beg + per; i += 64) {
+            const uint2 xv = X[i], av = WA[i], bv = WB[i];
+            const unsigned xp[2] = { xv.x, xv.y };
+            const unsigned ap[2] = { av.x, av.y };
+            const unsigned bp[2] = { bv.x, bv.y };
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const float x0 = q27_bf2f((unsigned short)(xp[h] & 0xFFFFu));
+                const float x1 = q27_bf2f((unsigned short)(xp[h] >> 16));
+                aa = fmaf(q27_bf2f((unsigned short)(ap[h] & 0xFFFFu)), x0, aa);
+                aa = fmaf(q27_bf2f((unsigned short)(ap[h] >> 16)),     x1, aa);
+                bb = fmaf(q27_bf2f((unsigned short)(bp[h] & 0xFFFFu)), x0, bb);
+                bb = fmaf(q27_bf2f((unsigned short)(bp[h] >> 16)),     x1, bb);
+            }
+        }
+        #pragma unroll
+        for (int o = 32; o; o >>= 1) { aa += __shfl_down(aa, o, 64); bb += __shfl_down(bb, o, 64); }
+        __shared__ float sa[Q27_GEMV2_NW], sb[Q27_GEMV2_NW];
+        if (lane == 0) { sa[wv] = aa; sb[wv] = bb; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float ta = 0.f, tb = 0.f;
+            #pragma unroll
+            for (int i = 0; i < Q27_GEMV2_NW; ++i) { ta += sa[i]; tb += sb[i]; }
+            ya[(size_t)t * ab_rows + row] = q27_f2bf(ta);
+            yb[(size_t)t * ab_rows + row] = q27_f2bf(tb);
+        }
+        return;
+    }
+    const int ch = ((int)blockIdx.x - ab_rows) * conv_nt + threadIdx.x;
+    if (blockIdx.y != 0) return;   // conv runs once; a/b uses y as the chunk index
+    if (ch >= nq + nk + nv) return;
+    const int gc = (ch < nq)      ? (qbase + ch)
+                 : (ch < nq + nk) ? (kbase + ch - nq)
+                                  : (vbase + ch - nq - nk);
+    const int si = sfull ? gc : ch;
+    uint2 st = reinterpret_cast<const uint2*>(conv_state)[si];
+    const uint2 w = reinterpret_cast<const uint2*>(cw)[gc];
+    for (int t = 0; t < Ct; ++t) {
+        unsigned short* p = qkv + (size_t)t * qstride + ch;
+        const unsigned x = (unsigned)*p;
+        const unsigned n0 = (st.x >> 16) | (st.y << 16);
+        const unsigned n1 = (st.y >> 16) | (x << 16);
+        float acc = q27_bf2f((unsigned short)(n0 & 0xFFFFu)) * q27_bf2f((unsigned short)(w.x & 0xFFFFu));
+        acc = fmaf(q27_bf2f((unsigned short)(n0 >> 16)),      q27_bf2f((unsigned short)(w.x >> 16)),      acc);
+        acc = fmaf(q27_bf2f((unsigned short)(n1 & 0xFFFFu)),  q27_bf2f((unsigned short)(w.y & 0xFFFFu)),  acc);
+        acc = fmaf(q27_bf2f((unsigned short)(n1 >> 16)),      q27_bf2f((unsigned short)(w.y >> 16)),      acc);
+        st.x = n0; st.y = n1;
+        *p = q27_f2bf(q27_silu(acc));
+        if (snap && t < Ct - 1 + snap_all) reinterpret_cast<uint2*>(snap + (size_t)t * snap_stride)[si] = st;
+    }
+    reinterpret_cast<uint2*>(conv_state)[si] = st;
+}
+
+extern "C" void q27_gdn_conv_tp_tile2_r(unsigned short* qkv, int qstride, int Ct, unsigned short* conv_state, int sfull,
+                          const unsigned short* cw, int kh0, int khn, unsigned short* snap, size_t snap_stride, int snap_all, hipStream_t s)
+{
+    const int nq = Q27_GDN_D * khn, nk = Q27_GDN_D * khn, nv = 3 * Q27_GDN_D * khn;
+    const int n  = nq + nk + nv;
+    const int nb = (n + Q27_GDN_CONV_NT - 1) / Q27_GDN_CONV_NT;
+    hipLaunchKernelGGL(k_gdn_conv_tp_tile, dim3(nb), dim3(Q27_GDN_CONV_NT), 0, s,
+                       qkv, qstride, Ct, conv_state, cw, nq, nk, nv, Q27_GDN_D * kh0, 2048 + Q27_GDN_D * kh0, 4096 + 3 * Q27_GDN_D * kh0, sfull, snap, snap_stride, snap_all);
+}
+
+// Fused a/b + conv (Q27_GDN_AB_CONV=1). Same arithmetic as k_bf16_gemv2_tile + k_gdn_conv_tp_tile.
+extern "C" void q27_gdn_ab_conv_tp_tile2_r(
+    const unsigned short* wa, const unsigned short* wb,
+    const unsigned short* xt, int xstride,
+    unsigned short* ya, unsigned short* yb, int ab_rows, int ab_K,
+    unsigned short* qkv, int qstride, int Ct, unsigned short* conv_state, int sfull,
+    const unsigned short* cw, int kh0, int khn, unsigned short* snap, size_t snap_stride, int snap_all, hipStream_t s)
+{
+    const int nq = Q27_GDN_D * khn, nk = Q27_GDN_D * khn, nv = 3 * Q27_GDN_D * khn;
+    const int n  = nq + nk + nv;
+    const int nb = (n + Q27_GDN_CONV_NT - 1) / Q27_GDN_CONV_NT;
+    const dim3 grid((unsigned)(ab_rows + nb), (unsigned)Ct);
+    hipLaunchKernelGGL(k_ab_conv_tile, grid, dim3(256), 0, s,
+                       wa, wb, xt, xstride, ya, yb, ab_rows, ab_K,
+                       qkv, qstride, Ct, conv_state, cw, nq, nk, nv,
+                       Q27_GDN_D * kh0, 2048 + Q27_GDN_D * kh0, 4096 + 3 * Q27_GDN_D * kh0,
+                       sfull, snap, snap_stride, snap_all, Q27_GDN_CONV_NT);
+}
 // Q27_SPEC: the tile conv with full-width state indexing and the per-token state snapshot.
 extern "C" void q27_gdn_conv_tp_tile2(unsigned short* qkv, int qstride, int Ct, unsigned short* conv_state, int sfull,
                           const unsigned short* cw, int g, int ndev, unsigned short* snap, size_t snap_stride, int snap_all, hipStream_t s)
@@ -461,7 +572,7 @@ extern "C" void q27_gdn_conv_tp_tile2(unsigned short* qkv, int qstride, int Ct, 
 
 // the recurrence over a tile: one block per local value head, S resident in registers for the
 // whole tile (one load before, one store after), gdn_step_body's phases per position.
-template <int G, int GATE>
+template <int G, int GATE, bool QUANT_BF16 = false>
 __global__ __launch_bounds__(Q27_GDN_VDIM * G) void k_gdn_scan_tp(
     const unsigned short* __restrict__ qkv_t, int qstride,
     const unsigned short* __restrict__ z_t, int zstride,
@@ -503,8 +614,9 @@ __global__ __launch_bounds__(Q27_GDN_VDIM * G) void k_gdn_scan_tp(
         const unsigned short* __restrict__ abuf  = a_t + (size_t)t * abstride;
         const unsigned short* __restrict__ bbuf  = b_t + (size_t)t * abstride;
         unsigned short* __restrict__ out = out_t + (size_t)t * ostride;
-        signed char* __restrict__ Q  = Q_t  ? Q_t  + (size_t)t * ostride : nullptr;
-        float*       __restrict__ QS = QS_t ? QS_t + (size_t)t * (ostride >> 4) : nullptr;
+        // Q/QS rows follow the z width (ZL), not MIXL/ostride — ostride is max(ZL,OL).
+        signed char* __restrict__ Q  = Q_t  ? Q_t  + (size_t)t * zstride : nullptr;
+        float*       __restrict__ QS = QS_t ? QS_t + (size_t)t * (zstride >> 4) : nullptr;
         // ---- phase 0 ----
         float qraw = 0.0f, kraw = 0.0f;
         if (g == 0) {
@@ -568,7 +680,9 @@ __global__ __launch_bounds__(Q27_GDN_VDIM * G) void k_gdn_scan_tp(
             const float y = mixed * inv * nw * q27_out_gate<GATE>(z);
             out[h * Q27_GDN_D + d] = q27_f2bf(y);
             if (Q) {
-                float mx = fabsf(y);
+                // Ragged native fusion preserves the BF16 producer/quantizer boundary.
+                const float qv = QUANT_BF16 ? q27_bf2f(q27_f2bf(y)) : y;
+                float mx = fabsf(qv);
 #pragma unroll
                 for (int o = 8; o; o >>= 1) mx = fmaxf(mx, __shfl_down(mx, o, 16));
                 mx = __shfl(mx, 0, 16);
@@ -576,7 +690,7 @@ __global__ __launch_bounds__(Q27_GDN_VDIM * G) void k_gdn_scan_tp(
                 const float qi = (sc > 0.0f) ? (qgs / sc) : 0.0f;
                 const int   k  = h * Q27_GDN_D + d;
                 if ((d & 15) == 0) QS[k >> 4] = sc;
-                int c = (int)rintf(y * qi);
+                int c = (int)rintf(qv * qi);
                 c = c < -127 ? -127 : (c > 127 ? 127 : c);
                 Q[k] = (signed char)c;
             }
@@ -627,6 +741,25 @@ extern "C" void q27_gdn_scan_tp_snap(const unsigned short* qkv_t, int qstride, c
                        dim3(vh), dim3(Q27_GDN_VDIM * Q27_GDN_G), 0, s,
                        qkv_t, qstride, z_t, zstride, a_t, b_t, abstride, A_log, dt_bias, norm_w, S,
                        out_t, ostride, q_t, qs_t, qgs, koff, voff, g * vh, Ct, Ssnap, snap_stride, snap_all);
+}
+
+extern "C" void q27_gdn_scan_tp_snap_r(const unsigned short* qkv_t, int qstride, const unsigned short* z_t, int zstride,
+                     const unsigned short* a_t, const unsigned short* b_t, int abstride,
+                     const unsigned short* A_log, const unsigned short* dt_bias,
+                     const unsigned short* norm_w, float* S,
+                     unsigned short* out_t, int ostride, int kh0, int khn, int Ct,
+                     signed char* q_t, float* qs_t, float in_scale,
+                     float* Ssnap, size_t snap_stride, int snap_all, hipStream_t s)
+{
+    const float qgs = (in_scale > 0.0f) ? (1.0f / in_scale) : 0.0f;
+    if (!(in_scale > 0.0f)) { q_t = nullptr; qs_t = nullptr; }
+    const int vh   = 3 * khn;
+    const int koff = Q27_GDN_D * khn;
+    const int voff = koff + Q27_GDN_D * khn;
+    hipLaunchKernelGGL((k_gdn_scan_tp<Q27_GDN_G, Q27_GATE_SWISH, true>),
+                       dim3(vh), dim3(Q27_GDN_VDIM * Q27_GDN_G), 0, s,
+                       qkv_t, qstride, z_t, zstride, a_t, b_t, abstride, A_log, dt_bias, norm_w, S,
+                       out_t, ostride, q_t, qs_t, qgs, koff, voff, 3 * kh0, Ct, Ssnap, snap_stride, snap_all);
 }
 
 // ---- SCAN v2 (Q27_PF_GDN_SCAN2): the recurrence with its position-independent half moved out.
@@ -727,8 +860,9 @@ __global__ __launch_bounds__(Q27_GDN_VDIM * G) void k_gdn_scan2_tp(
         const unsigned short* __restrict__ qkv_c = qkv_t + (size_t)t * qstride;
         const unsigned short* __restrict__ zbuf  = z_t + (size_t)t * zstride;
         unsigned short* __restrict__ out = out_t + (size_t)t * ostride;
-        signed char* __restrict__ Q  = Q_t  ? Q_t  + (size_t)t * ostride : nullptr;
-        float*       __restrict__ QS = QS_t ? QS_t + (size_t)t * (ostride >> 4) : nullptr;
+        // Q/QS rows follow the z width (ZL), not MIXL/ostride — ostride is max(ZL,OL).
+        signed char* __restrict__ Q  = Q_t  ? Q_t  + (size_t)t * zstride : nullptr;
+        float*       __restrict__ QS = QS_t ? QS_t + (size_t)t * (zstride >> 4) : nullptr;
         // stage position t+1 while t computes (consumed after barrier B)
         if (t + 1 < Ct) {
             if (NT >= 2 * Q27_GDN_KDIM) {
@@ -1356,6 +1490,33 @@ void q27_gdn_conv_tp(unsigned short* qkv, unsigned short* conv_state, int sfull,
     const int nb = (n + Q27_GDN_CONV_NT - 1) / Q27_GDN_CONV_NT;
     hipLaunchKernelGGL(k_gdn_conv_tp, dim3(nb), dim3(Q27_GDN_CONV_NT), 0, s,
                        qkv, conv_state, cw, nq, nk, nv, g * nq, 2048 + g * nk, 4096 + g * nv, sfull);
+}
+
+void q27_gdn_conv_tp_r(unsigned short* qkv, unsigned short* conv_state, int sfull,
+                       const unsigned short* cw, int kh0, int khn, hipStream_t s)
+{
+    const int nq = Q27_GDN_D * khn, nk = Q27_GDN_D * khn, nv = 3 * Q27_GDN_D * khn;
+    const int n  = nq + nk + nv;
+    const int nb = (n + Q27_GDN_CONV_NT - 1) / Q27_GDN_CONV_NT;
+    hipLaunchKernelGGL(k_gdn_conv_tp, dim3(nb), dim3(Q27_GDN_CONV_NT), 0, s,
+                       qkv, conv_state, cw, nq, nk, nv, Q27_GDN_D * kh0, 2048 + Q27_GDN_D * kh0, 4096 + 3 * Q27_GDN_D * kh0, sfull);
+}
+void q27_gdn_step_tp_r(const unsigned short* qkv_c, const unsigned short* z,
+                       const unsigned short* a, const unsigned short* b,
+                       const unsigned short* A_log, const unsigned short* dt_bias,
+                       const unsigned short* norm_w, float* S,
+                       unsigned short* out, int kh0, int khn,
+                       signed char* q, float* qs, float in_scale, hipStream_t s)
+{
+    const float qgs = (in_scale > 0.0f) ? (1.0f / in_scale) : 0.0f;
+    if (!(in_scale > 0.0f)) { q = nullptr; qs = nullptr; }
+    const int vh   = 3 * khn;
+    const int koff = Q27_GDN_D * khn;
+    const int voff = koff + Q27_GDN_D * khn;
+    hipLaunchKernelGGL((k_gdn_step_tp<Q27_GDN_G, Q27_GATE_SWISH>),
+                       dim3(vh), dim3(Q27_GDN_VDIM * Q27_GDN_G), 0, s,
+                       qkv_c, z, a, b, A_log, dt_bias, norm_w, S, out,
+                       koff, voff, 3 * kh0, q, qs, qgs);
 }
 
 void q27_gdn_step_tp(const unsigned short* qkv_c, const unsigned short* z,

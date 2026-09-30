@@ -21,11 +21,17 @@
 // moves the acceptance rate, never correctness, so a fixed scale is acceptable and measurable.
 struct MtpW {
     q27_fp8_t   q, k, v, o;
+    q27_fp8_t   k_full, v_full;          // Q27_MTP_TP: full-width k/v for the prompt-conditioning pass only (the decode k/v are the shard)
     // SLICED onto the EXACT K geometries the TP engine exercises (5120 and 4352). The full-width
     // forms (fc K=10240, down K=17408) are geometries only the non-TP serial path uses, and the
     // draft's MLP output measured 5445 where the oracle measures 0.026 for the same layer type --
     // so the draft moves onto the kernel shapes that are actually gated in production.
     q27_nvfp4_t fc[2], gate, up, down[4];
+    // Q27_EXL3: the same four projections on the trellis, FULL WIDTH -- the
+    // fc/down slicing above is an NVFP4 kernel limit, not a property of the
+    // weights, so the EXL3 path needs neither the slices nor their partial sums.
+    q27_exl3_t  ex_fc, ex_gate, ex_up, ex_down;
+    int         ex_live = 0;
     const unsigned short *in_norm = nullptr, *post_norm = nullptr;
     const unsigned short *q_norm = nullptr, *k_norm = nullptr, *mtp_norm = nullptr;
     const unsigned short *pre_emb = nullptr, *pre_hid = nullptr;
@@ -76,6 +82,7 @@ struct MtpState {
 };
 static MtpState g_mtp[Q27_MAX_DEVICES];
 static int g_mtp_on = 0;
+static int g_mtp_tp = 0;    // Q27_MTP_TP=1: the draft layer is TP-sharded like a trunk full-attention layer (q/o/gate/up/down per card, two LL sites per pass)
 static int g_spec = 0;      // Q27_SPEC=1: speculative decoding (MTP draft + row-batched verify)
 static int g_spec_k = 2;    // Q27_SPEC_K: drafts per round (chained through the MTP layer); verify rows = K+1
 // fc is [5120, 10240]: the concat order of (norm_hidden, norm_embedding) is a property of the
