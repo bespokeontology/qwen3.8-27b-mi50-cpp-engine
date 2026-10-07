@@ -278,14 +278,7 @@ extern "C" int q27_proj_fp8_wide(const q27_fp8_t* w, const signed char* xq, cons
                                   float* y, int M, int ystride,
                                   const unsigned short* radd, int rstride, float rs,
                                   int ki, hipStream_t s) {
-    // A layer-split build Frees a card's fp8 originals once the Q8/int8 mirrors exist ("the
-    // originals are gone: nothing on the Q8 path reads them") and nulls the pointer while keeping
-    // the struct's metadata. This kernel reads the fp8 original, so a null `w->w` is a DECLINE,
-    // not a launch: without this test it enqueued a kernel with a null weight pointer and the
-    // card took a page-not-present fault at null+offset (the varying small addresses of
-    // 2026-09-16). M is a property of the struct, so the old guard passed and `return 1` claimed
-    // a launch that could only fault. See BATCHED_PATH_FAULT_BISECT_20260916.md.
-    if (!w || !w->w || M < 1 || (w->K & 15) || w->K < 16) return 0;
+    if (!w || M < 1 || (w->K & 15) || w->K < 16) return 0;
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64));
     // KI=8: sw 18,432 + sx 18,432 + sxsc 2,048 = 38,912 B of the 64 KB LDS budget. KI=16 needs
@@ -366,8 +359,7 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_fp8b(
 
 extern "C" int q27_proj_fp8_wideb(const q27_fp8_t* w, const signed char* xq, const float* xs,
                                   unsigned short* y, int M, int ystride, int ki, hipStream_t s) {
-    // Same decline-not-launch rule as q27_proj_fp8_wide above: this kernel reads `w->w`.
-    if (!w || !w->w || M < 1 || (w->K & 15) || w->K < 16) return 0;
+    if (!w || M < 1 || (w->K & 15) || w->K < 16) return 0;
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64));
     if (ki == 8)  { hipLaunchKernelGGL((q27_k_wide_fp8b<8,8,1>),  g, dim3(512), 0, s, w->w, xq, xs, alpha, w->rows, w->K, M, y, ystride); return 1; }
@@ -1159,24 +1151,10 @@ static void q27_dec_i8_route_declined(const q27_fp8_t* w, int NR);
 static int q27_dec_i8_on();
 static int q27_dec_i8_plain_on();
 extern "C" const q27_i8g_t* q27_fp8_i8g(const q27_fp8_t* w);
-// ---- Q27_ALIAS_K_DBG: temporary diagnosis of the K-view aliasing (prints only, default OFF) ----
-static int q27_alias_kdbg() { static int v = -1; if (v < 0) { const char* e = getenv("Q27_ALIAS_K_DBG"); v = e ? atoi(e) : 0; } return v; }
-static int q27_alias_ksync() { static int v = -1; if (v < 0) { const char* e = getenv("Q27_ALIAS_K_SYNC"); v = e ? atoi(e) : 0; } return v; }
-static int      s_akdbg_n = 0;
-static unsigned s_akdbg_key[256];
-static void q27_alias_klog(unsigned key, const char* what, const q27_i8g_t* m, int a, int b, int c) {
-    if (!q27_alias_kdbg()) return;
-    for (int i = 0; i < s_akdbg_n; ++i) if (s_akdbg_key[i] == key) return;
-    if (s_akdbg_n >= 256) return;
-    s_akdbg_key[s_akdbg_n++] = key;
-    std::fprintf(stderr, "Q27_ALIAS_K_DBG %-14s rows=%d K=%d ldw=%d lds=%d a=%d b=%d c=%d\n",
-                 what, m ? m->rows : -1, m ? m->K : -1, m ? m->ldw : -1, m ? m->lds : -1, a, b, c);
-    std::fflush(stderr);
-}
 extern "C" int q27_proj_fp8_bf16(const q27_fp8_t* w, const signed char* xq, const float* xs,
                                  unsigned short* y, hipStream_t s) {
     if (!q27_env_flag("Q27_FP8_BF16", true)) return 0;
-    if (q27_dec_i8_plain_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, w->rows, nullptr, 0, 0.f, 1, -1, s)) return 1; q27_alias_klog(0x11u, "decline1", m, w->K, 1, q27_fp8_freed()); q27_dec_i8_route_declined(w, 1); } }
+    if (q27_dec_i8_plain_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, w->rows, nullptr, 0, 0.f, 1, -1, s)) return 1; q27_dec_i8_route_declined(w, 1); } }
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const int R = q27_fp8_pick_R(w->rows, w->K);
     if (q27_env_flag("Q27_FP8_NARROW", false) && w->K == 5120) {
@@ -1309,7 +1287,7 @@ extern "C" int q27_proj_fp8_res(const q27_fp8_t* w, const signed char* xq, const
                                 float* y, const unsigned short* radd, float rs, hipStream_t s) {
     static const bool stream = q27_env_flag("Q27_FP8_STREAM", true);
     if (!stream || w->K != 1536) return 0;
-    if (q27_dec_i8_plain_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, w->rows, radd, 0, rs, 1, -1, s)) return 1; q27_alias_klog(0x12u, "decline2", m, w->K, 1, q27_fp8_freed()); q27_dec_i8_route_declined(w, 1); } }
+    if (q27_dec_i8_plain_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, w->rows, radd, 0, rs, 1, -1, s)) return 1; q27_dec_i8_route_declined(w, 1); } }
     const float alpha = w->in_scale * w->wscale * 256.0f;
     static const int forced = q27_env_int("Q27_FP8_R", 0);
     static const int alt = q27_env_int("Q27_GEMV_ALT", 0);
@@ -3409,13 +3387,12 @@ extern "C" int q27_proj_fp8_wide_f32r(const q27_fp8_t* w, const signed char* xq,
 // from 0, then acc += dot * scale in step order), so each row's output is bit-identical.
 // Activation rows are contiguous ([NR][K] int8 natural order, [NR][K/16] f32 scales); outputs
 // land at y + n*ystride; the folded residual share reads radd + n*rstride.
-template <int NR, int R, int NSTEP, int OUTBF, int BS = 0>
+template <int NR, int R, int NSTEP, int OUTBF>
 __global__ __launch_bounds__(256) void q27_k_proj_fp8_snr(
         const unsigned char* __restrict__ W, const signed char* __restrict__ xq,
         const float* __restrict__ xs, void* __restrict__ yv, int ystride,
         int rows, int K, float alpha,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        const unsigned short* __restrict__ BSC = nullptr, int bs_kblk = 0) {
+        const unsigned short* __restrict__ radd, int rstride, float rs, int xst) {
     const int lane = threadIdx.x & 63;
     const int wave = threadIdx.x >> 6;
     const int row0 = (blockIdx.x * 4 + wave) * R;
@@ -3432,7 +3409,6 @@ __global__ __launch_bounds__(256) void q27_k_proj_fp8_snr(
     uint4 wv[R][NSTEP];
     uint4 xv[NR][NSTEP];
     float sc[NR][NSTEP];
-    float wbs[R][NSTEP];      // BS=1: this (row, K-block) weight scale; 1.0 when BS=0
     bool  ok[NSTEP];
 #pragma unroll
     for (int t = 0; t < NSTEP; ++t) {
@@ -3441,15 +3417,6 @@ __global__ __launch_bounds__(256) void q27_k_proj_fp8_snr(
         const int ks = ok[t] ? k0 : 0;
 #pragma unroll
         for (int r = 0; r < R; ++r) wv[r][t] = q27_ld16nt(wp[r] + ks);
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            if (BS) {
-                // A lane's 16 contiguous K values never straddle a 128-wide block (16 | 128), so one
-                // scale per (r, t) is exact rather than an approximation.
-                const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
-                wbs[r][t] = q27_bf2f(BSC[(size_t)(rr >> 7) * (size_t)bs_kblk + (size_t)(ks >> 7)]);
-            } else wbs[r][t] = 1.0f;
-        }
 #pragma unroll
         for (int n = 0; n < NR; ++n) {
             xv[n][t] = *(const uint4*)(xq + (size_t)n * xst + ks);
@@ -3485,7 +3452,7 @@ __global__ __launch_bounds__(256) void q27_k_proj_fp8_snr(
                 float d = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) d = q27_fdot2(wh[r][j], xh[j], d);
-                acc[n][r] += d * sc[n][t] * wbs[r][t];
+                acc[n][r] += d * sc[n][t];
             }
         }
     }
@@ -3510,162 +3477,6 @@ __global__ __launch_bounds__(256) void q27_k_proj_fp8_snr(
     }
 }
 
-// ---- ROLLING-PREFETCH block-scaled FP8 (BS=1) ----
-// q27_k_proj_fp8_snr stages all NSTEP k-blocks of activations/weights in registers before any
-// compute. At NR=3 that is ~15 activation uint4 + 5 weight uint4 live at once, which lands the
-// MLP consumer at ~40% of the read roofline (occupancy-bound). This variant keeps a 2-deep rolling
-// window (block t+1 loaded while block t computes) so only two k-blocks are live. The accumulation
-// order (t = 0..NSTEP-1, j = 0..7, d * sc * wbs) and the epilogue are bit-identical to the
-// register form; only the load scheduling changes.
-template <int NR, int R, int NSTEP>
-__device__ __forceinline__ void q27_fp8b_roll_body(
-        const unsigned char* __restrict__ W, const signed char* __restrict__ xq,
-        const float* __restrict__ xs, void* __restrict__ yv, int ystride,
-        int rows, int K, float alpha,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        const unsigned short* __restrict__ BSC, int bs_kblk, int row_group) {
-    const int lane = threadIdx.x & 63;
-    const int wave = threadIdx.x >> 6;
-    const int row0 = (row_group * 4 + wave) * R;
-    if (row0 >= rows) return;
-
-    const unsigned char* wp[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
-        wp[r] = W + (size_t)rr * (size_t)K;
-    }
-
-    uint4 wv[R][2];
-    uint4 xv[NR][2];
-    float sc[NR][2];
-    float wbs[R][2];
-    bool  ok[2];
-
-    // prime buffer 0 with block 0
-    {
-        const int k0 = lane * 16;
-        ok[0] = (k0 < K);
-        if (ok[0]) {
-#pragma unroll
-            for (int r = 0; r < R; ++r) wv[r][0] = q27_ld16nt(wp[r] + k0);
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
-                wbs[r][0] = q27_bf2f(BSC[(size_t)(rr >> 7) * (size_t)bs_kblk + (size_t)(k0 >> 7)]);
-            }
-#pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                xv[n][0] = *(const uint4*)(xq + (size_t)n * xst + k0);
-                sc[n][0] = xs[(size_t)n * (xst >> 4) + (k0 >> 4)];
-            }
-        }
-    }
-
-    float acc[NR][R];
-#pragma unroll
-    for (int n = 0; n < NR; ++n)
-#pragma unroll
-        for (int r = 0; r < R; ++r) acc[n][r] = 0.0f;
-
-#pragma unroll 1
-    for (int t = 0; t < NSTEP; ++t) {
-        // load block t+1 into buffer 1 while block t is still in buffer 0
-        if (t + 1 < NSTEP) {
-            const int k1 = ((t + 1) << 10) + lane * 16;
-            ok[1] = (k1 < K);
-            if (ok[1]) {
-#pragma unroll
-                for (int r = 0; r < R; ++r) wv[r][1] = q27_ld16nt(wp[r] + k1);
-#pragma unroll
-                for (int r = 0; r < R; ++r) {
-                    const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
-                    wbs[r][1] = q27_bf2f(BSC[(size_t)(rr >> 7) * (size_t)bs_kblk + (size_t)(k1 >> 7)]);
-                }
-#pragma unroll
-                for (int n = 0; n < NR; ++n) {
-                    xv[n][1] = *(const uint4*)(xq + (size_t)n * xst + k1);
-                    sc[n][1] = xs[(size_t)n * (xst >> 4) + (k1 >> 4)];
-                }
-            }
-        }
-        if (ok[0]) {
-            unsigned wh[R][8];
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                q27_e4m3x4_h2(wv[r][0].x, wh[r][0], wh[r][1]);
-                q27_e4m3x4_h2(wv[r][0].y, wh[r][2], wh[r][3]);
-                q27_e4m3x4_h2(wv[r][0].z, wh[r][4], wh[r][5]);
-                q27_e4m3x4_h2(wv[r][0].w, wh[r][6], wh[r][7]);
-            }
-#pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                unsigned xh[8];
-                q27_i8x4_h2(xv[n][0].x, xh[0], xh[1]);
-                q27_i8x4_h2(xv[n][0].y, xh[2], xh[3]);
-                q27_i8x4_h2(xv[n][0].z, xh[4], xh[5]);
-                q27_i8x4_h2(xv[n][0].w, xh[6], xh[7]);
-#pragma unroll
-                for (int r = 0; r < R; ++r) {
-                    float d = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) d = q27_fdot2(wh[r][j], xh[j], d);
-                    acc[n][r] += d * sc[n][0] * wbs[r][0];
-                }
-            }
-        }
-        if (t + 1 < NSTEP) {
-            ok[0] = ok[1];
-            if (ok[1]) {
-#pragma unroll
-                for (int r = 0; r < R; ++r) { wv[r][0] = wv[r][1]; wbs[r][0] = wbs[r][1]; }
-#pragma unroll
-                for (int n = 0; n < NR; ++n) { xv[n][0] = xv[n][1]; sc[n][0] = sc[n][1]; }
-            }
-        }
-    }
-
-#pragma unroll
-    for (int o = 32; o; o >>= 1)
-#pragma unroll
-        for (int n = 0; n < NR; ++n)
-#pragma unroll
-            for (int r = 0; r < R; ++r) acc[n][r] += __shfl_down(acc[n][r], o, 64);
-    if (lane == 0) {
-#pragma unroll
-        for (int n = 0; n < NR; ++n)
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if (row0 + r >= rows) continue;
-                float v = acc[n][r] * alpha;
-                if (radd) v += rs * q27_bf2f(radd[(size_t)n * rstride + row0 + r]);
-                ((float*)yv)[(size_t)n * ystride + row0 + r] = v;
-            }
-    }
-}
-template <int NR, int R, int NSTEP>
-__global__ __launch_bounds__(256) void q27_k_proj_fp8b_roll(
-        const unsigned char* __restrict__ W, const signed char* __restrict__ xq,
-        const float* __restrict__ xs, void* __restrict__ yv, int ystride,
-        int rows, int K, float alpha,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        const unsigned short* __restrict__ BSC, int bs_kblk) {
-    q27_fp8b_roll_body<NR,R,NSTEP>(W,xq,xs,yv,ystride,rows,K,alpha,radd,rstride,rs,xst,BSC,bs_kblk,blockIdx.x);
-}
-
-// Lottolabs' packed gate/up projection is one decode operation. Use the same
-// schedule on gfx906 without repacking or changing precision: alternate gate
-// and up row groups in a single launch. Each wave retains its original K order.
-__global__ __launch_bounds__(256) void q27_k_fp8b_gate_up_m1(
-        const unsigned char* wg, const unsigned char* wu,
-        const unsigned short* sg, const unsigned short* su,
-        const signed char* xq, const float* xs, float* yg, float* yu,
-        int rows, int K, int ystride, int bs_kblk, float ag, float au) {
-    const bool up = (blockIdx.x & 1) != 0;
-    q27_fp8b_roll_body<1,1,5>(up ? wu : wg,xq,xs,up ? yu : yg,ystride,rows,K,
-                             up ? au : ag,nullptr,0,0.f,K,up ? su : sg,bs_kblk,blockIdx.x >> 1);
-}
-
 #define Q27_NR_CASES(LAUNCH) \
     switch (NR) { case 1: LAUNCH(1); break; case 2: LAUNCH(2); break; \
                   case 3: LAUNCH(3); break; case 4: LAUNCH(4); break; default: return 0; }
@@ -3681,7 +3492,7 @@ extern "C" const q27_i8g_t* q27_fp8_i8g(const q27_fp8_t* w);
 extern "C" int q27_proj_fp8_bf16_nr(const q27_fp8_t* w, const signed char* xq, const float* xs,
                                     unsigned short* y, int ystride, int NR, hipStream_t s) {
     if (!w || w->K != 5120 || NR < 1 || NR > 8) return 0;
-    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, -1, s)) return 1; q27_alias_klog(0x13u, "decline3", m, w->K, NR, q27_fp8_freed()); q27_dec_i8_route_declined(w, NR); } }
+    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, -1, s)) return 1; q27_dec_i8_route_declined(w, NR); } }
     if (NR >= q27_fp8_nr_lds_min()) return q27_fp8_lds8(w, xq, w->K, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, s);
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const dim3 grid((unsigned)((w->rows + 3) / 4)), blk(256);          // R=1 (R=2 measured slower)
@@ -3697,7 +3508,7 @@ extern "C" int q27_proj_fp8_bf16_nr(const q27_fp8_t* w, const signed char* xq, c
 extern "C" int q27_proj_fp8_bf16_nrs(const q27_fp8_t* w, const signed char* xq, int xst, const float* xs,
                                      unsigned short* y, int ystride, int NR, hipStream_t s) {
     if (!w || NR < 1 || NR > 8 || (w->K != 5120 && w->K != 6144)) return 0;
-    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, xst, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, -1, s)) return 1; q27_alias_klog(0x14u, "decline4", m, w->K, NR, q27_fp8_freed()); q27_dec_i8_route_declined(w, NR); } }
+    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, xst, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, -1, s)) return 1; q27_dec_i8_route_declined(w, NR); } }
     if (NR >= q27_fp8_nr_lds_min()) return q27_fp8_lds8(w, xq, xst, xs, (void*)y, ystride, nullptr, 0, 0.f, NR, s);
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const dim3 grid((unsigned)((w->rows + 3) / 4)), blk(256);
@@ -3714,109 +3525,14 @@ extern "C" int q27_proj_fp8_bf16_nrs(const q27_fp8_t* w, const signed char* xq, 
     }
     return 1;
 }
-// BLOCK-SCALED FP8 MLP (Qwen3.8-27B-FP8). One dispatcher for both MLP shapes -- gate/up K=5120 and
-// down K=4352 -- because NSTEP=5 covers each (ok[] guards the ragged tail at 4352). R=1 keeps this
-// the simplest correct form; R>1 is a later question, not a first-boot one. alpha carries only
-// in_scale * 256 (the 2^8 the exponent-free e4m3->fp16 decode leaves behind): the weight scale is
-// NOT a per-tensor constant here, it is the [rows/128][K/128] plane folded in per K-block.
-// bs/bs_kblk are expected SHARD-LOCAL -- the loader compacts each card's block range so (row>>7)
-// and (k>>7) index the shard directly and no card offset is needed in the kernel.
-static int q27_fp8b_roll_on() {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("Q27_FP8B_ROLL"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
-    return v;
-}
-
-extern "C" int q27_proj_fp8b_nr(const q27_fp8_t* w, const signed char* xq, const float* xs,
-                                float* y, int ystride, const unsigned short* radd, int rstride,
-                                float rs, int NR, hipStream_t s) {
-    if (!w || !w->w || !w->bs || w->bs_kblk <= 0) return 0;
-    if (w->K <= 0 || w->K > 5120 || NR < 1 || NR > 4) return 0;
-    const float alpha = w->in_scale * 256.0f;
-    const dim3 grid((unsigned)((w->rows + 3) / 4)), blk(256);
-    if (q27_fp8b_roll_on()) {
-#define Q27_L(N) hipLaunchKernelGGL((q27_k_proj_fp8b_roll<N,1,5>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, w->K, w->bs, w->bs_kblk)
-        Q27_NR_CASES(Q27_L)
-#undef Q27_L
-        return 1;
-    }
-#define Q27_L(N) hipLaunchKernelGGL((q27_k_proj_fp8_snr<N,1,5,0,1>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, w->K, w->bs, w->bs_kblk)
-    Q27_NR_CASES(Q27_L)
-#undef Q27_L
-    return 1;
-}
-
-// Q27_LS_SR: the same block-scaled consumer with an EXPLICIT activation row stride. The owner card
-// runs down_proj as its four K-slices over one [NR][INTER] natural-order activation, so slice c
-// reads xq + c*4352 of a row whose pitch is INTER, not the slice's K.
-// Target-only M=1 specialization; all other regimes keep their existing route.
-extern "C" int q27_proj_fp8b_gu_nr(const q27_fp8_t* g, const q27_fp8_t* u,
-        const signed char* xq, const float* xs, float* yg, float* yu,
-        int ystride, int NR, hipStream_t stream) {
-    static const bool enabled = [] { const char* e=getenv("Q27_FP8B_GU_FUSED"); return e && atoi(e)==1; }();
-    if (enabled && NR==1 && q27_fp8b_roll_on() && g && u && g->w && u->w && g->bs && u->bs &&
-        g->rows==u->rows && g->rows>0 && g->K==5120 && u->K==5120 &&
-        g->bs_kblk==u->bs_kblk && g->bs_kblk>0 && ystride>=g->rows) {
-        hipLaunchKernelGGL(q27_k_fp8b_gate_up_m1,dim3(2*((g->rows+3)/4)),dim3(256),0,stream,
-            g->w,u->w,g->bs,u->bs,xq,xs,yg,yu,g->rows,g->K,ystride,g->bs_kblk,
-            g->in_scale*256.f,u->in_scale*256.f);
-        return 1;
-    }
-    return q27_proj_fp8b_nr(g,xq,xs,yg,ystride,nullptr,0,0.f,NR,stream) &&
-           q27_proj_fp8b_nr(u,xq,xs,yu,ystride,nullptr,0,0.f,NR,stream);
-}
-
-extern "C" int q27_proj_fp8b_nrs(const q27_fp8_t* w, const signed char* xq, int xst, const float* xs,
-                                 float* y, int ystride, const unsigned short* radd, int rstride,
-                                 float rs, int NR, hipStream_t s) {
-    if (!w || !w->w || !w->bs || w->bs_kblk <= 0) return 0;
-    // Q27_MLP_WSHARE (2026-09-18): the resident MLP's down K-slice is no longer fixed at
-    // INTER/ndev. NSTEP is a COMPILE-TIME count of 1024-wide k-blocks, so the old `K > 5120`
-    // guard was a real kernel limit, not a policy. K <= 5120 keeps the shipped <N,1,5>
-    // instantiation untouched; anything wider (a card owning more than5 k-blocks of the MLP)
-    // gets <N,1,8>, which covers K <= 8192. Everything else the kernel reads -- rows, K,
-    // bs_kblk, xst -- is already runtime-shaped.
-    const int nstep = (w->K + 1023) / 1024;
-    if (w->K <= 0 || nstep > 8 || xst < w->K || (xst & 15) || NR < 1 || NR > 4) return 0;
-    const float alpha = w->in_scale * 256.0f;
-    const dim3 grid((unsigned)((w->rows + 3) / 4)), blk(256);
-    if (q27_fp8b_roll_on()) {
-#define Q27_L(N) do { \
-        if (nstep > 5) hipLaunchKernelGGL((q27_k_proj_fp8b_roll<N,1,8>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, xst, w->bs, w->bs_kblk); \
-        else hipLaunchKernelGGL((q27_k_proj_fp8b_roll<N,1,5>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, xst, w->bs, w->bs_kblk); } while (0)
-        Q27_NR_CASES(Q27_L)
-#undef Q27_L
-        return 1;
-    }
-#define Q27_L(N) do { \
-        if (nstep > 5) hipLaunchKernelGGL((q27_k_proj_fp8_snr<N,1,8,0,1>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, xst, w->bs, w->bs_kblk); \
-        else hipLaunchKernelGGL((q27_k_proj_fp8_snr<N,1,5,0,1>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, xst, w->bs, w->bs_kblk); } while (0)
-    Q27_NR_CASES(Q27_L)
-#undef Q27_L
-    return 1;
-}
-
 extern "C" int q27_proj_fp8_res_nr(const q27_fp8_t* w, const signed char* xq, const float* xs,
                                    float* y, int ystride, const unsigned short* radd, int rstride,
                                    float rs, int NR, hipStream_t s) {
-    if (!w || w->K <= 0 || w->K > 3072 || (w->K % 64) || NR < 1 || NR > 8) return 0;   // Q27_TP3: o/out_proj K slices up to 3072 (NSTEP 2 or 3, ragged tails via ok[])
-    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, ystride, radd, rstride, rs, NR, -1, s)) return 1; q27_alias_klog(0x15u, "decline5", m, w->K, NR, q27_fp8_freed()); q27_dec_i8_route_declined(w, NR); } }
+    if (!w || w->K != 1536 || NR < 1 || NR > 8) return 0;
+    if (q27_dec_i8_on()) { const q27_i8g_t* m = q27_fp8_i8g(w); if (m) { if (q27_proj_i8g_rows(m, xq, w->K, xs, (void*)y, ystride, radd, rstride, rs, NR, -1, s)) return 1; q27_dec_i8_route_declined(w, NR); } }
     if (NR >= q27_fp8_nr_lds_min()) return q27_fp8_lds8(w, xq, w->K, xs, (void*)y, ystride, radd, rstride, rs, NR, s);
     const float alpha = w->in_scale * w->wscale * 256.0f;
     const dim3 grid((unsigned)((w->rows + 7) / 8)), blk(256);          // R=2: 8 rows per block (R=4 measured slower)
-    if (w->K > 2048) {
-#define Q27_L3(N) hipLaunchKernelGGL((q27_k_proj_fp8_snr<N,2,3,0>), grid, blk, 0, s, w->w, xq, xs, \
-                     (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, w->K)
-        Q27_NR_CASES(Q27_L3)
-#undef Q27_L3
-        return 1;
-    }
 #define Q27_L(N) hipLaunchKernelGGL((q27_k_proj_fp8_snr<N,2,2,0>), grid, blk, 0, s, w->w, xq, xs, \
                      (void*)y, ystride, w->rows, w->K, alpha, radd, rstride, rs, w->K)
     Q27_NR_CASES(Q27_L)
@@ -4089,22 +3805,6 @@ extern "C" int q27_fp8_make_i8g(const q27_fp8_t* w, hipStream_t s) {
 // Q27_DEC_I8: once the fp8 originals are released, each handle's weight pointer is replaced by a non-canonical
 // sentinel (any accidental fp8 use faults loudly instead of reading recycled VRAM); the mirror stays reachable
 // because its side-table key moves to the sentinel with it.
-// REGISTER AN EXISTING i8g TENSOR AS A HANDLE'S MIRROR, without building one.
-// The side table is keyed by HANDLE ADDRESS and stores the descriptor BY VALUE, so a mirror does
-// not have to be a tensor this card converted -- it can be a VIEW into one that already exists.
-// That is what lets a TP decode handle address the layer-split residency's full-width copy
-// instead of carrying its own: q27_i8g_t is w=[rows][K] with s=[rows][K/64], both row-contiguous,
-// and the group scales are per-row, so an output-row boundary can never split a quantization
-// group. A TP shard of an output-row-sharded projection is therefore a pointer offset and a row
-// count over the same bytes -- no repack, no conversion, no second copy.
-extern "C" int q27_fp8_set_i8g(const q27_fp8_t* w, const q27_i8g_t* m) {
-    if (!w || !m || !m->w || !m->s) return 0;
-    for (int i = 0; i < s_i8g_n; ++i)
-        if (s_i8g_key[i] == (const unsigned char*)w) { s_i8g_val[i] = *m; return 1; }
-    if (s_i8g_n >= 4096) return 0;
-    s_i8g_key[s_i8g_n] = (const unsigned char*)w; s_i8g_val[s_i8g_n] = *m; ++s_i8g_n;
-    return 1;
-}
 extern "C" int q27_fp8_i8g_rekey(const void* oldw, const void* neww) {
     for (int i = 0; i < s_i8g_n; ++i) if (s_i8g_key[i] == (const unsigned char*)oldw) { s_i8g_key[i] = (const unsigned char*)neww; return 1; }
     return 0;
@@ -4116,22 +3816,13 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_snr(
         const signed char* __restrict__ W, const float* __restrict__ WS, const signed char* __restrict__ xq,
         const float* __restrict__ xs, void* __restrict__ yv, int ystride,
         int rows, int K, float alpha,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        // K-VIEW (0 = dense): when the shard's rows are a COLUMN RANGE of a wider resident tensor,
-        // ldw is that tensor's physical row stride and lds the stride of its per-64 scale plane.
-        // The logical K (and therefore NSTEP, the group count and every in-row offset) is unchanged
-        // -- only how a row is reached changes. This is what lets decode read the layer-split
-        // residency in place instead of keeping a second, K-sharded copy of the same weights.
-        int ldw, int lds,
-        // Q27_LL_EPI: when ll != null (host guarantees rows % 4 == 0 and OUTBF == 0), also write the LL words
-        // {bf16(v[row]) | bf16(v[row+1]) << 16, llseq} for each row pair into ll[n * llstride + row/2].
-        uint2* __restrict__ ll, int llstride, unsigned llseq) {
+        const unsigned short* __restrict__ radd, int rstride, float rs, int xst) {
     const int lane = threadIdx.x & 63;
     const int wave = threadIdx.x >> 6;
     const int row = blockIdx.x * 4 + wave;
     if (row >= rows) return;
-    const signed char* wp = W + (size_t)row * (size_t)(ldw ? ldw : K);
-    const float* wsp = WS + (size_t)row * (size_t)(lds ? lds : (K >> 6));
+    const signed char* wp = W + (size_t)row * (size_t)K;
+    const float* wsp = WS + (size_t)row * (size_t)(K >> 6);
     uint4 wv[NSTEP]; float ws[NSTEP];
     uint4 xv[NR][NSTEP];
     float sc[NR][NSTEP];
@@ -4168,149 +3859,15 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_snr(
     for (int o = 32; o; o >>= 1)
 #pragma unroll
         for (int n = 0; n < NR; ++n) acc[n] += __shfl_down(acc[n], o, 64);
-    float vout[NR];
     if (lane == 0) {
 #pragma unroll
         for (int n = 0; n < NR; ++n) {
             float v = acc[n] * alpha;
             if (radd) v += rs * q27_bf2f(radd[(size_t)n * rstride + row]);
-            vout[n] = v;
             if (OUTBF) ((unsigned short*)yv)[(size_t)n * ystride + row] = q27_f2bf(v);
             else       ((float*)yv)[(size_t)n * ystride + row] = v;
         }
     }
-    if (ll) {   // Q27_LL_EPI: rows 4 per block, pairs (2j, 2j+1) = waves (0,1) and (2,3); no wave returned early (rows % 4 == 0)
-        __shared__ float sll[NR][4];
-        if (lane == 0) {
-#pragma unroll
-            for (int n = 0; n < NR; ++n) sll[n][wave] = vout[n];
-        }
-        __syncthreads();
-        if (lane == 0 && (wave & 1) == 0) {
-#pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                uint2 o;
-                o.x = (unsigned)q27_f2bf(sll[n][wave]) | ((unsigned)q27_f2bf(sll[n][wave + 1]) << 16);
-                o.y = llseq;
-                ll[(size_t)n * llstride + (row >> 1)] = o;
-            }
-        }
-    }
-}
-// Q27_PROJ_SEG (2026-09-28): ONE launch for up to three same-K, bf16-out projections that read the SAME activation rows
-// (q/k/v of an attention layer, in_qkv/in_z of a GDN layer). The grid is the concatenation of the segments' block ranges;
-// a block resolves its segment from blockIdx.x (uniform per block) and then runs exactly the q27_k_proj_i8g_snr<NR,NSTEP,1>
-// body against that segment's weights, so every output is bit-identical to the separate launches.
-struct q27_i8g_seg_t { const signed char* W; const float* WS; unsigned short* y; int rows, ystride, ldw, lds, blk0; float alpha; };
-struct q27_i8g_segs_t { q27_i8g_seg_t s[3]; int nseg; };
-template <int NR, int NSTEP, int W8 = 0>
-__global__ __launch_bounds__(256) void q27_k_proj_i8g_snr_seg(q27_i8g_segs_t segs, const signed char* __restrict__ xq,
-                                                            const float* __restrict__ xs, int K, int xst) {
-    int si = 0;
-    if (segs.nseg > 1 && (int)blockIdx.x >= segs.s[1].blk0) si = 1;
-    if (segs.nseg > 2 && (int)blockIdx.x >= segs.s[2].blk0) si = 2;
-    const signed char* W  = (si == 0) ? segs.s[0].W  : (si == 1) ? segs.s[1].W  : segs.s[2].W;
-    const float* WS       = (si == 0) ? segs.s[0].WS : (si == 1) ? segs.s[1].WS : segs.s[2].WS;
-    unsigned short* yv    = (si == 0) ? segs.s[0].y  : (si == 1) ? segs.s[1].y  : segs.s[2].y;
-    const int rows        = (si == 0) ? segs.s[0].rows    : (si == 1) ? segs.s[1].rows    : segs.s[2].rows;
-    const int ystride     = (si == 0) ? segs.s[0].ystride : (si == 1) ? segs.s[1].ystride : segs.s[2].ystride;
-    const int ldw         = (si == 0) ? segs.s[0].ldw  : (si == 1) ? segs.s[1].ldw  : segs.s[2].ldw;
-    const int lds         = (si == 0) ? segs.s[0].lds  : (si == 1) ? segs.s[1].lds  : segs.s[2].lds;
-    const int blk0        = (si == 0) ? segs.s[0].blk0 : (si == 1) ? segs.s[1].blk0 : segs.s[2].blk0;
-    const float alpha     = (si == 0) ? segs.s[0].alpha : (si == 1) ? segs.s[1].alpha : segs.s[2].alpha;
-    const int lane = threadIdx.x & 63;
-    const int wave = threadIdx.x >> 6;
-    const int row = ((int)blockIdx.x - blk0) * 4 + wave;
-    if (row >= rows) return;
-    const signed char* wp = W + (size_t)row * (size_t)(ldw ? ldw : K);
-    const float* wsp = WS + (size_t)row * (size_t)(lds ? lds : (K >> 6));
-    uint4 wv[NSTEP]; float ws[NSTEP];
-    uint4 xv[NR][NSTEP];
-    float sc[NR][NSTEP];
-    bool  ok[NSTEP];
-#pragma unroll
-    for (int t = 0; t < NSTEP; ++t) {
-        const int k0 = (t << 10) + lane * 16;
-        ok[t] = (k0 < K);
-        const int ks = ok[t] ? k0 : 0;
-        // Q27_SEG_W8: two 8-B loads (512-B wave burst) instead of one 16-B load (1024-B).
-        // Donor: uint2 741 GB/s vs uint4 643 GB/s at the same total bytes.
-        if (W8) {
-            const uint2 w0 = *(const uint2*)(wp + ks);
-            const uint2 w1 = *(const uint2*)(wp + ks + 8);
-            wv[t] = make_uint4(w0.x, w0.y, w1.x, w1.y);
-        } else {
-            wv[t] = q27_ld16nt(wp + ks);
-        }
-        ws[t] = wsp[ks >> 6];
-#pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            if (W8) {
-                const uint2 x0 = *(const uint2*)(xq + (size_t)n * xst + ks);
-                const uint2 x1 = *(const uint2*)(xq + (size_t)n * xst + ks + 8);
-                xv[n][t] = make_uint4(x0.x, x0.y, x1.x, x1.y);
-            } else {
-                xv[n][t] = *(const uint4*)(xq + (size_t)n * xst + ks);
-            }
-            sc[n][t] = xs[(size_t)n * (xst >> 4) + (ks >> 4)];
-        }
-    }
-    float acc[NR];
-#pragma unroll
-    for (int n = 0; n < NR; ++n) acc[n] = 0.0f;
-#pragma unroll
-    for (int t = 0; t < NSTEP; ++t) {
-        if (!ok[t]) continue;
-#pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            int d = q27_d4(wv[t].x, xv[n][t].x, 0);
-            d = q27_d4(wv[t].y, xv[n][t].y, d);
-            d = q27_d4(wv[t].z, xv[n][t].z, d);
-            d = q27_d4(wv[t].w, xv[n][t].w, d);
-            acc[n] = fmaf((float)d, ws[t] * sc[n][t], acc[n]);
-        }
-    }
-#pragma unroll
-    for (int o = 32; o; o >>= 1)
-#pragma unroll
-        for (int n = 0; n < NR; ++n) acc[n] += __shfl_down(acc[n], o, 64);
-    if (lane == 0) {
-#pragma unroll
-        for (int n = 0; n < NR; ++n) yv[(size_t)n * ystride + row] = q27_f2bf(acc[n] * alpha);
-    }
-}
-// host entry: up to three K=5120 bf16-out int8-mirror projections in one launch (NR <= 4, register form only).
-// Returns 0 (caller falls back to separate launches) when any segment lacks a mirror or the shape is not the K=5120 one.
-extern "C" int q27_proj_i8g_bf16_seg(const q27_fp8_t* const* ws, unsigned short* const* ys, const int* ystrides, int nseg,
-                                     const signed char* xq, const float* xs, int NR, hipStream_t s) {
-    if (nseg < 2 || nseg > 3 || NR < 1 || NR > 4 || !q27_dec_i8_on() || NR >= q27_fp8_nr_lds_min()) return 0;
-    q27_i8g_segs_t segs{}; int blocks = 0;
-    for (int i = 0; i < nseg; ++i) {
-        const q27_fp8_t* w = ws[i]; if (!w || w->K != 5120) return 0;
-        const q27_i8g_t* m = q27_fp8_i8g(w); if (!m || !m->w || !m->s || m->K != 5120) return 0;
-        if ((m->ldw && m->ldw < m->K) || (m->lds && m->lds < (m->K >> 6))) return 0;
-        segs.s[i] = { m->w, m->s, ys[i], m->rows, ystrides[i], m->ldw, m->lds, blocks, m->alpha };
-        blocks += (m->rows + 3) / 4;
-    }
-    segs.nseg = nseg;
-    const dim3 grid((unsigned)blocks), blk(256);
-    static const bool seg_w8 = q27_env_flag("Q27_SEG_W8", false);
-    if (seg_w8) {
-        switch (NR) {
-            case 1: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<1,5,1>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            case 2: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<2,5,1>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            case 3: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<3,5,1>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            default: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<4,5,1>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-        }
-    } else {
-        switch (NR) {
-            case 1: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<1,5,0>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            case 2: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<2,5,0>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            case 3: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<3,5,0>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-            default: hipLaunchKernelGGL((q27_k_proj_i8g_snr_seg<4,5,0>), grid, blk, 0, s, segs, xq, xs, 5120, 5120); break;
-        }
-    }
-    return 1;
 }
 // LDS form, NR 5..8: the v7 fp8 LDS kernel's structure (two weight rows per iteration, next-pair
 // prefetch, residual prefetched, accumulators pinned per step) with int8 weights and per-64 scales.
@@ -4319,11 +3876,9 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_lds8_nr(
         const signed char* __restrict__ W, const float* __restrict__ WS, const signed char* __restrict__ xq,
         const float* __restrict__ xs, void* __restrict__ yv, int ystride,
         int rows, int K, float alpha,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int rpw, int xst,
-        int ldw, int lds) {   // K-VIEW strides (0 = dense), same contract as q27_k_proj_i8g_snr
+        const unsigned short* __restrict__ radd, int rstride, float rs, int rpw, int xst) {
     constexpr int KB = NSTEP * 1024;
     constexpr int KS = KB / 16;
-    const int lwr = ldw ? ldw : K, lsp = lds ? lds : (K >> 6);
     __shared__ __align__(16) signed char sx[NR][KB];
     __shared__ float ss[NR][KS];
     const int kb = K, ks = K >> 4;
@@ -4345,7 +3900,7 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_lds8_nr(
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int rr = (rowbase + p < rows) ? rowbase + p : rows - 1;
-        const signed char* wp = W + (size_t)rr * (size_t)lwr; const float* wsp = WS + (size_t)rr * (size_t)lsp;
+        const signed char* wp = W + (size_t)rr * (size_t)K; const float* wsp = WS + (size_t)rr * NG64;
 #pragma unroll
         for (int t = 0; t < NSTEP; ++t) { wv[p][t] = q27_ld16nt(wp + koff[t]); wsv[p][t] = wsp[koff[t] >> 6]; }
     }
@@ -4355,7 +3910,7 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_lds8_nr(
 #pragma unroll
             for (int p = 0; p < 2; ++p) {
                 const int rr = (row + 2 + p < rows) ? row + 2 + p : rows - 1;
-                const signed char* wp = W + (size_t)rr * (size_t)lwr; const float* wsp = WS + (size_t)rr * (size_t)lsp;
+                const signed char* wp = W + (size_t)rr * (size_t)K; const float* wsp = WS + (size_t)rr * NG64;
 #pragma unroll
                 for (int t = 0; t < NSTEP; ++t) { wn[p][t] = q27_ld16nt(wp + koff[t]); wsn[p][t] = wsp[koff[t] >> 6]; }
             }
@@ -4425,14 +3980,6 @@ __global__ __launch_bounds__(256) void q27_k_proj_i8g_lds8_nr(
 // or 1536 (fp32 out + residual share). Returns 0 when the shape has no instance (caller falls back to fp8).
 static int g_fp8_freed = 0;
 extern "C" void q27_fp8_freed_set(int v) { g_fp8_freed = v ? 1 : 0; }
-// Q27_LS_SR: the sequential decode runs o_proj/out_proj at their FULL K (6144) straight on the
-// int8 per-64 side-table mirror with an fp32 output, which the fp8 wrappers above cannot express
-// (q27_proj_fp8_res_nr is the TP K-shard form, K == 1536). Exported thin wrapper over the row
-// consumer; same routing, same kernels.
-extern "C" int q27_sr_proj_i8g_rows(const q27_i8g_t* m, const signed char* xq, int xst, const float* xs, void* y, int ystride,
-                                    const unsigned short* radd, int rstride, float rs, int NR, int outbf, hipStream_t s) {
-    return q27_proj_i8g_rows(m, xq, xst, xs, y, ystride, radd, rstride, rs, NR, outbf, s);
-}
 extern "C" int  q27_fp8_freed(void) { return g_fp8_freed; }
 // DFlash2 runner access: the i8g row-batched GEMM over the drafter's shapes (same dispatch).
 // q27_i8g_d_t (q27_dflash2.h) is layout-compatible with q27_i8g_t.
@@ -4451,40 +3998,22 @@ static void q27_dec_i8_route_declined(const q27_fp8_t* w, int NR) {
 static int q27_proj_i8g_rows(const q27_i8g_t* m, const signed char* xq, int xst, const float* xs, void* y, int ystride,
                              const unsigned short* radd, int rstride, float rs, int NR, int outbf, hipStream_t s) {
     if (!m || !m->w || !m->s || NR < 1 || NR > 8) return 0;
-    // A view must be at least as wide as the logical row it addresses. A stride smaller than the
-    // logical width can only come from a descriptor that was never given one (the class of bug that
-    // broke the row views the moment these kernels learned to honour a stride): refuse it here,
-    // loudly, instead of launching a kernel that walks off the allocation into a GPU page fault.
-    if ((m->ldw && m->ldw < m->K) || (m->lds && m->lds < (m->K >> 6))) {
-        std::fprintf(stderr, "Q27_DEC_I8: impossible mirror strides (rows=%d K=%d ldw=%d lds=%d) -- declined\n",
-                     m->rows, m->K, m->ldw, m->lds);
-        return 0;
-    }
-    if (m->ldw && q27_alias_ksync())
-        std::fprintf(stderr, "Q27_ALIAS_K_SYNC pre  rows=%d K=%d ldw=%d lds=%d NR=%d outbf=%d W=%p WS=%p xq=%p xs=%p y=%p radd=%p xst=%d\n",
-                     m->rows, m->K, m->ldw, m->lds, NR, outbf, (const void*)m->w, (const void*)m->s,
-                     (const void*)xq, (const void*)xs, y, (const void*)radd, xst);
-    if (m->ldw && q27_alias_ksync()) std::fflush(stderr);
-    const auto q27_i8g_body = [&]() -> int {
     const float alpha = m->alpha;
     // shape -> (NSTEP, default OUTBF); the DFlash2 drafter adds 4096/17408/25600/4352 and an
     // explicit outbf override (gate/up need fp32 out of a K=5120 weight, etc).
     int NS = 0, OB = outbf;
     if (m->K == 5120) NS = 5; else if (m->K == 6144) NS = 6; else if (m->K == 1536) NS = 2;
-    else if (m->K == 3072 || m->K == 2304) NS = 3;   // Q27_TP3 o_proj / out_proj K slices (2304: ragged tail via ok[])
-    else if ((m->K % 64) == 0 && m->K > 0 && m->K <= 3072) NS = (m->K + 1023) / 1024;   // Q27_TP3 other ragged o/out_proj slices (1920, 2688...): NSTEP 2/3 with ok[] tails
     else if (m->K == 4096) NS = 4; else if (m->K == 17408) NS = 17; else if (m->K == 25600) NS = 25; else if (m->K == 4352) NS = 5;
-    else { q27_alias_klog(0x20u ^ (unsigned)m->K, "noroute(K)", m, NR, outbf, q27_fp8_freed()); return 0; }
-    if (OB < 0) OB = (m->K == 1536 || m->K == 17408 || m->K == 25600 || (m->K <= 3072 && m->K != 1024 && m->K != 2048)) ? 0 : 1;   // Q27_TP3: K <= 3072 are o/out_proj K slices (fp32 partial out)
-    if (m->ldw) q27_alias_klog(0x40u ^ (unsigned)(m->K * 8 + NR), "dispatch(ldw)", m, NR, NS, OB);
+    else return 0;
+    if (OB < 0) OB = (m->K == 1536 || m->K == 17408 || m->K == 25600) ? 0 : 1;
     if (NS == 17 || NS == 25) {   // big-K (DFlash2 down-full / fc): register form only, chunked to <=4 rows —
         // the LDS forms' per-thread wv/wsv state exceeds the 64 KB local-memory limit at these NSTEPs.
         for (int c0 = 0; c0 < NR; c0 += 4) {
             const int cn = (NR - c0 < 4) ? NR - c0 : 4;
             const dim3 grid((unsigned)((m->rows + 3) / 4)), blk(256);
-#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_snr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s,                 xq + (size_t)c0 * xst, xs + (size_t)c0 * (xst >> 4), (char*)y + (size_t)c0 * ystride * (OB_ ? 2 : 4), ystride,                 m->rows, m->K, alpha, radd ? radd + (size_t)c0 * rstride : nullptr, rstride, rs, xst, m->ldw, m->lds, (uint2*)nullptr, 0, 0u)
+#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_snr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s,                 xq + (size_t)c0 * xst, xs + (size_t)c0 * (xst >> 4), (char*)y + (size_t)c0 * ystride * (OB_ ? 2 : 4), ystride,                 m->rows, m->K, alpha, radd ? radd + (size_t)c0 * rstride : nullptr, rstride, rs, xst)
 #define Q27_LIK(NS_, OB_) switch (cn) { case 1: Q27_LI(1,NS_,OB_); break; case 2: Q27_LI(2,NS_,OB_); break; case 3: Q27_LI(3,NS_,OB_); break; case 4: Q27_LI(4,NS_,OB_); break; default: return 0; }
-            if (NS == 17 && OB == 0) { Q27_LIK(17,0) } else if (NS == 25 && OB == 0) { Q27_LIK(25,0) } else { q27_alias_klog(0x51u, "drop(ns17/25)", m, NR, NS, OB); return 0; }
+            if (NS == 17 && OB == 0) { Q27_LIK(17,0) } else if (NS == 25 && OB == 0) { Q27_LIK(25,0) } else return 0;
 #undef Q27_LIK
 #undef Q27_LI
         }
@@ -4492,36 +4021,24 @@ static int q27_proj_i8g_rows(const q27_i8g_t* m, const signed char* xq, int xst,
     }
     if (NR <= 4) {
         const dim3 grid((unsigned)((m->rows + 3) / 4)), blk(256);
-        unsigned* llp = nullptr; unsigned llseq = 0;   // Q27_LL_EPI: only the fp32-out register form packs the LL words
-        const int llon = (OB == 0 && (m->rows % 4) == 0) ? q27_ll_hint_take(&llp, &llseq) : 0;
-        uint2* const llw = llon ? (uint2*)llp : nullptr; const int llstride = ystride >> 1;
-#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_snr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s, xq, xs, y, ystride, m->rows, m->K, alpha, radd, rstride, rs, xst, m->ldw, m->lds, llw, llstride, llseq)
+#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_snr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s, xq, xs, y, ystride, m->rows, m->K, alpha, radd, rstride, rs, xst)
 #define Q27_LIK(NS_, OB_) switch (NR) { case 1: Q27_LI(1,NS_,OB_); break; case 2: Q27_LI(2,NS_,OB_); break; case 3: Q27_LI(3,NS_,OB_); break; case 4: Q27_LI(4,NS_,OB_); break; default: return 0; }
-        if (NS == 5 && OB == 1) { Q27_LIK(5,1) } else if (NS == 5 && OB == 0) { Q27_LIK(5,0) } else if (NS == 6 && OB == 1) { Q27_LIK(6,1) } else if (NS == 6 && OB == 0) { Q27_LIK(6,0) } /* Q27_LS_SR: full-K o/out_proj, fp32 out */
-        else if (NS == 2 && OB == 0) { Q27_LIK(2,0) } else if (NS == 3 && OB == 0) { Q27_LIK(3,0) } else if (NS == 4 && OB == 1) { Q27_LIK(4,1) }
-        else if (NS == 17 && OB == 0) { Q27_LIK(17,0) } else if (NS == 25 && OB == 0) { Q27_LIK(25,0) } else { q27_alias_klog(0x52u, "drop(nr<=4)", m, NR, NS, OB); return 0; }
+        if (NS == 5 && OB == 1) { Q27_LIK(5,1) } else if (NS == 5 && OB == 0) { Q27_LIK(5,0) } else if (NS == 6 && OB == 1) { Q27_LIK(6,1) }
+        else if (NS == 2 && OB == 0) { Q27_LIK(2,0) } else if (NS == 4 && OB == 1) { Q27_LIK(4,1) }
+        else if (NS == 17 && OB == 0) { Q27_LIK(17,0) } else if (NS == 25 && OB == 0) { Q27_LIK(25,0) } else return 0;
 #undef Q27_LIK
 #undef Q27_LI
         return 1;
     }
     const int rpw = q27_nr_rpw8_fp8(m->rows);
     const dim3 grid((unsigned)((m->rows + 4 * rpw - 1) / (4 * rpw))), blk(256);
-#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_lds8_nr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s, xq, xs, y, ystride, m->rows, m->K, alpha, radd, rstride, rs, rpw, xst, m->ldw, m->lds)
+#define Q27_LI(N, NS_, OB_) hipLaunchKernelGGL((q27_k_proj_i8g_lds8_nr<N,NS_,OB_>), grid, blk, 0, s, m->w, m->s, xq, xs, y, ystride, m->rows, m->K, alpha, radd, rstride, rs, rpw, xst)
 #define Q27_LIK(NS_, OB_) switch (NR) { case 5: Q27_LI(5,NS_,OB_); break; case 6: Q27_LI(6,NS_,OB_); break; case 7: Q27_LI(7,NS_,OB_); break; case 8: Q27_LI(8,NS_,OB_); break; default: return 0; }
-        if (NS == 5 && OB == 1) { Q27_LIK(5,1) } else if (NS == 5 && OB == 0) { Q27_LIK(5,0) } else if (NS == 6 && OB == 1) { Q27_LIK(6,1) } else if (NS == 6 && OB == 0) { Q27_LIK(6,0) } /* Q27_LS_SR: full-K o/out_proj, fp32 out */
-        else if (NS == 2 && OB == 0) { Q27_LIK(2,0) } else if (NS == 3 && OB == 0) { Q27_LIK(3,0) } else if (NS == 4 && OB == 1) { Q27_LIK(4,1) } else { q27_alias_klog(0x53u, "drop(nr>4)", m, NR, NS, OB); return 0; }
+        if (NS == 5 && OB == 1) { Q27_LIK(5,1) } else if (NS == 5 && OB == 0) { Q27_LIK(5,0) } else if (NS == 6 && OB == 1) { Q27_LIK(6,1) }
+        else if (NS == 2 && OB == 0) { Q27_LIK(2,0) } else if (NS == 4 && OB == 1) { Q27_LIK(4,1) } else return 0;
 #undef Q27_LIK
 #undef Q27_LI
     return 1;
-    };
-    const int q27_i8g_rc = q27_i8g_body();
-    if (m->ldw && q27_alias_ksync()) {
-        hipError_t q27_i8g_e = hipStreamSynchronize(s);
-        std::fprintf(stderr, "Q27_ALIAS_K_SYNC post rc=%d launch=%d (%s)\n", q27_i8g_rc, (int)q27_i8g_e,
-                     hipGetErrorName(q27_i8g_e ? q27_i8g_e : hipSuccess));
-        std::fflush(stderr);
-    }
-    return q27_i8g_rc;
 }
 // K = 5120 / 6144 (bf16 out) or 1536 (fp32 out + residual share), NR = 5..8
 static int q27_fp8_lds8(const q27_fp8_t* w, const signed char* xq, int xst, const float* xs, void* y, int ystride,

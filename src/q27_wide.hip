@@ -251,18 +251,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb(
         float ag, float au, int rows, int K, int M, float* __restrict__ YG, float* __restrict__ YU) {
     constexpr int TR = 64, TC = 16 * TCB, WSTR = KI * 16 + 16, XSTR = KI * 16 + 16;
     __shared__ __align__(16) signed char sw[TR * WSTR];
-    // DECODED SCALES IN LDS. The K-group loop used to decode the SAME four e4m3 weight-scale
-    // bytes in every one of the 16 ty threads that share a tx (rw = r*16+tx depends only on tx):
-    // 4 decodes x ~12 instructions x 256 threads x KI groups per staging round, against 64
-    // distinct values. Decode once per (row, group) at staging instead and read a float.
-    // The old rejection ("hoist the decoded scale into LDS as float: 882 -> 732") was an LDS
-    // BUDGET loss, not a decode loss: it grew the block past 32,256 B and dropped 2 blocks/CU.
-    // This version pays for it -- the activation scales go to fp16 and both scale arrays take a
-    // KI+1 stride (odd dword stride: 16 tx lanes land on 16 distinct banks). Block stays at
-    // exactly 32,256 B: 9216 + 2304 + 18432 + 2304.
-    __shared__ float swscf[TR * (KI + 1)];
+    __shared__ unsigned char swsc[TR * KI];
     __shared__ __align__(16) signed char sx[TC * XSTR];
-    __shared__ _Float16 sxsch[TC * (KI + 1)];
+    __shared__ float sxsc[TC * KI];
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const int mat = blockIdx.z;
     const unsigned char* __restrict__ W = mat ? WU : WG;
@@ -284,67 +275,36 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb(
             const uint2 v = *(const uint2*)(W + (size_t)rr * KP + (size_t)(g0 + g) * 8);
             uint4 o; o.x = q27_dq4(v.x & 0x0F0F0F0Fu); o.y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
             o.z = q27_dq4(v.y & 0x0F0F0F0Fu); o.w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
-            *(uint4*)(sw + r * WSTR + g * 16) = o;
-            swscf[r * (KI + 1) + g] = q27_e4m3_sel(S[(size_t)rr * NG + g0 + g]);
+            *(uint4*)(sw + r * WSTR + g * 16) = o; swsc[it] = S[(size_t)rr * NG + g0 + g];
         }
         for (int it = tid; it < TC * KI; it += 256) {
             const int t = it / KI, g = it - t * KI;
             const int tt = min(tok_base + t, M - 1);
             *(uint4*)(sx + t * XSTR + g * 16) = *(const uint4*)(Xq + (size_t)tt * K + (size_t)(g0 + g) * 16);
-            sxsch[t * (KI + 1) + g] = (_Float16)(Xs[(size_t)tt * NG + g0 + g] * 0.5f);
+            sxsc[it] = Xs[(size_t)tt * NG + g0 + g] * 0.5f;
         }
         __syncthreads();
 #pragma unroll 1
         for (int g = 0; g < KI; ++g) {
             uint4 wr[4]; float ws[4]; uint4 xr[8]; float xsv[8];
 #pragma unroll
-            // BRANCH-FREE e4m3. q27.h records that the if-form compiles to per-group
-            // s_and_saveexec regions inside the LDS kernels; this loop issues every dot4, so an
-            // exec-mask region per K-group is paid against the whole inner tile. q27_e4m3_sel is
-            // the identical decode with selects instead of branches, and costs no LDS and no
-            // extra accumulator -- which matters here because at TCB=8 the block already sits at
-            // 32256 B, exactly 2 blocks/CU, and any LDS growth halves occupancy (measured: moving
-            // the decoded scale into LDS as float dropped 882 -> 732 tok/s).
-            // LANE-CONTIGUOUS ROWS. rw = tx*4+r put consecutive lanes 4 rows apart: the weight
-            // ds_read_b128 stride across tx is 4*WSTR = 144 dwords, and 144 mod 32 = 16, so all 16
-            // tx lanes land on 2 banks -- an 8-way conflict on the most-issued LDS read in the
-            // kernel. It also made the epilogue store 4 rows apart per lane, so no store coalesced.
-            // rw = r*16+tx is the same bijection onto [0,64) with stride WSTR = 36 dwords (mod 32 = 4),
-            // which is 2-way, and consecutive lanes now write consecutive rows of Y.
-            for (int r = 0; r < 4; ++r) { const int rw = r * 16 + tx; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = swscf[rw * (KI + 1) + g]; }
-            // LAZY ACTIVATION COLUMNS. This loop used to preload all eight activation vectors
-            // (xr[8] = 32 VGPRs) and all eight scales before any dot4 issued, so every group
-            // iteration opened with 12 dependent LDS reads whose latency had to be absorbed by
-            // the previous group's tail. Loading the column pair just before it is consumed keeps
-            // two independent chain pairs (the +4% win) while freeing ~24 registers and spreading
-            // the LDS reads across the compute instead of bunching them at the top. Addresses,
-            // operands and per-chain order are unchanged, so the results are identical.
-            // The activation-side bank geometry is unchanged: tc = c*16+ty is the bijection that
-            // separates the four ty of a wave into four distinct banks.
+            for (int r = 0; r < 4; ++r) { const int rw = tx * 4 + r; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
 #pragma unroll
-            for (int c = 0; c < TCB; c += 2) {
-                const int tc0 = c * 16 + ty, tc1 = tc0 + 16;
-                const uint4 x0 = *(const uint4*)(sx + tc0 * XSTR + g * 16);
-                const uint4 x1 = *(const uint4*)(sx + tc1 * XSTR + g * 16);
-                const float xs0 = (float)sxsch[tc0 * (KI + 1) + g];
-                const float xs1 = (float)sxsch[tc1 * (KI + 1) + g];
+            for (int c = 0; c < TCB; ++c) { const int tc = ty * TCB + c; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
 #pragma unroll
-                for (int r = 0; r < 4; ++r) {
-                    int dA = q27_d4(wr[r].x, x0.x, 0); dA = q27_d4(wr[r].y, x0.z, dA);
-                    dA = q27_d4(wr[r].z, x0.y, dA);   dA = q27_d4(wr[r].w, x0.w, dA);
-                    int dB = q27_d4(wr[r].x, x1.x, 0); dB = q27_d4(wr[r].y, x1.z, dB);
-                    dB = q27_d4(wr[r].z, x1.y, dB);   dB = q27_d4(wr[r].w, x1.w, dB);
-                    acc[r][c]     = fmaf((float)dA, ws[r] * xs0, acc[r][c]);
-                    acc[r][c + 1] = fmaf((float)dB, ws[r] * xs1, acc[r][c + 1]);
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int c = 0; c < TCB; ++c) {
+                    int d = q27_d4(wr[r].x, xr[c].x, 0); d = q27_d4(wr[r].y, xr[c].z, d); d = q27_d4(wr[r].z, xr[c].y, d); d = q27_d4(wr[r].w, xr[c].w, d);
+                    acc[r][c] = fmaf((float)d, ws[r] * xsv[c], acc[r][c]);
                 }
-            }
         }
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 template <int KI, int TCB>
@@ -387,9 +347,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb(
             if (g >= gl) break;
             uint4 wr[4]; float ws[4]; uint4 xr[8]; float xsv[8];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) { const int rw = r * 16 + tx; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
+            for (int r = 0; r < 4; ++r) { const int rw = tx * 4 + r; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) { const int tc = c * 16 + ty; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
+            for (int c = 0; c < TCB; ++c) { const int tc = ty * TCB + c; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
 #pragma unroll
             for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -401,9 +361,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
     }
 }
 
@@ -437,7 +397,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rbpf(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -455,7 +415,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rbpf(
         if (nxt0 < NG) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -468,7 +428,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rbpf(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16);
                 xsv[c] = sxsc[tc * KI + g];
             }
@@ -486,9 +446,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rbpf(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 
@@ -513,7 +473,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rbpf(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -531,7 +491,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rbpf(
         if (nxt0 < NG) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -545,7 +505,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rbpf(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16);
                 xsv[c] = sxsc[tc * KI + g];
             }
@@ -563,16 +523,14 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rbpf(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
     }
 }
 
 extern "C" int q27_wide_gu_rbpf(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                                 float* yg, float* yu, int M, int tcb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu_rbpf rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const int TCv = 16 * tcb;
@@ -602,7 +560,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rbpf(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -620,7 +578,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rbpf(
         if (nxt0 < NG) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -634,7 +592,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rbpf(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16);
                 xsv[c] = sxsc[tc * KI + g];
             }
@@ -652,9 +610,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rbpf(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
     }
 }
 
@@ -678,7 +636,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -706,7 +664,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -719,7 +677,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -738,16 +696,14 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
     }
 }
 
 extern "C" int q27_wide_down_b_rb2p(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                                     unsigned short* y, int ystride, int M, int tcb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_b_rb2p rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int TCv = 16 * tcb;
@@ -759,8 +715,6 @@ extern "C" int q27_wide_down_b_rb2p(const q27_nvfp4_t* w, const signed char* xq,
 
 extern "C" int q27_wide_down_b_rbpf(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                                     unsigned short* y, int ystride, int M, int tcb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_b_rbpf rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int TCv = 16 * tcb;
@@ -772,8 +726,6 @@ extern "C" int q27_wide_down_b_rbpf(const q27_nvfp4_t* w, const signed char* xq,
 
 extern "C" int q27_wide_down_rbpf(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                   const unsigned short* radd, float rs, int tcb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rbpf rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int TCv = 16 * tcb;
@@ -812,7 +764,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb2p(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -840,7 +792,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb2p(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -852,7 +804,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb2p(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -871,9 +823,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb2p(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 
@@ -898,7 +850,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -926,7 +878,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -939,7 +891,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -958,9 +910,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
     }
 }
 
@@ -997,7 +949,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p3(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1026,7 +978,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p3(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1039,7 +991,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p3(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -1058,9 +1010,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_b_rb2p3(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * ystride + row] = q27_f2bf(acc[r][c] * alpha); }
     }
 }
 
@@ -1089,8 +1041,6 @@ extern "C" int q27_wide_down_b_rb2p3(const q27_nvfp4_t* wq, const q27_nvfp4_t* w
                                      const signed char* xq, const float* xs,
                                      unsigned short* y0, unsigned short* y1, unsigned short* y2, int ystride, int M,
                                      hipStream_t s) {
-    if ((wq) && !((wq)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_b_rb2p3 rows=%d K=%d\n", (wq)->rows, (wq)->K); std::fflush(stderr); std::abort(); }
-
     if (!wq || !wk || !wv || (wq->K % 16) || M < 1) return 0;
     const float aq = wq->in_scale * wq->ws2, ak = wk->in_scale * wk->ws2, av = wv->in_scale * wv->ws2;
     const dim3 gr((unsigned)((Q27_QROWS + 63) / 64), (unsigned)((M + 63) / 64), 3u);
@@ -1128,7 +1078,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
     uint4 xr0[TCB], xr1[TCB]; float xsv0[TCB], xsv1[TCB];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1136,7 +1086,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
     }
 #pragma unroll
     for (int c = 0; c < TCB; ++c) {
-        const int tt = tok_base + c * 16 + ty;
+        const int tt = tok_base + ty * TCB + c;
         xr0[c] = *(const uint4*)(Xq + (size_t)tt * K + 0);
         xsv0[c] = Xs[(size_t)tt * NG + 0] * 0.5f;
     }
@@ -1145,7 +1095,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
         if (nxt0 < NG) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1153,7 +1103,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
             }
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tt = tok_base + c * 16 + ty;
+                const int tt = tok_base + ty * TCB + c;
                 xr1[c] = *(const uint4*)(Xq + (size_t)tt * K + (size_t)nxt0 * 16);
                 xsv1[c] = Xs[(size_t)tt * NG + nxt0] * 0.5f;
             }
@@ -1164,7 +1114,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tt = tok_base + c * 16 + ty;
+                const int tt = tok_base + ty * TCB + c;
                 xr[c] = *(const uint4*)(Xq + (size_t)tt * K + (size_t)kk * 16);
                 xsv[c] = Xs[(size_t)tt * NG + kk] * 0.5f;
             }
@@ -1184,16 +1134,14 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_rb3p(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 
 extern "C" int q27_wide_gu_rb3p(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                                 float* yg, float* yu, int M, int tcb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu_rb3p rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const int TCv = 16 * tcb;
@@ -1231,7 +1179,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_sk2(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)k0 * 8);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1259,7 +1207,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_sk2(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1271,7 +1219,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_sk2(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -1291,10 +1239,10 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_sk2(
     const float zrs = blockIdx.z ? 0.f : rs;         // the residual folds into z=0 only
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
         for (int c = 0; c < TCB; ++c) {
-            const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (zrs && radd) v += zrs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; }
+            const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (zrs && radd) v += zrs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; }
         }
     }
 }
@@ -1310,8 +1258,6 @@ extern "C" void q27_add_f32(float* a, const float* b, int n, hipStream_t s) {
 extern "C" int q27_wide_down_rb2p_sk2(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                                       float* y0, float* y1, float* y2, float* y3, int splits, int M,
                                       const unsigned short* radd, float rs, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rb2p_sk2 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !y1 || !y2 || !y3 || (splits != 2 && splits != 4)) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int khalf = (w->K >> 4) / splits;
@@ -1413,8 +1359,6 @@ __global__ __launch_bounds__(128, 2) void q27_k_wide_down_rb2p_tr32(
 
 extern "C" int q27_wide_down_rb2p_tr32(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                        const unsigned short* radd, float rs, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rb2p_tr32 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 gr((unsigned)((w->rows + 31) / 32), (unsigned)((M + 63) / 64), 1u);
@@ -1424,8 +1368,6 @@ extern "C" int q27_wide_down_rb2p_tr32(const q27_nvfp4_t* w, const signed char* 
 
 extern "C" int q27_wide_down_rb2p(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                   const unsigned short* radd, float rs, int tcb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rb2p rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int TCv = 16 * tcb;
@@ -1437,8 +1379,6 @@ extern "C" int q27_wide_down_rb2p(const q27_nvfp4_t* w, const signed char* xq, c
 
 extern "C" int q27_wide_gu_rb2p(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                                 float* yg, float* yu, int M, int tcb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu_rb2p rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const int TCv = 16 * tcb;
@@ -1492,13 +1432,13 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_w8(
             const unsigned char* wbase = W + ((size_t)((size_t)kk * ntiles + blockIdx.x) * 16 + tx) * 64;
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 wr[r] = *(const uint4*)(wbase + r * 16);
                 ws[r] = q27_e4m3(S[(size_t)row * NG + kk]);
             }
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16);
                 xsv[c] = sxsc[tc * KI + g];
             }
@@ -1514,9 +1454,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_gu_w8(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 
@@ -1555,13 +1495,13 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_w8(
             const unsigned char* wbase = W + ((size_t)((size_t)kk * ntiles + blockIdx.x) * 16 + tx) * 64;
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 wr[r] = *(const uint4*)(wbase + r * 16);
                 ws[r] = q27_e4m3(S[(size_t)row * NG + kk]);
             }
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16);
                 xsv[c] = sxsc[tc * KI + g];
             }
@@ -1577,16 +1517,14 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_w8(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * q27_bf2f(radd[(size_t)t * rows + row]); Y[(size_t)t * rows + row] = v; } }
     }
 }
 
 extern "C" int q27_wide_gu_w8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                               float* yg, float* yu, int M, int tcb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu_w8 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const unsigned char* g8 = q27_nvfp4_w8s(wg); const unsigned char* u8 = q27_nvfp4_w8s(wu);
     if (!g8 || !u8) return 0;
@@ -1600,8 +1538,6 @@ extern "C" int q27_wide_gu_w8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, cons
 
 extern "C" int q27_wide_down_w8(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                 const unsigned short* radd, float rs, int tcb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_w8 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1) return 0;
     const unsigned char* w8 = q27_nvfp4_w8s(w);
     if (!w8) return 0;
@@ -1618,8 +1554,6 @@ extern "C" int q27_wide_down_w8(const q27_nvfp4_t* w, const signed char* xq, con
 // gate+up over M tokens: grid (rows/128, M/64, 2). ki = 8 (30 KB LDS, two blocks per CU) or 16 (58 KB, one).
 extern "C" int q27_wide_gu(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                            float* yg, float* yu, int M, int ki, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     // ki encodes KI*10 + NW: e.g. 88 = KI 8 / 8 waves (512 threads), 84 = KI 8 / 4 waves (256), 168 = KI 16 / 8 waves
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
@@ -1649,8 +1583,6 @@ extern "C" int q27_wide_gu(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const s
 }
 extern "C" int q27_wide_down(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                              const unsigned short* radd, float rs, int ki, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64), 1u);
@@ -1675,8 +1607,6 @@ extern "C" int q27_wide_down(const q27_nvfp4_t* w, const signed char* xq, const 
 // bf16-output NVFP4 wide GEMM for the layer-split projection sites (q/k/v, GDN in_qkv/in_z).
 extern "C" int q27_wide_down_b(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                                unsigned short* y, int ystride, int M, int ki, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_b rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64), 1u);
@@ -1831,7 +1761,7 @@ __device__ __forceinline__ void q27_q8_epilogue(float (&acc)[4][TCB], float alph
         mx = __shfl(mx, 0, 4);
         const float sc = mx * (1.f / 127.f);
         const float qi = (sc > 0.f) ? (1.f / sc) : 0.f;
-        const int t = tok_base + c * 16 + ty;
+        const int t = tok_base + ty * TCB + c;
         if (t < M && row0 < rows) {
             unsigned packed = 0u;
 #pragma unroll
@@ -1868,7 +1798,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = min(row_base + r * 16 + tx, rows - 1);
+        const int row = min(row_base + tx * 4 + r, rows - 1);
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1896,7 +1826,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = min(row_base + r * 16 + tx, rows - 1);
+                const int row = min(row_base + tx * 4 + r, rows - 1);
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1909,7 +1839,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -1962,7 +1892,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p3(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx;
+        const int row = row_base + tx * 4 + r;
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -1991,7 +1921,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p3(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = row_base + r * 16 + tx;
+                const int row = row_base + tx * 4 + r;
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -2004,7 +1934,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_q8_rb2p3(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -2047,7 +1977,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_f32r(
     uint4 wr0[4], wr1[4]; float ws0[4], ws1[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = min(row_base + r * 16 + tx, rows - 1);
+        const int row = min(row_base + tx * 4 + r, rows - 1);
         const uint2 v = *(const uint2*)(W + (size_t)row * KP + 0);
         wr0[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr0[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
         wr0[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr0[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -2075,7 +2005,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_f32r(
             }
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int row = min(row_base + r * 16 + tx, rows - 1);
+                const int row = min(row_base + tx * 4 + r, rows - 1);
                 const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)nxt0 * 8);
                 wr1[r].x = q27_dq4( v.x       & 0x0F0F0F0Fu); wr1[r].y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
                 wr1[r].z = q27_dq4( v.y       & 0x0F0F0F0Fu); wr1[r].w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
@@ -2088,7 +2018,7 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_f32r(
             uint4 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint4*)(sx[cur] + tc * XSTR + g * 16);
                 xsv[c] = sxsc[cur][tc * KI + g];
             }
@@ -2107,10 +2037,10 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_f32r(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
         for (int c = 0; c < TCB; ++c) {
-            const int t = tok_base + c * 16 + ty;
+            const int t = tok_base + ty * TCB + c;
             if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; }
         }
     }
@@ -2118,8 +2048,6 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb2p_f32r(
 
 extern "C" int q27_wide_q8_rb2p(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                                 signed char* yq, float* ys, int ystride, int M, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_q8_rb2p rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || (w->rows % 16) || (ystride % 16) || M < 1 || !xq || !xs || !yq || !ys) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 gr((unsigned)((w->rows + 63) / 64), (unsigned)((M + 63) / 64), 1u);
@@ -2131,8 +2059,6 @@ extern "C" int q27_wide_q8_rb2p3(const q27_nvfp4_t* wq, const q27_nvfp4_t* wk, c
                                  const signed char* xq, const float* xs,
                                  signed char* yq0, signed char* yq1, signed char* yq2,
                                  float* ys0, float* ys1, float* ys2, int ystride, int M, hipStream_t s) {
-    if ((wq) && !((wq)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_q8_rb2p3 rows=%d K=%d\n", (wq)->rows, (wq)->K); std::fflush(stderr); std::abort(); }
-
     if (!wq || !wk || !wv || (wq->K % 16) || (ystride % 16) || M < 1 || !xq || !xs) return 0;
     if (wq->rows != Q27_QROWS || wk->rows != Q27_KVROWS || wv->rows != Q27_KVROWS) return 0;
     const float aq = wq->in_scale * wq->ws2, ak = wk->in_scale * wk->ws2, av = wv->in_scale * wv->ws2;
@@ -2144,8 +2070,6 @@ extern "C" int q27_wide_q8_rb2p3(const q27_nvfp4_t* wq, const q27_nvfp4_t* wk, c
 }
 extern "C" int q27_wide_down_rb2p_f32r(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                        const float* radd, float rs, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rb2p_f32r rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 gr((unsigned)((w->rows + 63) / 64), (unsigned)((M + 63) / 64), 1u);
@@ -2169,13 +2093,9 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_down_f32r_row(
     constexpr int TC = 64; static_assert(TR == 128 || TR == 64, "TR");
     constexpr int WSTR = KI * 16 + 16, XSTR = KI * 16 + 16;
     __shared__ __align__(16) signed char sw[TR * WSTR];
-    // Same decode hoist as q27_k_wide_gu_rb: every wave re-decoded the same e4m3 weight scale
-    // bytes (8 waves share each row's scales). Decode once per (row, group) at staging instead.
-    // This kernel already sits at 1 block/CU (58,368 B), so the +6.3 KB of fp32 weight scales
-    // and fp16 activation scales still fits the 64 KB budget: 63,104 B.
-    __shared__ float swscf[TR * (KI + 1)];
+    __shared__ unsigned char swsc[TR * KI];
     __shared__ __align__(16) signed char sx[TC * XSTR];
-    __shared__ _Float16 sxsch[TC * (KI + 1)];
+    __shared__ float sxsc[TC * KI];
     constexpr int NT = NW * 64, TPW = TC / NW;
     const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
     const int row_base = blockIdx.x * TR, tok_base = blockIdx.y * TC;
@@ -2196,14 +2116,14 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_down_f32r_row(
             o.x = q27_dq4( v.x       & 0x0F0F0F0Fu); o.y = q27_dq4((v.x >> 4) & 0x0F0F0F0Fu);
             o.z = q27_dq4( v.y       & 0x0F0F0F0Fu); o.w = q27_dq4((v.y >> 4) & 0x0F0F0F0Fu);
             *(uint4*)(sw + r * WSTR + g * 16) = o;
-            swscf[r * (KI + 1) + g] = q27_e4m3_sel(S[(size_t)rr * NG + gg]);
+            swsc[it] = S[(size_t)rr * NG + gg];
         }
         for (int it = tid; it < TC * KI; it += NT) {
             const int t = it / KI, g = it - t * KI;
             const int tt = min(tok_base + t, M - 1);
             const int gg = min(g0 + g, NG - 1);
             *(uint4*)(sx + t * XSTR + g * 16) = *(const uint4*)(Xq + (size_t)tt * K + (size_t)gg * 16);
-            sxsch[t * (KI + 1) + g] = (_Float16)((g0 + g < NG) ? Xs[(size_t)tt * NG + gg] * 0.5f : 0.f);
+            sxsc[it] = (g0 + g < NG) ? Xs[(size_t)tt * NG + gg] * 0.5f : 0.f;
         }
         __syncthreads();
 #pragma unroll 2
@@ -2211,17 +2131,13 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_down_f32r_row(
             if (g >= gl) break;
             const uint4 w0 = *(const uint4*)(sw + lane * WSTR + g * 16);
             const uint4 w1 = (TR == 128) ? *(const uint4*)(sw + (lane + 64) * WSTR + g * 16) : make_uint4(0u, 0u, 0u, 0u);
-            // Branch-free e4m3, same substitution that took gate+up 882 -> 895. The if-form
-            // compiles to s_and_saveexec regions; this decode sits directly in the K-group loop
-            // that issues every dot4, and q27_e4m3_sel costs no LDS (this kernel is already at
-            // 2 blocks/CU on its own shared arrays).
-            const float s0 = swscf[lane * (KI + 1) + g];
-            const float s1 = (TR == 128) ? swscf[(lane + 64) * (KI + 1) + g] : 0.f;
+            const float s0 = q27_e4m3(swsc[lane * KI + g]);
+            const float s1 = (TR == 128) ? q27_e4m3(swsc[(lane + 64) * KI + g]) : 0.f;
 #pragma unroll
             for (int j = 0; j < TPW; ++j) {
                 const int t = wave * TPW + j;
                 const uint4 x = *(const uint4*)(sx + t * XSTR + g * 16);
-                const float xs = (float)sxsch[t * (KI + 1) + g];
+                const float xs = sxsc[t * KI + g];
                 int a = q27_d4(w0.x, x.x, 0); a = q27_d4(w0.y, x.z, a); a = q27_d4(w0.z, x.y, a); a = q27_d4(w0.w, x.w, a);
                 int b = 0; if (TR == 128) { b = q27_d4(w1.x, x.x, 0); b = q27_d4(w1.y, x.z, b); b = q27_d4(w1.z, x.y, b); b = q27_d4(w1.w, x.w, b); }
                 acc0[j] = fmaf((float)a, s0 * xs, acc0[j]);
@@ -2241,8 +2157,6 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_down_f32r_row(
 
 extern "C" int q27_wide_down_f32r(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                   const float* radd, float rs, int ki, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_f32r rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64), 1u);
@@ -2307,7 +2221,7 @@ __global__ __launch_bounds__(256, 4) void q27_k_wide_gu_rb2d(
         }
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            const int row = row_base + r * 16 + tx;
+            const int row = row_base + tx * 4 + r;
             const uint2 v = *(const uint2*)(W + (size_t)row * KP + (size_t)g16 * 8);
             if (half == 0) { wr0[0] = (uint4){ q27_dq4( v.x       & 0x0F0F0F0Fu), 0u, 0u, 0u };
                              wr0[1] = (uint4){ q27_dq4((v.x >> 4) & 0x0F0F0F0Fu), 0u, 0u, 0u }; }
@@ -2320,7 +2234,7 @@ __global__ __launch_bounds__(256, 4) void q27_k_wide_gu_rb2d(
             uint2 xr[TCB]; float xsv[TCB];
 #pragma unroll
             for (int c = 0; c < TCB; ++c) {
-                const int tc = c * 16 + ty;
+                const int tc = ty * TCB + c;
                 xr[c] = *(const uint2*)(sx[cur] + tc * XSTR + g * 8);
                 xsv[c] = sxsc[cur][tc * 8 + g];
             }
@@ -2336,16 +2250,14 @@ __global__ __launch_bounds__(256, 4) void q27_k_wide_gu_rb2d(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) Y[(size_t)t * rows + row] = acc[r][c] * alpha; }
     }
 }
 
 extern "C" int q27_wide_gu_rb2d(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, const float* xs,
                                 float* yg, float* yu, int M, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_gu_rb2d rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || (wg->K % 128) || M < 1) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 gr((unsigned)((wg->rows + 63) / 64), (unsigned)((M + 63) / 64), 2u);
@@ -2454,8 +2366,6 @@ __global__ __launch_bounds__(NW * 64, MINW) void q27_k_wide_i8(
 
 extern "C" int q27_wide_i8_q8(const q27_nvfp4_t* w, const signed char* xq, const float* xs,
                               signed char* yq, float* ys, int ystride, int M, int ki, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_i8_q8 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || !w->w || (w->K % 16) || M < 1 || !xq || !xs || !yq || !ys || (ystride & 15)) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64), 1u);
@@ -2466,8 +2376,6 @@ extern "C" int q27_wide_i8_q8(const q27_nvfp4_t* w, const signed char* xq, const
 }
 extern "C" int q27_wide_i8_f32r(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                 const float* radd, float rs, int ki, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_i8_f32r rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || !w->w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 127) / 128), (unsigned)((M + 63) / 64), 1u);
@@ -2642,9 +2550,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb_f32r(
             if (g >= gl) break;
             uint4 wr[4]; float ws[4]; uint4 xr[8]; float xsv[8];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) { const int rw = r * 16 + tx; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
+            for (int r = 0; r < 4; ++r) { const int rw = tx * 4 + r; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) { const int tc = c * 16 + ty; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
+            for (int c = 0; c < TCB; ++c) { const int tc = ty * TCB + c; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
 #pragma unroll
             for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2656,15 +2564,13 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_down_rb_f32r(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-        for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
+        for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
     }
 }
 extern "C" int q27_wide_down_rb_f32r(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                      const float* radd, float rs, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_down_rb_f32r rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int tcb = (M <= 64) ? 4 : 8, TCv = 16 * tcb;   // 32-token tiles / 32-wide chunks measured 5x slower: never below 64
@@ -2720,9 +2626,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8_rb(
             if (g >= gl) break;
             uint4 wr[4]; float ws[4]; uint4 xr[8]; float xsv[8];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) { const int rw = r * 16 + tx; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
+            for (int r = 0; r < 4; ++r) { const int rw = tx * 4 + r; wr[r] = *(const uint4*)(sw + rw * WSTR + g * 16); ws[r] = q27_e4m3(swsc[rw * KI + g]); }
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) { const int tc = c * 16 + ty; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
+            for (int c = 0; c < TCB; ++c) { const int tc = ty * TCB + c; xr[c] = *(const uint4*)(sx + tc * XSTR + g * 16); xsv[c] = sxsc[tc * KI + g]; }
 #pragma unroll
             for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2737,9 +2643,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8_rb(
     } else {
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+            const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
+            for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
         }
     }
 }
@@ -2765,8 +2671,6 @@ extern "C" int q27_wide_i8_rb_q8m(int n, const q27_nvfp4_t* const* ws, const sig
 }
 extern "C" int q27_wide_i8_rb_f32r(const q27_nvfp4_t* w, const signed char* xq, const float* xs, float* y, int M,
                                    const float* radd, float rs, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_wide_i8_rb_f32r rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || !w->w || (w->K % 16) || M < 1 || !xq || !xs || !y) return 0;
     q27_i8m3 P; P.n = 1;
     for (int i = 0; i < 3; ++i) { P.w[i] = nullptr; P.s[i] = nullptr; P.yq[i] = nullptr; P.ys[i] = nullptr; P.alpha[i] = 0.f; P.rows[i] = 0; P.ystride[i] = 0; P.sstride[i] = 0; }
@@ -2844,9 +2748,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64(
                 const int g = sg * 4 + g4;
                 uint4 wr[4]; uint4 xr[TCB];
 #pragma unroll
-                for (int r = 0; r < 4; ++r) wr[r] = *(const uint4*)(sw + (r * 16 + tx) * WSTR + g * 16);
+                for (int r = 0; r < 4; ++r) wr[r] = *(const uint4*)(sw + (tx * 4 + r) * WSTR + g * 16);
 #pragma unroll
-                for (int c = 0; c < TCB; ++c) xr[c] = *(const uint4*)(sx + (c * 16 + ty) * XSTR + g * 16);
+                for (int c = 0; c < TCB; ++c) xr[c] = *(const uint4*)(sx + (ty * TCB + c) * XSTR + g * 16);
 #pragma unroll
                 for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2857,9 +2761,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64(
             }
             float ws[4], xsv[TCB];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) ws[r] = sws[(r * 16 + tx) * NSG + sg];
+            for (int r = 0; r < 4; ++r) ws[r] = sws[(tx * 4 + r) * NSG + sg];
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) xsv[c] = sxs[(c * 16 + ty) * NSG + sg];
+            for (int c = 0; c < TCB; ++c) xsv[c] = sxs[(ty * TCB + c) * NSG + sg];
 #pragma unroll
             for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2868,10 +2772,10 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64(
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+        const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
         for (int c = 0; c < TCB; ++c) {
-            const int t = tok_base + c * 16 + ty;
+            const int t = tok_base + ty * TCB + c;
             if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; }
         }
     }
@@ -2964,9 +2868,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64m(
                 const int g = sg * 4 + g4;
                 uint4 wr[4]; uint4 xr[TCB];
 #pragma unroll
-                for (int r = 0; r < 4; ++r) wr[r] = *(const uint4*)(sw + (r * 16 + tx) * WSTR + g * 16);
+                for (int r = 0; r < 4; ++r) wr[r] = *(const uint4*)(sw + (tx * 4 + r) * WSTR + g * 16);
 #pragma unroll
-                for (int c = 0; c < TCB; ++c) xr[c] = *(const uint4*)(sx + (c * 16 + ty) * XSTR + g * 16);
+                for (int c = 0; c < TCB; ++c) xr[c] = *(const uint4*)(sx + (ty * TCB + c) * XSTR + g * 16);
 #pragma unroll
                 for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2977,9 +2881,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64m(
             }
             float ws[4], xsv[TCB];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) ws[r] = sws[(r * 16 + tx) * NSG + sg];
+            for (int r = 0; r < 4; ++r) ws[r] = sws[(tx * 4 + r) * NSG + sg];
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) xsv[c] = sxs[(c * 16 + ty) * NSG + sg];
+            for (int c = 0; c < TCB; ++c) xsv[c] = sxs[(ty * TCB + c) * NSG + sg];
 #pragma unroll
             for (int r = 0; r < 4; ++r)
 #pragma unroll
@@ -2991,9 +2895,9 @@ __global__ __launch_bounds__(256, 2) void q27_k_wide_i8g64m(
     } else {
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            const int row = row_base + r * 16 + tx; if (row >= rows) continue;
+            const int row = row_base + tx * 4 + r; if (row >= rows) continue;
 #pragma unroll
-            for (int c = 0; c < TCB; ++c) { const int t = tok_base + c * 16 + ty; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
+            for (int c = 0; c < TCB; ++c) { const int t = tok_base + ty * TCB + c; if (t < M) { float v = acc[r][c] * alpha; if (radd) v += rs * radd[(size_t)t * rows + row]; Y[(size_t)t * rows + row] = v; } }
         }
     }
 }

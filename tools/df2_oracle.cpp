@@ -101,7 +101,7 @@ static void cmpf(const char* tag,const std::vector<float>& ours,int width,int st
     std::fflush(stdout);
 }
 int main(int argc,char** argv){
-    const char* ck = argc>1?argv[1]:"./models/dflash2/model.safetensors";
+    const char* ck = argc>1?argv[1]:"/data/qwen38-27b/dflash-aligned-v5/model.safetensors";
     const char* dp = argc>2?argv[2]:"/tmp/df2_block_dump.bin";
     int pos = argc>3?atoi(argv[3]):0;
     for(int i=4;i<argc;++i){ if(!strcmp(argv[i],"--i8w")) I8W=1; else if(!strcmp(argv[i],"--i8a")) I8A=1; }

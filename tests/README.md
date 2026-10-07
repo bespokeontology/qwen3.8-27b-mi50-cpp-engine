@@ -1,7 +1,3 @@
-# Historical four card checks
-
-This document describes earlier four-card fixtures. Use [the corrected component suite](takeover/README.md) and the root README for the current release.
-
 # Reference gate
 
 `reference_prompt_ids.txt` — the 41 token ids of the chat-formatted prompt
@@ -67,5 +63,5 @@ and measure `ds_read`/`ds_bpermute` -> `s_waitcnt` distances.
   decoded 3.3% slower with byte-identical decode kernels because ~350 KB of closed experimental
   kernels sat in its code objects (receipt v93). Experiments compile only with `make EXP=1`.
 - The bank window (`~/q27_window62.sh` / `67.sh` on the box) copies the binary as `.pending` right
-  after the build and renames it into `./freezes/` only when every gate passed, appending the
+  after the build and renames it into `/data/q27-freeze/` only when every gate passed, appending the
   MANIFEST line itself.

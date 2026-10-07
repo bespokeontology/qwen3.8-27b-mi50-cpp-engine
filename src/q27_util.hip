@@ -328,19 +328,6 @@ __global__ __launch_bounds__(256) void k_copy_bf16_flag_mb(const float4* __restr
         if (old + 1u == target) { __threadfence_system(); *((volatile unsigned*)done) = gen; }
     }
 }
-// Q27_WAIT_KERNEL (2026-09-28): a resident spin on the host-published collective flag, as an
-// alternative to the CP barrier-value packet (hipStreamWaitValue32). It blocks only its own stream
-// (in-order barrier bit); a co-resident worker's queue keeps dispatching. The flag lives in
-// fine-grained pinned host memory, so a system-scope atomic load reads it over PCIe each iteration.
-__global__ void k_wait_flag_eq(const unsigned* __restrict__ flag, unsigned want) {
-    if (threadIdx.x == 0) {
-        while (__hip_atomic_load(flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != want)
-            __builtin_amdgcn_s_sleep(1);
-    }
-}
-extern "C" void q27_wait_flag_eq(const unsigned* flag_dev, unsigned want, hipStream_t s) {
-    hipLaunchKernelGGL(k_wait_flag_eq, dim3(1), dim3(64), 0, s, flag_dev, want);
-}
 extern "C" void q27_copy_bf16_flag_mb(unsigned short* dst_dev, const float* src, int n, unsigned* done_dev,
                                       unsigned gen, unsigned* cnt_dev, unsigned target, int nblk,
                                       hipStream_t s) {

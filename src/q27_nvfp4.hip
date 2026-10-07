@@ -418,8 +418,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_b(
 extern "C" void q27_proj_nvfp4_gu_b(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120) return;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g64((unsigned)((wg->rows + 3) / 4)), b64(256);
@@ -551,8 +549,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_b(
 }
 extern "C" void q27_proj_nvfp4_b(const q27_nvfp4_t* w, const signed char* xq_perm,
                                  const float* xs, float* y, int C, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_b rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (w->K != 5120) return;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g64((unsigned)((w->rows + 3) / 4)), b64(256);
@@ -577,8 +573,6 @@ extern "C" void q27_proj_nvfp4_b(const q27_nvfp4_t* w, const signed char* xq_per
 
 extern "C" int q27_proj_nvfp4_bf16(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, unsigned short* y, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bf16 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 5120) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g64((unsigned)((w->rows + 3) / 4)), b64(256);
@@ -837,8 +831,6 @@ extern "C" int q27_proj_nvfp4_gu(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                  const signed char* xq_perm, const float* xs,
                                  float* yg, float* yu, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!q27_env_flag("Q27_NVFP4_GU", true)) return 0;
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120) return 0;
     // Q27_GEMV_ALT (plain-decode A/B of the row-batched forms at NR=1; identical arithmetic): 1 = register NR form, 2 = LDS-staged form
@@ -1409,8 +1401,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_gu_b3(
 extern "C" int q27_proj_nvfp4_gu_b3(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b3 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > 8) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -1423,9 +1413,7 @@ extern "C" int q27_proj_nvfp4_gu_b3(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu
 }
 
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
-extern "C" int q27_proj_nvfp4_gu_b3(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b3 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b3(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
 #endif
 // v5 (Q27_PF_MLP5): b2's exact loop, minus the per-chunk register cache of the eight staged
 // activations (xv[8] = 32 VGPRs, xs[8] = 8): each is read from LDS where it is used. The resource
@@ -1495,8 +1483,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b5(
 extern "C" int q27_proj_nvfp4_gu_b5(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b5 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -1574,8 +1560,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b5(
 }
 extern "C" int q27_proj_nvfp4_bt5(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt5 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -1678,8 +1662,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b6(
 extern "C" int q27_proj_nvfp4_gu_b6(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b6 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -1769,8 +1751,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b6(
 }
 extern "C" int q27_proj_nvfp4_bt6(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt6 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -1861,8 +1841,6 @@ __global__ __launch_bounds__(256, 1) void q27_k_nvfp4_gu_b7(
 extern "C" int q27_proj_nvfp4_gu_b7(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int rpw_req, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b7 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const int ncu = 60;
@@ -1947,8 +1925,6 @@ __global__ __launch_bounds__(256, 1) void q27_k_nvfp4_t2_b7(
 }
 extern "C" int q27_proj_nvfp4_bt7(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int rpw_req, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt7 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -2057,8 +2033,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b8(
 extern "C" int q27_proj_nvfp4_gu_b8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b8 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > 8) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -2154,8 +2128,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b9(
 extern "C" int q27_proj_nvfp4_gu_b9(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b9 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -2245,8 +2217,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b9(
 }
 extern "C" int q27_proj_nvfp4_bt9(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt9 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -2332,8 +2302,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b10(
 extern "C" int q27_proj_nvfp4_gu_b10(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b10 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -2411,8 +2379,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b10(
 }
 extern "C" int q27_proj_nvfp4_bt10(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt10 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -2426,33 +2392,15 @@ extern "C" int q27_proj_nvfp4_bt10(const q27_nvfp4_t* w, const signed char* xq_p
 }
 
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
-extern "C" int q27_proj_nvfp4_gu_b6(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b6 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt6(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt6 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b7(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int rpw_req, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b7 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt7(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int rpw_req, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt7 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b8 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b9(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b9 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt9(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt9 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b10(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b10 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt10(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt10 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b6(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt6(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b7(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int rpw_req, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt7(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int rpw_req, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b9(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt9(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b10(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt10(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) { (void)0; return 0; }
 #endif
 #ifdef Q27_EXPERIMENTS
 // v12 (Q27_PF_MLP12): b5's loop untouched, the EPILOGUE rebuilt. b5's disassembly ends in 96 ds_bpermute_b32 with
@@ -2515,8 +2463,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b12(
 extern "C" int q27_proj_nvfp4_gu_b12(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int C, int gb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b12 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -2584,8 +2530,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b12(
 }
 extern "C" int q27_proj_nvfp4_bt12(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, float* y, int C, int gb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt12 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -2596,12 +2540,8 @@ extern "C" int q27_proj_nvfp4_bt12(const q27_nvfp4_t* w, const signed char* xq_p
 }
 
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
-extern "C" int q27_proj_nvfp4_gu_b12(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int gb, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b12 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt12(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int gb, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt12 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b12(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int gb, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt12(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int gb, hipStream_t s) { (void)0; return 0; }
 #endif
 // v13 (Q27_PF_MLP13): v12 with the weight/scale addressing made wave-uniform on purpose. b12's code forms every
 // weight and scale address as a 64-bit VGPR pair (60 64-bit address ops, no saddr loads) although the row base is
@@ -2665,8 +2605,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b13(
 extern "C" int q27_proj_nvfp4_gu_b13(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int C, int minw, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b13 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -2736,8 +2674,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b13(
 }
 extern "C" int q27_proj_nvfp4_bt13(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, float* y, int C, int minw, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt13 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -2777,8 +2713,6 @@ extern "C" void q27_nvfp4_free_w8(const q27_nvfp4_t* w) {
     }
 }
 extern "C" int q27_nvfp4_make_w8(const q27_nvfp4_t* w, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_make_w8 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || !w->w || w->rows <= 0 || w->K <= 0 || (w->K % 16)) return 0;
     if (q27_nvfp4_w8(w)) return 1;
     if (s_w8_n >= 2048) return 0;
@@ -2846,8 +2780,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b14(
 extern "C" int q27_proj_nvfp4_gu_b14(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int C, int minw, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b14 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     const unsigned char* g8 = q27_nvfp4_w8(wg); const unsigned char* u8 = q27_nvfp4_w8(wu);
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC || !g8 || !u8) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
@@ -2914,8 +2846,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b14(
 }
 extern "C" int q27_proj_nvfp4_bt14(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, float* y, int C, int minw, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt14 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     const unsigned char* w8 = q27_nvfp4_w8(w);
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC || !w8) return 0;
     const float alpha = w->in_scale * w->ws2;
@@ -2992,8 +2922,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_gu_b11(
 extern "C" int q27_proj_nvfp4_gu_b11(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int C, int depth, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b11 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -3071,8 +2999,6 @@ __global__ __launch_bounds__(256, MINW) void q27_k_nvfp4_t2_b11(
 }
 extern "C" int q27_proj_nvfp4_bt11(const q27_nvfp4_t* w, const signed char* xq_perm,
                                    const float* xs, float* y, int C, int depth, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt11 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -3086,21 +3012,11 @@ extern "C" int q27_proj_nvfp4_bt11(const q27_nvfp4_t* w, const signed char* xq_p
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
 extern "C" const unsigned char* q27_nvfp4_w8(const q27_nvfp4_t* w) { (void)0; return nullptr; }
 extern "C" void q27_nvfp4_free_w8(const q27_nvfp4_t* w) { (void)0;  }
-extern "C" int q27_nvfp4_make_w8(const q27_nvfp4_t* w, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_make_w8 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b14(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int minw, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b14 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt14(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int minw, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt14 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b11(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int depth, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b11 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt11(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int depth, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt11 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_nvfp4_make_w8(const q27_nvfp4_t* w, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b14(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int minw, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt14(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int minw, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b11(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int depth, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt11(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int depth, hipStream_t s) { (void)0; return 0; }
 
 // PRESHUFFLED int8 mirror (Q27_LS_W8): [kk][tile][tx][4 rows][16 B] with the dq4 even-then-odd
 // lane order baked in. A warp reading one (kk, tile) walks 1 KB of contiguous bytes -- the
@@ -3131,8 +3047,6 @@ extern "C" const unsigned char* q27_nvfp4_w8s(const q27_nvfp4_t* w) {
     return nullptr;
 }
 extern "C" int q27_nvfp4_make_w8s(const q27_nvfp4_t* w, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_make_w8s rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || !w->w || w->rows <= 0 || w->K <= 0 || (w->K % 16) || (w->rows % 64)) return 0;
     if (q27_nvfp4_w8s(w)) return 1;
     if (s_w8s_n >= 2048) return 0;
@@ -3257,8 +3171,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_gu_b4(
 extern "C" int q27_proj_nvfp4_gu_b4(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b4 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     if (R == 1) { const dim3 g((unsigned)((wg->rows + 3) / 4)), b(256);
@@ -3370,8 +3282,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_t2_b4(
 }
 extern "C" int q27_proj_nvfp4_bt4(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt4 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;
@@ -3389,8 +3299,6 @@ extern "C" int q27_proj_nvfp4_bt4(const q27_nvfp4_t* w, const signed char* xq_pe
 extern "C" int q27_proj_nvfp4_gu_b2_c(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                       const signed char* xq_perm, const float* xs,
                                       float* yg, float* yu, int C, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b2_c rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g((unsigned)((wg->rows + 7) / 8)), b(256);
@@ -3404,21 +3312,13 @@ extern "C" int q27_proj_nvfp4_gu_b2_c(const q27_nvfp4_t* wg, const q27_nvfp4_t* 
 }
 
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
-extern "C" int q27_proj_nvfp4_gu_b4(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b4 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt4(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt4 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_gu_b2_c(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b2_c rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b4(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt4(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_gu_b2_c(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, const float* xs, float* yg, float* yu, int C, hipStream_t s) { (void)0; return 0; }
 #endif
 extern "C" int q27_proj_nvfp4_gu_b2(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int C, int R, hipStream_t s) {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_b2 rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || C < 1 || C > Q27_PF_MC) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     // always C=Q27_PF_MC: the slots are 8 wide, the extra positions of a tail chunk compute into slots nobody reads
@@ -3596,8 +3496,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_t2_b3(
 }
 extern "C" int q27_proj_nvfp4_bt3(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt3 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     const unsigned short* radd = g_nv_radd; const float rs = g_nv_rs;   // same contract as bt2 (q27_nvfp4_set_res)
@@ -3612,8 +3510,6 @@ extern "C" int q27_proj_nvfp4_bt3(const q27_nvfp4_t* w, const signed char* xq_pe
 
 extern "C" int q27_proj_nvfp4_bt2_c(const q27_nvfp4_t* w, const signed char* xq_perm,
                                     const float* xs, float* y, int C, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt2_c rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (w->K != 4352) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g((unsigned)((w->rows + 7) / 8)), b(256);
@@ -3627,17 +3523,11 @@ extern "C" int q27_proj_nvfp4_bt2_c(const q27_nvfp4_t* w, const signed char* xq_
 }
 
 #else   // closed experiments compiled out (see docs/AMD_REFERENCE_MINING.md); stubs keep the flag chains linkable
-extern "C" int q27_proj_nvfp4_bt3(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt3 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
-extern "C" int q27_proj_nvfp4_bt2_c(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt2_c rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
- (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt3(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, int R, hipStream_t s) { (void)0; return 0; }
+extern "C" int q27_proj_nvfp4_bt2_c(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs, float* y, int C, hipStream_t s) { (void)0; return 0; }
 #endif
 extern "C" int q27_proj_nvfp4_bt2(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, int R, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt2 rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (w->K != 4352 || C < 1 || C > Q27_PF_MC) return 0;
     const float alpha = w->in_scale * w->ws2;
     if (R == 4) { const dim3 g((unsigned)((w->rows + 15) / 16)), b(256);
@@ -3650,8 +3540,6 @@ extern "C" int q27_proj_nvfp4_bt2(const q27_nvfp4_t* w, const signed char* xq_pe
 
 extern "C" void q27_proj_nvfp4_bt(const q27_nvfp4_t* w, const signed char* xq_perm,
                                   const float* xs, float* y, int C, hipStream_t s) {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_bt rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (w->K != 4352) return;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g64((unsigned)((w->rows + 3) / 4)), b64(256);
@@ -3682,8 +3570,6 @@ extern "C" void q27_proj_nvfp4_bt(const q27_nvfp4_t* w, const signed char* xq_pe
 void q27_proj_nvfp4(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs,
                     float* y, hipStream_t s)
 {
-    if (w && !w->w) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ in %s (rows=%d K=%d) -- a DROPPED 4-bit handle was read; this path is not on EXL3\n", __func__, w->rows, w->K); std::fflush(stderr); std::abort(); }
-
     const int rows = w->rows, K = w->K;
     if (rows <= 0 || K <= 0 || (K & 31)) {
         fprintf(stderr, "q27_proj_nvfp4: rows=%d K=%d — K must be a positive multiple of 32 "
@@ -3701,15 +3587,6 @@ void q27_proj_nvfp4(const q27_nvfp4_t* w, const signed char* xq_perm, const floa
     if (!use32) {                       // measured 1.39x faster; W32=1 restores the old geometry
         const dim3 g64((unsigned)((rows + 3) / 4)), b64(256);
         switch (K) {
-        case 2176:
-        case 6528:
-        case 3264:
-        case 5440:
-        case 5888:
-        case 5760:
-        case 6400: case 5504: case 6656: case 5376: case 6016: case 5696:
-            if (q27_proj_nvfp4_down_nr(w, xq_perm, xs, y, rows, g_nv_radd, 0, g_nv_rs, 1, s)) return;
-            break;
         case  5120:
             if (q27_env_flag("Q27_NVFP4_WIDE", false))
                 hipLaunchKernelGGL((q27_k_nvfp4_w64w<2,1>), g64, b64, 0, s,
@@ -4034,7 +3911,7 @@ static void run_one(St& st, const char* prefix, int checkrows, int iters, double
 int main(int argc, char** argv)
 {
     const char* shard = (argc > 1) ? argv[1]
-        : "./model/model-00000-of-00003.safetensors";
+        : "/data/qwen38-27b/model/model-00000-of-00003.safetensors";
     const int checkrows = (argc > 2) ? atoi(argv[2]) : 2048;
     const int iters     = (argc > 3) ? atoi(argv[3]) : 200;
     const int dev       = (argc > 4) ? atoi(argv[4]) : 0;
@@ -4265,8 +4142,6 @@ extern "C" int q27_mlp_gu_swiglu_q(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
                                    const signed char* xq_perm, const float* xs,
                                    signed char* dq, float* ds, float down_in_scale, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_mlp_gu_swiglu_q rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     // REJECTED on measurement, kept behind a flag as evidence. Full gate+up+SwiGLU+quant fusion
 // composed 20.181 ms mean against 19.160 for the two-kernel form (gate+up fused, SwiGLU+quant
 // fused). First version also had a single-thread epilogue serialising 16 __expf calls; fixing that
@@ -4317,91 +4192,9 @@ __global__ void q27_k_nvfp4_to_i8g64(const unsigned char* __restrict__ W, const 
         wr[j] = (signed char)q;
     }
 }
-// SAME CONVERSION, CALLER-OWNED DESTINATION.
-// q27_nvfp4_to_i8g64_conv hipMallocs a permanent mirror, which is why the int8 MLP is all-or-
-// nothing: 271 MiB per layer x 16 owned layers = 4.23 GiB, and it does not fit at ctx=262144.
-// But layer-split prefill walks its layers SEQUENTIALLY, so only ONE layer's MLP has to be
-// expanded at a time. Writing into a reusable arena turns a 4.23 GiB residency decision into a
-// 271 MiB working set, which fits in the headroom -- and the already-fast int8/Tensile MLP
-// consumers run unchanged against it.
-// PER-1024 int8 GROUP. The per-64 form above feeds the wide int8 consumers, which measured 2.3x
-// slower than the NVFP4 wide kernels this campaign optimized. The fast consumer is the Tensile
-// int8 GEMM (q27_rb_gemm_i8g), and it needs the weights quantized in K-slices of GS with ONE fp32
-// scale per row per slice -- at GS=1024 the int32 accumulator is 5 x M x N and stays affordable,
-// while at GS=64 it would be 80 x M x N and not. Keep the original per-16 scales: multiplying a
-// per-16 e4m3 scale by its row's slice scale is only valid if the block max is taken over the
-// TRUE dequantized values, which is what the two passes below do (pass 2 re-reads, L2-hot).
-__global__ void q27_k_nvfp4_to_i8g1024(const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
-                                       signed char* __restrict__ W8, float* __restrict__ S1024, int rows, int K)
-{
-    const int t = blockIdx.x * 256 + threadIdx.x;
-    const int NG = K >> 10, NG16 = K >> 4, KP = K >> 1;
-    if (t >= rows * NG) return;
-    const int r = t / NG, kb = t % NG;
-    const unsigned char* pr = W + (size_t)r * KP + (size_t)kb * 512;   // 1024 elements = 512 packed bytes
-    const unsigned char* ps = S + (size_t)r * NG16 + (size_t)kb * 64;  // 64 per-16 e4m3 scale bytes
-    static const float e2m1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    float mx = 0.f;
-    for (int g = 0; g < 64; ++g) {
-        const float gs = q27_e4m3_sel(ps[g]);
-#pragma unroll
-        for (int b = 0; b < 8; ++b) {
-            const unsigned byte = pr[(g << 3) + b];
-            const float lo = e2m1[byte & 7u] * ((byte & 8u) ? -1.f : 1.f) * gs;
-            const float hi = e2m1[(byte >> 4) & 7u] * ((byte & 0x80u) ? -1.f : 1.f) * gs;
-            mx = fmaxf(mx, fmaxf(fabsf(lo), fabsf(hi)));
-        }
-    }
-    const float sc = (mx > 0.f) ? (mx * (1.0f / 127.0f)) : 1.f;
-    const float inv = 1.0f / sc;
-    S1024[(size_t)r * NG + kb] = sc;
-    signed char* wr = W8 + (size_t)r * K + (size_t)kb * 1024;
-    for (int g = 0; g < 64; ++g) {
-        const float gs = q27_e4m3_sel(ps[g]);
-#pragma unroll
-        for (int b = 0; b < 8; ++b) {
-            const unsigned byte = pr[(g << 3) + b];
-            const float lo = e2m1[byte & 7u] * ((byte & 8u) ? -1.f : 1.f) * gs;
-            const float hi = e2m1[(byte >> 4) & 7u] * ((byte & 0x80u) ? -1.f : 1.f) * gs;
-            int q0 = (int)rintf(lo * inv); q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
-            int q1 = (int)rintf(hi * inv); q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
-            wr[(g << 4) + (b << 1)]     = (signed char)q0;
-            wr[(g << 4) + (b << 1) + 1] = (signed char)q1;
-        }
-    }
-}
-extern "C" int q27_nvfp4_to_i8g1024_into(const q27_nvfp4_t* src, q27_i8g_t* dst,
-                                         signed char* w8, float* s1024, hipStream_t st) {
-    if ((src) && !((src)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_to_i8g1024_into rows=%d K=%d\n", (src)->rows, (src)->K); std::fflush(stderr); std::abort(); }
-
-    if (!src || !src->w || (src->K % 1024) || !w8 || !s1024) return 0;
-    dst->rows = src->rows; dst->K = src->K; dst->alpha = src->in_scale * src->ws2;
-    dst->ldw = 0; dst->lds = 0;
-    const int NG = src->K >> 10;
-    hipLaunchKernelGGL(q27_k_nvfp4_to_i8g1024, dim3((size_t)(((size_t)src->rows * NG + 255) / 256)), dim3(256), 0, st,
-                       src->w, src->gs, w8, s1024, src->rows, src->K);
-    dst->w = w8; dst->s = s1024;
-    return 1;
-}
-extern "C" int q27_nvfp4_to_i8g64_into(const q27_nvfp4_t* src, q27_i8g_t* dst,
-                                       signed char* w8, float* s64, hipStream_t st) {
-    if ((src) && !((src)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_to_i8g64_into rows=%d K=%d\n", (src)->rows, (src)->K); std::fflush(stderr); std::abort(); }
-
-    if (!src || !src->w || (src->K % 64) || !w8 || !s64) return 0;
-    dst->rows = src->rows; dst->K = src->K; dst->alpha = src->in_scale * src->ws2;
-    dst->ldw = 0; dst->lds = 0;
-    const int NG = src->K >> 6;
-    hipLaunchKernelGGL(q27_k_nvfp4_to_i8g64, dim3((size_t)((size_t)src->rows * NG + 255) / 256), dim3(256), 0, st,
-                       src->w, src->gs, w8, s64, src->rows, src->K);
-    dst->w = w8; dst->s = s64;
-    return 1;
-}
 extern "C" int q27_nvfp4_to_i8g64_conv(const q27_nvfp4_t* src, q27_i8g_t* dst, hipStream_t st) {
-    if ((src) && !((src)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_nvfp4_to_i8g64_conv rows=%d K=%d\n", (src)->rows, (src)->K); std::fflush(stderr); std::abort(); }
-
     if (!src || !src->w || (src->K % 64)) return 0;
     dst->rows = src->rows; dst->K = src->K; dst->alpha = src->in_scale * src->ws2;
-    dst->ldw = 0; dst->lds = 0;
     signed char* w8 = nullptr; float* s64 = nullptr;
     if (hipMalloc((void**)&w8, (size_t)src->rows * src->K) != hipSuccess ||
         hipMalloc((void**)&s64, (size_t)src->rows * (src->K >> 6) * 4) != hipSuccess) {
@@ -4451,51 +4244,6 @@ __global__ __launch_bounds__(256) void q27_k_swiglu_quant_b_g64(
     }
     if (ok) *(uint4*)(Q + base) = make_uint4(d[0], d[1], d[2], d[3]);
 }
-// PER-1024 SWIGLU+QUANT. The Tensile int8 GEMM slices K at GS and applies ONE activation scale per
-// token per slice, so the activation buffer that feeds it must be quantized in the same slices.
-// One wave (64 lanes) covers a 1024 element group: 16 elements per lane, one xor reduction for the
-// group max, then each lane writes its own 16 int8. Same swiglu, same rounding, different group.
-__global__ __launch_bounds__(64) void q27_k_swiglu_quant_b_1024(
-        const float* __restrict__ G, const float* __restrict__ U,
-        signed char* __restrict__ Q, float* __restrict__ XS, float gscale,
-        size_t gu_stride, size_t q_stride, size_t xs_stride)
-{
-    const int c = blockIdx.y, g = blockIdx.x, lane = threadIdx.x;
-    G += (size_t)c * gu_stride; U += (size_t)c * gu_stride;
-    Q += (size_t)c * q_stride;  XS += (size_t)c * xs_stride;
-    const size_t base = ((size_t)g << 10) + ((size_t)lane << 4);
-    float v[16]; float mx = 0.f;
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        const float a = G[base + j];
-        const float b = U[base + j];
-        const float sw = a / (1.0f + __expf(-a));
-        v[j] = sw * b * gscale;
-        mx = fmaxf(mx, fabsf(v[j]));
-    }
-#pragma unroll
-    for (int o = 32; o; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 64));
-    const float sc  = mx * (1.0f / 127.0f);
-    const float inv = (sc > 0.f) ? (1.0f / sc) : 0.f;
-    if (lane == 0) XS[g] = sc;
-    unsigned d[4] = {0u, 0u, 0u, 0u};
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        int cq = (int)rintf(v[j] * inv);
-        cq = cq < -127 ? -127 : (cq > 127 ? 127 : cq);
-        d[j >> 2] |= ((unsigned)(cq & 0xFF)) << ((j & 3) * 8);
-    }
-    *(uint4*)(Q + base) = make_uint4(d[0], d[1], d[2], d[3]);
-}
-extern "C" int q27_swiglu_quant_b_1024(const float* gate, const float* up, signed char* xq, float* xs,
-                                       int n, float in_scale, int C, hipStream_t s)
-{
-    if (n <= 0 || (n & 1023) || !(in_scale > 0.f) || C < 1) return 0;
-    if (((uintptr_t)gate | (uintptr_t)up | (uintptr_t)xq) & 15u) return 0;
-    hipLaunchKernelGGL(q27_k_swiglu_quant_b_1024, dim3((unsigned)(n >> 10), (unsigned)C), dim3(64), 0, s,
-                       gate, up, xq, xs, 1.0f / in_scale, (size_t)n, (size_t)n, (size_t)(n >> 10));
-    return 1;
-}
 extern "C" int q27_swiglu_quant_b_g64(const float* gate, const float* up, signed char* xq, float* xs,
                                       int n, float in_scale, int C, hipStream_t s)
 {
@@ -4529,9 +4277,6 @@ __global__ void q27_k_fp8_to_i8g64(const unsigned char* __restrict__ F, signed c
 extern "C" int q27_fp8_to_i8g64_conv(const q27_fp8_t* src, q27_i8g_t* dst, hipStream_t st) {
     if (!src || !src->w || (src->K % 64)) return 0;
     dst->rows = src->rows; dst->K = src->K; dst->alpha = src->in_scale * src->wscale;
-    dst->ldw = 0; dst->lds = 0;      // dense: the row stride IS K. Consumers read these fields, so
-                                     // a caller that did not zero-initialise its descriptor must not
-                                     // be able to leave a stale stride here.
     signed char* w8 = nullptr; float* s64 = nullptr;
     if (hipMalloc((void**)&w8, (size_t)src->rows * src->K) != hipSuccess ||
         hipMalloc((void**)&s64, (size_t)src->rows * (src->K >> 6) * 4) != hipSuccess) {
@@ -4560,7 +4305,6 @@ extern "C" int q27_fp8_to_i8g64_cat(const q27_fp8_t* const* srcs, int n, q27_i8g
         hipLaunchKernelGGL(q27_k_fp8_to_i8g64, dim3((size_t)((size_t)s->rows * NG + 255) / 256), dim3(256), 0, st,
                            s->w, w8 + off * (size_t)K, s64 + off * (size_t)NG, s->rows, K);
         dsts[i].w = w8 + off * (size_t)K; dsts[i].s = s64 + off * (size_t)NG; dsts[i].rows = s->rows; dsts[i].K = K; dsts[i].alpha = s->in_scale * s->wscale;
-        dsts[i].ldw = 0; dsts[i].lds = 0;   // dense row: `off*K` is a row offset in the shared buffer, not a column view
         off += (size_t)s->rows;
     }
     return 1;
@@ -4580,14 +4324,6 @@ __device__ __forceinline__ void q27_grp16_pre(uint2 pk, unsigned* w) {
     w[1] = q27_dq4((pk.x >> 4) & 0x0F0F0F0Fu);
     w[2] = q27_dq4( pk.y       & 0x0F0F0F0Fu);
     w[3] = q27_dq4((pk.y >> 4) & 0x0F0F0F0Fu);
-}
-// Same as q27_grp16_pre but the weight nibbles are LINEAR int4 (q27_dq4_i4), not E2M1.
-// pk is 8 bytes = 16 packed int4 nibbles, same layout as E2M1 (low nibble = even, high = odd).
-__device__ __forceinline__ void q27_grp16_pre_from_i4(uint2 pk, unsigned* w) {
-    w[0] = q27_dq4_i4( pk.x       & 0x0F0F0F0Fu);
-    w[1] = q27_dq4_i4((pk.x >> 4) & 0x0F0F0F0Fu);
-    w[2] = q27_dq4_i4( pk.y       & 0x0F0F0F0Fu);
-    w[3] = q27_dq4_i4((pk.y >> 4) & 0x0F0F0F0Fu);
 }
 __device__ __forceinline__ int q27_grp16_dot(const unsigned* w, uint4 xv) {   // xe = (x, y), xo = (z, w)
     int a = 0;
@@ -4661,14 +4397,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_nr(
     }
 }
 
-// MX=1 makes this the OCP MXFP4 (AMD Quark) consumer -- q27_k_mxfp4_w64_gu_nr, dispatched by
-// q27_proj_mxfp4_gu_nr below. The E2M1 weight nibbles and the [rows][K/2] K-contiguous byte layout
-// are IDENTICAL to NVFP4, so q27_grp16_pre/q27_grp16_dot are reused verbatim and the entire wave64
-// geometry, row assignment, NR organisation, reduction and output path are unchanged. Exactly two
-// things move: the scale plane is [rows][K/32] instead of [rows][K/16] (one byte per 32 weights, so
-// two consecutive 16-weight groups share a scale -> index g>>1), and the byte is E8M0 rather than
-// E4M3 (one shift instead of ~6 ops). ws2 must be 1.0f: MXFP4 has no second-level weight scale.
-template<int UPL2, int NR, int R, int FS = 0, int MX = 0, int SW = 0>
+template<int UPL2, int NR, int R>
 __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_nr(
         const unsigned char* __restrict__ WG, const unsigned char* __restrict__ SG,
         const unsigned char* __restrict__ WU, const unsigned char* __restrict__ SU,
@@ -4679,7 +4408,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_nr(
     if (row0 >= rows) return;
     const int lane = threadIdx.x & 63;
     const int KP = UPL2 * 64 * 8;
-    const int NG = MX ? (UPL2 * 32) : (UPL2 * 64);   // scale-plane row stride: K/32 (MXFP4) vs K/16
+    const int NG = UPL2 * 64;
     const uint2* wg[R]; const uint2* wu[R]; const unsigned char* sg[R]; const unsigned char* su[R];
     #pragma unroll
     for (int r = 0; r < R; ++r) {
@@ -4694,9 +4423,8 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_nr(
     #pragma unroll
     for (int i = 0; i < UPL2; ++i) {
         const int g = lane + i * 64;
-        const int gsi = MX ? (g >> 1) : g;   // MXFP4: two 16-weight groups share one E8M0 byte
         #pragma unroll
-        for (int r = 0; r < R; ++r) { vg[r][i] = wg[r][g]; vu[r][i] = wu[r][g]; cg[r][i] = sg[r][gsi]; cu[r][i] = su[r][gsi]; }
+        for (int r = 0; r < R; ++r) { vg[r][i] = wg[r][g]; vu[r][i] = wu[r][g]; cg[r][i] = sg[r][g]; cu[r][i] = su[r][g]; }
         #pragma unroll
         for (int n = 0; n < NR; ++n) {
             xv[n][i]  = *(const uint4*)(Xp + (size_t)n * (xst >> 2) + (size_t)g * 4);
@@ -4712,13 +4440,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_nr(
     for (int i = 0; i < UPL2; ++i) {
         #pragma unroll
         for (int r = 0; r < R; ++r) {
-            // FS is a TEMPLATE parameter, so the unused arm is gone at compile time -- this is the
-            // deletion the banked select-form negatives were not. FS=1 only when the dispatcher saw
-            // gs_fast on BOTH planes (q27_nvfp4_gs_validate).
-            const float eg = MX ? q27_e8m0(cg[r][i])
-                                : (FS ? q27_e4m3_fast(cg[r][i]) : ((NR > 1) ? q27_e4m3_sel(cg[r][i]) : q27_e4m3(cg[r][i])));
-            const float eu = MX ? q27_e8m0(cu[r][i])
-                                : (FS ? q27_e4m3_fast(cu[r][i]) : ((NR > 1) ? q27_e4m3_sel(cu[r][i]) : q27_e4m3(cu[r][i])));
+            const float eg = (NR > 1) ? q27_e4m3_sel(cg[r][i]) : q27_e4m3(cg[r][i]), eu = (NR > 1) ? q27_e4m3_sel(cu[r][i]) : q27_e4m3(cu[r][i]);
             unsigned wgd[4], wud[4]; q27_grp16_pre(vg[r][i], wgd); q27_grp16_pre(vu[r][i], wud);
             #pragma unroll
             for (int n = 0; n < NR; ++n) {
@@ -4738,326 +4460,37 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_nr(
         for (int r = 0; r < R; ++r) {
             if (row0 + r >= rows) continue;
             #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                const float g = accg[r][n] * ag, u = accu[r][n] * au;
-                // Q27_GU_SWILU (SW=1): write silu(g)*u only; the separate SwiGLU launch is skipped.
-                YG[(size_t)n * ystride + row0 + r] = SW ? (g / (1.0f + __expf(-g)) * u) : g;
-                if (!SW) YU[(size_t)n * ystride + row0 + r] = u;
-            }
+            for (int n = 0; n < NR; ++n) { YG[(size_t)n * ystride + row0 + r] = accg[r][n] * ag; YU[(size_t)n * ystride + row0 + r] = accu[r][n] * au; }
         }
     }
 }
 
-// Q27_GU_WIDE: K-widened fused gate+up for the trunk. Two consecutive 16-weight groups ride
-// one dwordx4 per matrix -> 1024-B single-tensor bursts instead of two 512-B ones, and the
-// shared activation decode is amortised over 32 weights. Same 1 row/wave, 256-thread block,
-// NR rows and ystride as q27_k_nvfp4_w64_gu_nr.
-//
-// INDEXING PROVENANCE (2026-09-29): the EXP=1 q27_k_nvfp4_w64_guw donor produces ~1e10 garbage
-// against gu_nr on identical inputs (control tests/gu_wide/check_ctrl2.cpp: w64_gu matches
-// gu_nr bit-exactly, guw does not). This body is therefore derived from the working
-// q27_k_nvfp4_w64_gu (g = lane + i*64, uint2 per group) with ONLY the load width widened to
-// uint4 over consecutive group pairs. Work distribution is consecutive pairs so the dwordx4
-// is a single 1024-B burst; fmaf grouping across lanes differs from gu_nr, so outputs are not
-// bit-identical to it (diagnostic token hashes).
-template<int WIDE2, int NARROW, int NR, int FS = 0>
-__global__ __launch_bounds__(256) void q27_k_nvfp4_w64_guw_nr(
-        const unsigned char* __restrict__ WG, const unsigned char* __restrict__ SG,
-        const unsigned char* __restrict__ WU, const unsigned char* __restrict__ SU,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float ag, float au, int rows, float* __restrict__ YG, float* __restrict__ YU, int ystride, int xst)
-{
-    const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 6));
-    if (row0 >= rows) return;
-    const int lane = threadIdx.x & 63;
-    const int NG = (WIDE2 * 2 + NARROW) * 64;
-    const int KP = NG * 8;
-    // Weight/scale planes are per output row; activation planes are per NR row (stride xst).
-    const unsigned char* sg = SG + (size_t)row0 * (size_t)NG;
-    const unsigned char* su = SU + (size_t)row0 * (size_t)NG;
-    const unsigned char* wgbase = WG + (size_t)row0 * (size_t)KP;
-    const unsigned char* wubase = WU + (size_t)row0 * (size_t)KP;
-
-    uint4 vg[WIDE2], vu[WIDE2];
-    unsigned short cg2[WIDE2], cu2[WIDE2];
-    uint2 xs2[WIDE2][NR];
-    uint4 xv0[WIDE2][NR], xv1[WIDE2][NR];
-    #pragma unroll
-    for (int i = 0; i < WIDE2; ++i) {
-        const int l2 = lane + i * 64;          // uint4 index
-        const int g  = 2 * l2;                 // first of the two 16-weight groups
-        vg[i]  = *(const uint4*)(wgbase + (size_t)l2 * 16u);
-        vu[i]  = *(const uint4*)(wubase + (size_t)l2 * 16u);
-        cg2[i] = *(const unsigned short*)(sg + g);
-        cu2[i] = *(const unsigned short*)(su + g);
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            const unsigned* xp = Xp + (size_t)n * (size_t)(xst >> 2);
-            xv0[i][n] = *(const uint4*)(xp + (size_t)g * 4);
-            xv1[i][n] = *(const uint4*)(xp + (size_t)(g + 1) * 4);
-            xs2[i][n] = *(const uint2*)(Xs + (size_t)n * (size_t)(xst >> 4) + g);
-        }
-    }
-    // Narrow tail: one 16-weight group per lane (same as w64_gu's last iteration).
-    const int gt = (WIDE2 * 2) * 64 + lane;
-    const uint2 vgt = *(const uint2*)(wgbase + (size_t)gt * 8u);
-    const uint2 vut = *(const uint2*)(wubase + (size_t)gt * 8u);
-    const unsigned char cgt = sg[gt], cut = su[gt];
-    uint4 xvt[NR]; float xstl[NR];
-    #pragma unroll
-    for (int n = 0; n < NR; ++n) {
-        xvt[n]  = *(const uint4*)(Xp + (size_t)n * (size_t)(xst >> 2) + (size_t)gt * 4);
-        xstl[n] = Xs[(size_t)n * (size_t)(xst >> 4) + gt];
-    }
-
-    float accg[NR], accu[NR];
-    #pragma unroll
-    for (int n = 0; n < NR; ++n) { accg[n] = 0.f; accu[n] = 0.f; }
-
-#ifndef GUW_PAIR
-#define GUW_PAIR 1   // 1 = dwordx4 pair map (Q27_GU_WIDE); 0 = w64_gu control map
-#endif
-#if GUW_PAIR
-    // Exact w64_gu expressions: q27_grp16(weight_uint2, e, o) with e=(xv.x,xv.y), o=(xv.z,xv.w),
-    // scale = e4m3(gs) * xs * 0.5f applied as one fmaf multiplier.
-    #pragma unroll
-    for (int i = 0; i < WIDE2; ++i) {
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            const int g = 2 * (lane + i * 64);
-            const unsigned* xp = Xp + (size_t)n * (size_t)(xst >> 2);
-            const float*  xf = Xs + (size_t)n * (size_t)(xst >> 4);
-            const uint4 xv0n = *(const uint4*)(xp + (size_t)g * 4);
-            const uint4 xv1n = *(const uint4*)(xp + (size_t)(g + 1) * 4);
-            const uint2 e0 = make_uint2(xv0n.x, xv0n.y);
-            const uint2 o0 = make_uint2(xv0n.z, xv0n.w);
-            const uint2 e1 = make_uint2(xv1n.x, xv1n.y);
-            const uint2 o1 = make_uint2(xv1n.z, xv1n.w);
-            const unsigned char cg0 = sg[g], cg1 = sg[g+1];
-            const unsigned char cu0 = su[g], cu1 = su[g+1];
-            const float xs0 = xf[g], xs1 = xf[g+1];
-            const float gs0 = (FS ? q27_e4m3_fast(cg0) : q27_e4m3(cg0));
-            const float gs1 = (FS ? q27_e4m3_fast(cg1) : q27_e4m3(cg1));
-            const float us0 = (FS ? q27_e4m3_fast(cu0) : q27_e4m3(cu0));
-            const float us1 = (FS ? q27_e4m3_fast(cu1) : q27_e4m3(cu1));
-            const uint2 w0g = *(const uint2*)(wgbase + (size_t)g * 8u);
-            const uint2 w1g = *(const uint2*)(wgbase + (size_t)(g + 1) * 8u);
-            const uint2 u0g = *(const uint2*)(wubase + (size_t)g * 8u);
-            const uint2 u1g = *(const uint2*)(wubase + (size_t)(g + 1) * 8u);
-            accg[n] = fmaf((float)q27_grp16(w0g, e0, o0), gs0 * xs0 * 0.5f, accg[n]);
-            accg[n] = fmaf((float)q27_grp16(w1g, e1, o1), gs1 * xs1 * 0.5f, accg[n]);
-            accu[n] = fmaf((float)q27_grp16(u0g, e0, o0), us0 * xs0 * 0.5f, accu[n]);
-            accu[n] = fmaf((float)q27_grp16(u1g, e1, o1), us1 * xs1 * 0.5f, accu[n]);
-        }
-    }
-    {
-        const float gsc = (FS ? q27_e4m3_fast(cgt) : q27_e4m3(cgt));
-        const float usc = (FS ? q27_e4m3_fast(cut) : q27_e4m3(cut));
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            const uint2 e = make_uint2(xvt[n].x, xvt[n].y);
-            const uint2 o = make_uint2(xvt[n].z, xvt[n].w);
-            accg[n] = fmaf((float)q27_grp16(vgt, e, o), gsc * xstl[n] * 0.5f, accg[n]);
-            accu[n] = fmaf((float)q27_grp16(vut, e, o), usc * xstl[n] * 0.5f, accu[n]);
-        }
-    }
-#else
-    // CONTROL: w64_gu group map (g = lane + i*64) with uint2 loads. Must match gu_nr.
-    // Declared here only when GUW_PAIR=0 so the pair path stays untouched.
-    {
-        const unsigned char* sg2 = SG + (size_t)row0 * (size_t)NG;
-        const unsigned char* su2 = SU + (size_t)row0 * (size_t)NG;
-        #pragma unroll
-        for (int i = 0; i < 5; ++i) {
-            const int g = lane + i * 64;
-            const uint2 wgv = *(const uint2*)(wgbase + (size_t)g * 8u);
-            const uint2 wuv = *(const uint2*)(wubase + (size_t)g * 8u);
-            const unsigned char cg = sg2[g], cu = su2[g];
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                const uint4 xv = *(const uint4*)(Xp + (size_t)n * (size_t)(xst >> 2) + (size_t)g * 4);
-                const float xsc = Xs[(size_t)n * (size_t)(xst >> 4) + g] * 0.5f;
-                const uint2 e = make_uint2(xv.x, xv.y);
-                const uint2 o = make_uint2(xv.z, xv.w);
-                accg[n] = fmaf((float)q27_grp16(wgv, e, o), q27_e4m3(cg) * xsc, accg[n]);
-                accu[n] = fmaf((float)q27_grp16(wuv, e, o), q27_e4m3(cu) * xsc, accu[n]);
-            }
-        }
-    }
-#endif
-    #pragma unroll
-    for (int o = 32; o; o >>= 1)
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { accg[n] += __shfl_down(accg[n], o, 64); accu[n] += __shfl_down(accu[n], o, 64); }
-    if (lane == 0) {
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { YG[(size_t)n * ystride + row0] = accg[n] * ag; YU[(size_t)n * ystride + row0] = accu[n] * au; }
-    }
-}
-
-// Q27_GU_ILEAVE: WPERM-style interleaved gate/up. Weights [row][group][16B] = {gate[8], up[8]};
-// scales [row][group][2B] = {gate_gs, up_gs}. Same g = lane + i*64 as w64_gu, same q27_grp16,
-// so outputs are bit-identical to gu_nr. A wave issues one 1024-B burst per iteration instead
-// of two 512-B ones. Offline packer: tools/pack_gu_wperm.py. One-time load materialization
-// (q27_gu_ileave_pack), not a per-step repack. Default off (Q27_GU_ILEAVE).
-template<int UPL2, int NR, int FS = 0>
-__global__ __launch_bounds__(256) void q27_k_nvfp4_w64_gu_ileave_nr(
-        const unsigned char* __restrict__ GU, const unsigned char* __restrict__ GS,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float ag, float au, int rows, float* __restrict__ YG, float* __restrict__ YU, int ystride, int xst)
-{
-    const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 6));
-    if (row0 >= rows) return;
-    const int lane = threadIdx.x & 63;
-    const int NG = UPL2 * 64;                 // groups per row
-    const int KP = NG * 16;                   // interleaved weight bytes per row
-    const unsigned char* gu = GU + (size_t)row0 * (size_t)KP;
-    const unsigned char* gs = GS + (size_t)row0 * (size_t)NG * 2;
-
-    float accg[NR], accu[NR];
-    #pragma unroll
-    for (int n = 0; n < NR; ++n) { accg[n] = 0.f; accu[n] = 0.f; }
-
-    #pragma unroll
-    for (int i = 0; i < UPL2; ++i) {
-        const int g = lane + i * 64;
-        const uint4 wgu = *(const uint4*)(gu + (size_t)g * 16u);
-        const uint2 wgv = make_uint2(wgu.x, wgu.y);   // gate
-        const uint2 wuv = make_uint2(wgu.z, wgu.w);   // up
-        const unsigned short sc2 = *(const unsigned short*)(gs + (size_t)g * 2u);
-        const unsigned char cg = (unsigned char)(sc2 & 0xFF), cu = (unsigned char)(sc2 >> 8);
-        const float eg = (FS ? q27_e4m3_fast(cg) : q27_e4m3(cg));
-        const float eu = (FS ? q27_e4m3_fast(cu) : q27_e4m3(cu));
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            const uint4 xv = *(const uint4*)(Xp + (size_t)n * (size_t)(xst >> 2) + (size_t)g * 4);
-            const float xsc = Xs[(size_t)n * (size_t)(xst >> 4) + g] * 0.5f;
-            const uint2 e = make_uint2(xv.x, xv.y);
-            const uint2 o = make_uint2(xv.z, xv.w);
-            accg[n] = fmaf((float)q27_grp16(wgv, e, o), eg * xsc, accg[n]);
-            accu[n] = fmaf((float)q27_grp16(wuv, e, o), eu * xsc, accu[n]);
-        }
-    }
-    #pragma unroll
-    for (int o = 32; o; o >>= 1)
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { accg[n] += __shfl_down(accg[n], o, 64); accu[n] += __shfl_down(accu[n], o, 64); }
-    if (lane == 0) {
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { YG[(size_t)n * ystride + row0] = accg[n] * ag; YU[(size_t)n * ystride + row0] = accu[n] * au; }
-    }
-}
-
-// One-time materialization: [row][K/2] gate + [row][K/2] up -> [row][group][16B];
-// scales [row][K/16] + [row][K/16] -> [row][group][2B]. Load-time only.
-__global__ void q27_k_gu_ileave_pack(
-        const unsigned char* __restrict__ WG, const unsigned char* __restrict__ SG,
-        const unsigned char* __restrict__ WU, const unsigned char* __restrict__ SU,
-        unsigned char* __restrict__ GU, unsigned char* __restrict__ GS, int rows, int K)
-{
-    const size_t ng = (size_t)(K >> 4);
-    const size_t total = (size_t)rows * ng;
-    for (size_t t = blockIdx.x * 256u + threadIdx.x; t < total; t += (size_t)gridDim.x * 256u) {
-        const size_t r = t / ng, g = t % ng;
-        const unsigned char* p8 = WG + r * (size_t)(K >> 1) + g * 8u;
-        const unsigned char* u8 = WU + r * (size_t)(K >> 1) + g * 8u;
-        unsigned char* o = GU + r * ng * 16u + g * 16u;
-        #pragma unroll
-        for (int b = 0; b < 8; ++b) { o[b] = p8[b]; o[8 + b] = u8[b]; }
-        GS[r * ng * 2u + g * 2u + 0] = SG[r * ng + g];
-        GS[r * ng * 2u + g * 2u + 1] = SU[r * ng + g];
-    }
-}
-
-// Inverse for the offline/reference path (tests only).
-__global__ void q27_k_gu_ileave_unpack(
-        const unsigned char* __restrict__ GU, const unsigned char* __restrict__ GS,
-        unsigned char* __restrict__ WG, unsigned char* __restrict__ SG,
-        unsigned char* __restrict__ WU, unsigned char* __restrict__ SU, int rows, int K)
-{
-    const size_t ng = (size_t)(K >> 4);
-    const size_t total = (size_t)rows * ng;
-    for (size_t t = blockIdx.x * 256u + threadIdx.x; t < total; t += (size_t)gridDim.x * 256u) {
-        const size_t r = t / ng, g = t % ng;
-        const unsigned char* o = GU + r * ng * 16u + g * 16u;
-        unsigned char* p8 = WG + r * (size_t)(K >> 1) + g * 8u;
-        unsigned char* u8 = WU + r * (size_t)(K >> 1) + g * 8u;
-        #pragma unroll
-        for (int b = 0; b < 8; ++b) { p8[b] = o[b]; u8[b] = o[8 + b]; }
-        SG[r * ng + g] = GS[r * ng * 2u + g * 2u + 0];
-        SU[r * ng + g] = GS[r * ng * 2u + g * 2u + 1];
-    }
-}
-
-extern "C" int q27_gu_ileave_pack(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                  unsigned char* gu, unsigned char* gs, hipStream_t s)
-{
-    if (!wg || !wu || !wg->w || !wu->w || !wg->gs || !wu->gs || !gu || !gs) return 0;
-    if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || wg->gs_mx || wu->gs_mx) return 0;
-    const size_t ng = (size_t)(wg->rows) * (size_t)(wg->K >> 4);
-    const dim3 g((unsigned)((ng + 255) / 256)), b(256);
-    hipLaunchKernelGGL(q27_k_gu_ileave_pack, g, b, 0, s,
-                       wg->w, wg->gs, wu->w, wu->gs, gu, gs, wg->rows, wg->K);
-    return 1;
-}
-
-extern "C" int q27_proj_nvfp4_gu_ileave(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                        const unsigned char* gu, const unsigned char* gs,
-                                        const signed char* xq_perm, const float* xs,
-                                        float* yg, float* yu, int ystride, int NR, hipStream_t s)
-{
-    if (!wg || !wu || !gu || !gs || !xq_perm || !xs || NR < 1 || NR > 8) return 0;
-    if (wg->rows != wu->rows || wg->K != 5120 || wg->gs_mx) return 0;
-    const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
-    const dim3 g64((unsigned)((wg->rows + 3) / 4)), b64(256);
-#define Q27_IL_LAUNCH(N, FS) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_ileave_nr<5,N,FS>), g64, b64, 0, s, gu, gs, \
-                     (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-    const int fs = (wg->gs_fast && wu->gs_fast) ? 1 : 0;
-    switch (NR) {
-        case 1: if (fs) Q27_IL_LAUNCH(1,1); else Q27_IL_LAUNCH(1,0); break;
-        case 2: if (fs) Q27_IL_LAUNCH(2,1); else Q27_IL_LAUNCH(2,0); break;
-        case 3: if (fs) Q27_IL_LAUNCH(3,1); else Q27_IL_LAUNCH(3,0); break;
-        case 4: if (fs) Q27_IL_LAUNCH(4,1); else Q27_IL_LAUNCH(4,0); break;
-        default: return 0;
-    }
-#undef Q27_IL_LAUNCH
-    return 1;
-}
-
-// MX=1: OCP MXFP4 down_proj consumer. Same E2M1 nibbles and same [rows][K/2] weight bytes; only the
-// scale plane changes to [rows][K/32] E8M0. NOTE NG is used for TWO things here -- the group count
-// AND (via KP) the weight row stride -- so the MXFP4 scale stride has to be split out separately or
-// the weight addressing moves with it.
-template<int FULL2, int TAIL, int NR, int R, int MX = 0, int FS = 0>
+template<int FULL2, int TAIL, int NR, int R>
 __global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr(
         const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
         const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
         float alpha, int rows, float* __restrict__ Y, int ystride,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        // Q27_LL_EPI (R == 1 only; host guarantees rows % 4 == 0): also write the LL words {bf16(v[row])|bf16(v[row+1])<<16, llseq}
-        uint2* __restrict__ ll, int llstride, unsigned llseq)
+        const unsigned short* __restrict__ radd, int rstride, float rs, int xst)
 {
     const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 6)) * R;
     if (row0 >= rows) return;
     const int lane = threadIdx.x & 63;
     const int NG = FULL2 * 64 + TAIL;
-    const int KP = NG * 8;                            // weight bytes per row = K/2, MX or not
-    const int SGS = MX ? (NG >> 1) : NG;              // scale bytes per row: K/32 (MXFP4) vs K/16
+    const int KP = NG * 8;
     const bool tailact = (lane < TAIL);
     const uint2* wr[R]; const unsigned char* sr[R];
     #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
         wr[r] = (const uint2*)(W + (size_t)rr * (size_t)KP);
-        sr[r] = S + (size_t)rr * (size_t)SGS;
+        sr[r] = S + (size_t)rr * (size_t)NG;
     }
     uint2 wv[R][FULL2 + 1];  unsigned char cg[R][FULL2 + 1];  uint4 xv[NR][FULL2 + 1];  float xs[NR][FULL2 + 1];
     #pragma unroll
     for (int i = 0; i < FULL2 + 1; ++i) {
         const int g = i * 64 + ((i < FULL2) ? lane : (tailact ? lane : 0));   // clamped on tail
-        const int gsi = MX ? (g >> 1) : g;
         #pragma unroll
-        for (int r = 0; r < R; ++r) { wv[r][i] = q27_ld8nt(&wr[r][g]); cg[r][i] = sr[r][gsi]; }
+        for (int r = 0; r < R; ++r) { wv[r][i] = q27_ld8nt(&wr[r][g]); cg[r][i] = sr[r][g]; }
         #pragma unroll
         for (int n = 0; n < NR; ++n) {
             xv[n][i] = *(const uint4*)(Xp + (size_t)n * (xst >> 2) + (size_t)g * 4);
@@ -5073,8 +4506,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr(
     for (int i = 0; i < FULL2; ++i) {
         #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float ec = MX ? q27_e8m0(cg[r][i])
-                                : (FS ? q27_e4m3_fast(cg[r][i]) : ((NR > 1) ? q27_e4m3_sel(cg[r][i]) : q27_e4m3(cg[r][i])));
+            const float ec = (NR > 1) ? q27_e4m3_sel(cg[r][i]) : q27_e4m3(cg[r][i]);
             unsigned wd[4]; q27_grp16_pre(wv[r][i], wd);
             #pragma unroll
             for (int n = 0; n < NR; ++n)
@@ -5084,8 +4516,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr(
     if (tailact) {
         #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float ec = MX ? q27_e8m0(cg[r][FULL2])
-                                : (FS ? q27_e4m3_fast(cg[r][FULL2]) : ((NR > 1) ? q27_e4m3_sel(cg[r][FULL2]) : q27_e4m3(cg[r][FULL2])));
+            const float ec = (NR > 1) ? q27_e4m3_sel(cg[r][FULL2]) : q27_e4m3(cg[r][FULL2]);
             unsigned wd[4]; q27_grp16_pre(wv[r][FULL2], wd);
             #pragma unroll
             for (int n = 0; n < NR; ++n)
@@ -5098,7 +4529,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr(
         for (int r = 0; r < R; ++r)
             #pragma unroll
             for (int n = 0; n < NR; ++n) acc[r][n] += __shfl_down(acc[r][n], o, 64);
-    float vout[NR];
     if (lane == 0) {
         #pragma unroll
         for (int r = 0; r < R; ++r) {
@@ -5107,149 +4537,7 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr(
             for (int n = 0; n < NR; ++n) {
                 float v = acc[r][n] * alpha;
                 if (radd) v += rs * q27_bf2f(radd[(size_t)n * rstride + row0 + r]);
-                if (r == 0) vout[n] = v;
                 Y[(size_t)n * ystride + row0 + r] = v;
-            }
-        }
-    }
-    if (R == 1 && ll) {   // Q27_LL_EPI: one row per wave, 4 rows per block -> pairs (0,1),(2,3); no early return (rows % 4 == 0)
-        __shared__ float sll[NR][4];
-        const int wave = threadIdx.x >> 6;
-        if (lane == 0) {
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) sll[n][wave] = vout[n];
-        }
-        __syncthreads();
-        if (lane == 0 && (wave & 1) == 0) {
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                uint2 o;
-                o.x = (unsigned)q27_f2bf(sll[n][wave]) | ((unsigned)q27_f2bf(sll[n][wave + 1]) << 16);
-                o.y = llseq;
-                ll[(size_t)n * llstride + (row0 >> 1)] = o;
-            }
-        }
-    }
-}
-
-// Q27_DOWN_OCC: chunk-staged variant of q27_k_nvfp4_w64t2_nr. Identical arithmetic, but stages
-// only 2 K-groups at a time instead of all FULL2+1, cutting VGPR pressure enough to lift NR=1
-// from 3 to 4 waves/SIMD on gfx906. Down is latency-bound (~14% BW util), so more waves > more
-// per-wave latency hiding. Chunk=2 keeps one group in flight while the previous computes.
-template<int FULL2, int TAIL, int NR, int R, int MX = 0>
-__global__ __launch_bounds__(256) void q27_k_nvfp4_w64t2_nr_ch(
-        const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float alpha, int rows, float* __restrict__ Y, int ystride,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        uint2* __restrict__ ll, int llstride, unsigned llseq)
-{
-    const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 6)) * R;
-    if (row0 >= rows) return;
-    const int lane = threadIdx.x & 63;
-    const int NG = FULL2 * 64 + TAIL;
-    const int KP = NG * 8;
-    const int SGS = MX ? (NG >> 1) : NG;
-    const bool tailact = (lane < TAIL);
-    const uint2* wr[R]; const unsigned char* sr[R];
-    #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const int rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
-        wr[r] = (const uint2*)(W + (size_t)rr * (size_t)KP);
-        sr[r] = S + (size_t)rr * (size_t)SGS;
-    }
-    float acc[R][NR];
-    #pragma unroll
-    for (int r = 0; r < R; ++r)
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) acc[r][n] = 0.f;
-    // Chunk-staged main loop: 2 groups live at a time.
-    #pragma unroll 1
-    for (int base = 0; base < FULL2; base += 2) {
-        uint2 wv[R][2]; unsigned char cg[R][2]; uint4 xv[NR][2]; float xs[NR][2];
-        #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int i = base + j;
-            if (i >= FULL2) break;
-            const int g = i * 64 + lane;
-            const int gsi = MX ? (g >> 1) : g;
-            #pragma unroll
-            for (int r = 0; r < R; ++r) { wv[r][j] = q27_ld8nt(&wr[r][g]); cg[r][j] = sr[r][gsi]; }
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                xv[n][j] = *(const uint4*)(Xp + (size_t)n * (xst >> 2) + (size_t)g * 4);
-                xs[n][j] = Xs[(size_t)n * (xst >> 4) + g];
-            }
-        }
-        #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int i = base + j;
-            if (i >= FULL2) break;
-            #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const float ec = MX ? q27_e8m0(cg[r][j]) : ((NR > 1) ? q27_e4m3_sel(cg[r][j]) : q27_e4m3(cg[r][j]));
-                unsigned wd[4]; q27_grp16_pre(wv[r][j], wd);
-                #pragma unroll
-                for (int n = 0; n < NR; ++n)
-                    acc[r][n] = fmaf((float)q27_grp16_dot(wd, xv[n][j]), ec * xs[n][j] * 0.5f, acc[r][n]);
-            }
-        }
-    }
-    if (tailact) {
-        uint2 wv[R]; unsigned char cg[R]; uint4 xv[NR]; float xs[NR];
-        const int g = FULL2 * 64 + lane;
-        const int gsi = MX ? (g >> 1) : g;
-        #pragma unroll
-        for (int r = 0; r < R; ++r) { wv[r] = q27_ld8nt(&wr[r][g]); cg[r] = sr[r][gsi]; }
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            xv[n] = *(const uint4*)(Xp + (size_t)n * (xst >> 2) + (size_t)g * 4);
-            xs[n] = Xs[(size_t)n * (xst >> 4) + g];
-        }
-        #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const float ec = MX ? q27_e8m0(cg[r]) : ((NR > 1) ? q27_e4m3_sel(cg[r]) : q27_e4m3(cg[r]));
-            unsigned wd[4]; q27_grp16_pre(wv[r], wd);
-            #pragma unroll
-            for (int n = 0; n < NR; ++n)
-                acc[r][n] = fmaf((float)q27_grp16_dot(wd, xv[n]), ec * xs[n] * 0.5f, acc[r][n]);
-        }
-    }
-    #pragma unroll
-    for (int o = 32; o; o >>= 1)
-        #pragma unroll
-        for (int r = 0; r < R; ++r)
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) acc[r][n] += __shfl_down(acc[r][n], o, 64);
-    float vout[NR];
-    if (lane == 0) {
-        #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            if (row0 + r >= rows) continue;
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                float v = acc[r][n] * alpha;
-                if (radd) v += rs * q27_bf2f(radd[(size_t)n * rstride + row0 + r]);
-                if (r == 0) vout[n] = v;
-                Y[(size_t)n * ystride + row0 + r] = v;
-            }
-        }
-    }
-    if (R == 1 && ll) {
-        __shared__ float sll[NR][4];
-        const int wave = threadIdx.x >> 6;
-        if (lane == 0) {
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) sll[n][wave] = vout[n];
-        }
-        __syncthreads();
-        if (lane == 0 && (wave & 1) == 0) {
-            #pragma unroll
-            for (int n = 0; n < NR; ++n) {
-                uint2 o;
-                o.x = (unsigned)q27_f2bf(sll[n][wave]) | ((unsigned)q27_f2bf(sll[n][wave + 1]) << 16);
-                o.y = llseq;
-                ll[(size_t)n * llstride + (row0 >> 1)] = o;
             }
         }
     }
@@ -5260,85 +4548,15 @@ static int q27_nr_lds_min();   // Q27_NR_LDS_MIN threshold (defined with the LDS
 static int q27_nvfp4_lds8(const q27_nvfp4_t* w, const signed char* xq, int xst, const float* xs, float* y, int ystride, int NR, hipStream_t s);
 static int q27_nvfp4_gu_lds8(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq, int xst, const float* xs, float* yg, float* yu, int ystride, int NR, hipStream_t s);
 static int q27_nvfp4_down_lds8(const q27_nvfp4_t* w, const signed char* xq, int xst, const float* xs, float* y, int ystride, const unsigned short* radd, int rstride, float rs, int NR, hipStream_t s);
-// ---- Q27_E4M3_FAST eligibility scan -----------------------------------------------------------
-// One pass over a tensor's e4m3 group-scale plane, ON THE DEVICE IT ALREADY LIVES ON -- not over the
-// checkpoint file. Sets gs_fast only if EVERY byte satisfies 8 <= b <= 126, i.e. both exceptional
-// arms of q27_e4m3 are unreachable for this plane. Scanning the resident bytes rather than the file
-// is the point: q27_f32_to_e4m3 can manufacture a plane at runtime (Q27_FP8X4) with a live subnormal
-// branch, and a static scan of the safetensors would call that plane eligible when it is not.
-// Measured over this checkpoint 2026-09-17: 193 planes / 1,149,009,920 bytes, min 55, max 126, zero
-// violations -- but max 126 sits ONE code below the NaN encoding, so this stays a check, not a law.
-__global__ void q27_k_e4m3_chk(const unsigned char* __restrict__ p, size_t n, int* __restrict__ bad) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-    int v = 0;
-    for (; i < n; i += stride) { const unsigned b = p[i]; if (b < 8u || b >= 127u) v = 1; }
-    if (v) atomicOr(bad, 1);
-}
-extern "C" int q27_nvfp4_gs_validate(q27_nvfp4_t* w, hipStream_t s) {
-    if (!w || !w->gs || w->rows <= 0 || w->K <= 0) return 0;
-    w->gs_fast = 0;                                   // fail closed until proven otherwise
-    const size_t n = (size_t)w->rows * (size_t)(w->K / 16);
-    int* d_bad = nullptr;
-    if (hipMalloc((void**)&d_bad, sizeof(int)) != hipSuccess) return 0;
-    int ok = 0, h_bad = 1;
-    if (hipMemsetAsync(d_bad, 0, sizeof(int), s) == hipSuccess) {
-        size_t blk = (n + 255) / 256; if (blk > 4096) blk = 4096; if (!blk) blk = 1;
-        hipLaunchKernelGGL(q27_k_e4m3_chk, dim3((unsigned)blk), dim3(256), 0, s, w->gs, n, d_bad);
-        if (hipMemcpyAsync(&h_bad, d_bad, sizeof(int), hipMemcpyDeviceToHost, s) == hipSuccess &&
-            hipStreamSynchronize(s) == hipSuccess)
-            ok = 1;
-    }
-    hipFree(d_bad);
-    w->gs_fast = (ok && h_bad == 0) ? 1 : 0;
-    return (int)w->gs_fast;
-}
-
 #define Q27_NR_CASES(LAUNCH) \
     switch (NR) { case 1: LAUNCH(1); break; case 2: LAUNCH(2); break; \
                   case 3: LAUNCH(3); break; case 4: LAUNCH(4); break; default: return 0; }
 #define Q27_NR_R 1      // weight rows per wave in the row-batched NVFP4 forms (R=2 measured slower: fewer waves than SIMDs on the small shards)
 
-// Existing ragged-K donor kernel instantiated for the asymmetric three-GPU
-// placement. Only ownership dimensions change; scale decoding and arithmetic
-// are the same as the proven K=4352 consumer.
-template<int FULL, int TAIL>
-static int q27_nvfp4_down_share(const q27_nvfp4_t* w, const signed char* xq, int xst,
-        const float* xs, float* y, int ystride, const unsigned short* radd,
-        int rstride, float rs, int NR, hipStream_t s) {
-    if (NR < 1 || NR > 4 || w->gs_mx) return 0;
-    const float alpha = w->in_scale * w->ws2;
-    const dim3 grid((unsigned)((w->rows + 3) / 4)), block(256);
-    unsigned* llp = nullptr; unsigned llseq = 0;   // Q27_LL_EPI: this fp32-out, one-row-per-wave form packs the LL words itself
-    const int llon = ((w->rows % 4) == 0) ? q27_ll_hint_take(&llp, &llseq) : 0;
-    uint2* const llw = llon ? (uint2*)llp : nullptr; const int llstride = ystride >> 1;
-    static const bool down_occ = q27_env_flag("Q27_DOWN_OCC", false);
-    if (down_occ) {
-#define Q27_SHARE(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr_ch<FULL,TAIL,N,1,0>), grid, block, 0, s, \
-        w->w, w->gs, (const unsigned*)xq, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst, llw, llstride, llseq)
-        Q27_NR_CASES(Q27_SHARE)
-#undef Q27_SHARE
-    } else if (w->gs_fast) {
-        // Q27_DOWN_FS: certified scale plane -> 2-instruction q27_e4m3_fast decode (same pattern as GU FS=1)
-#define Q27_SHARE(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<FULL,TAIL,N,1,0,1>), grid, block, 0, s, \
-        w->w, w->gs, (const unsigned*)xq, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst, llw, llstride, llseq)
-        Q27_NR_CASES(Q27_SHARE)
-#undef Q27_SHARE
-    } else {
-#define Q27_SHARE(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<FULL,TAIL,N,1,0,0>), grid, block, 0, s, \
-        w->w, w->gs, (const unsigned*)xq, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst, llw, llstride, llseq)
-        Q27_NR_CASES(Q27_SHARE)
-#undef Q27_SHARE
-    }
-    return 1;
-}
-
 // K=5120, fp32 out (lm_head shard).
 extern "C" int q27_proj_nvfp4_nr(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs,
                                  float* y, int ystride, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_nr rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 5120 || NR < 1 || NR > 8) return 0;
     if (NR >= q27_nr_lds_min()) return q27_nvfp4_lds8(w, xq_perm, w->K, xs, y, ystride, NR, s);
     const float alpha = w->in_scale * w->ws2;
@@ -5355,537 +4573,14 @@ extern "C" int q27_proj_nvfp4_gu_nr(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int ystride, int NR, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_nr rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || NR < 1 || NR > 8) return 0;
-    // Q27_GU_E8M0: one-time e4m3->e8m0 scale pack; sets gs_mx so MX=1 kernels run (1-shift decode).
-    static const bool gu_e8m0 = q27_env_flag("Q27_GU_E8M0", false);
-    if (gu_e8m0 && !wg->gs_mx && !wu->gs_mx) {
-        struct PackE8 { const unsigned char* g; const unsigned char* u; unsigned char* s8g; unsigned char* s8u; int rows; };
-        static PackE8 cache[256];
-        static int ncache = 0;
-        unsigned char* s8g = nullptr; unsigned char* s8u = nullptr;
-        for (int i = 0; i < ncache; ++i)
-            if (cache[i].g == wg->w && cache[i].u == wu->w && cache[i].rows == wg->rows) {
-                s8g = cache[i].s8g; s8u = cache[i].s8u; break;
-            }
-        if (!s8g) {
-            if (ncache >= 256) return 0;
-            const size_t n32 = (size_t)wg->rows * (size_t)(wg->K >> 5);
-            if (hipMalloc((void**)&s8g, n32) != hipSuccess) return 0;
-            if (hipMalloc((void**)&s8u, n32) != hipSuccess) { hipFree(s8g); return 0; }
-            if (!q27_nvfp4_to_e8m0(wg, s8g, s) || !q27_nvfp4_to_e8m0(wu, s8u, s)) {
-                hipFree(s8g); hipFree(s8u); return 0;
-            }
-            cache[ncache++] = PackE8{wg->w, wu->w, s8g, s8u, wg->rows};
-        }
-        // Reuse the packed scales via local copies of the tensors with gs_mx=1.
-        q27_nvfp4_t G = *wg, U = *wu;
-        G.gs = s8g; U.gs = s8u; G.gs_mx = 1; U.gs_mx = 1; G.gs_fast = 0; U.gs_fast = 0;
-        return q27_proj_nvfp4_gu_nr(&G, &U, xq_perm, xs, yg, yu, ystride, NR, s);
-    }
-    // Q27_GU_INT4: one-time load-time E2M1->int4 requant + linear-decode GEMV. Default off.
-    static const bool gu_int4 = q27_env_flag("Q27_GU_INT4", false);
-    if (gu_int4 && !wg->gs_mx && !wu->gs_mx) {
-        struct PackI4 { const unsigned char* g; const unsigned char* u; unsigned char* g4; float* sg4; unsigned char* u4; float* su4; int rows; };
-        static PackI4 cache[256];
-        static int ncache = 0;
-        unsigned char* g4 = nullptr; float* sg4 = nullptr;
-        unsigned char* u4 = nullptr; float* su4 = nullptr;
-        for (int i = 0; i < ncache; ++i)
-            if (cache[i].g == wg->w && cache[i].u == wu->w && cache[i].rows == wg->rows) {
-                g4 = cache[i].g4; sg4 = cache[i].sg4; u4 = cache[i].u4; su4 = cache[i].su4; break;
-            }
-        if (!g4) {
-            if (ncache >= 256) return 0;
-            const size_t nb = (size_t)wg->rows * (size_t)(wg->K >> 1);
-            const size_t ns = (size_t)wg->rows * (size_t)(wg->K >> 4);
-            if (hipMalloc((void**)&g4, nb) != hipSuccess) return 0;
-            if (hipMalloc((void**)&sg4, ns * sizeof(float)) != hipSuccess) { hipFree(g4); return 0; }
-            if (hipMalloc((void**)&u4, nb) != hipSuccess) { hipFree(g4); hipFree(sg4); return 0; }
-            if (hipMalloc((void**)&su4, ns * sizeof(float)) != hipSuccess) { hipFree(g4); hipFree(sg4); hipFree(u4); return 0; }
-            if (!q27_nvfp4_to_int4(wg, wu, g4, sg4, u4, su4, s)) {
-                hipFree(g4); hipFree(sg4); hipFree(u4); hipFree(su4); return 0;
-            }
-            cache[ncache++] = PackI4{wg->w, wu->w, g4, sg4, u4, su4, wg->rows};
-        }
-        return q27_proj_int4_gu_nr(g4, sg4, u4, su4, xq_perm, xs, yg, yu,
-                                   wg->rows, wg->K, wg->in_scale * wg->ws2, wu->in_scale * wu->ws2, ystride, NR, s);
-    }
-    // Q27_GU_ILEAVE: one-time prefill/load materialization of interleaved gate/up (WPERM-style).
-    // Packed once per (wg->w, wu->w) pair; decode then sees only the ileave consumer. Default off.
-    static const bool gu_ileave = q27_env_flag("Q27_GU_ILEAVE", false);
-    if (gu_ileave && !wg->gs_mx && !wu->gs_mx) {
-        struct Pack { const unsigned char* g; const unsigned char* u; unsigned char* gu; unsigned char* gs; int rows; };
-        static Pack cache[256];
-        static int ncache = 0;
-        unsigned char* gu = nullptr; unsigned char* gs = nullptr;
-        for (int i = 0; i < ncache; ++i)
-            if (cache[i].g == wg->w && cache[i].u == wu->w && cache[i].rows == wg->rows) { gu = cache[i].gu; gs = cache[i].gs; break; }
-        if (!gu) {
-            if (ncache >= 256) return 0;
-            const size_t ng = (size_t)wg->rows * (size_t)(wg->K >> 4);
-            unsigned char* pgu = nullptr; unsigned char* pgs = nullptr;
-            if (hipMalloc((void**)&pgu, ng * 16) != hipSuccess) return 0;
-            if (hipMalloc((void**)&pgs, ng * 2) != hipSuccess) { hipFree(pgu); return 0; }
-            if (!q27_gu_ileave_pack(wg, wu, pgu, pgs, s)) { hipFree(pgu); hipFree(pgs); return 0; }
-            cache[ncache++] = Pack{wg->w, wu->w, pgu, pgs, wg->rows};
-            gu = pgu; gs = pgs;
-        }
-        return q27_proj_nvfp4_gu_ileave(wg, wu, gu, gs, xq_perm, xs, yg, yu, ystride, NR, s);
-    }
-    // Q27_GU_WIDE: trunk-only dwordx4 fused gate+up (1024-B bursts). NVFP4 only; MXFP4 and the
-    // non-5120 shapes fall through to the shipped w64_gu_nr arm. Default off.
-    static const bool gu_wide = q27_env_flag("Q27_GU_WIDE", false);
-    if (gu_wide && !wg->gs_mx && !wu->gs_mx) {
-        const float agw = wg->in_scale * wg->ws2, auw = wu->in_scale * wu->ws2;
-        const dim3 gw((unsigned)((wg->rows + 3) / 4)), bw(256);
-        if (wg->gs_fast && wu->gs_fast) {
-#define Q27_WL(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_guw_nr<2,1,N,1>), gw, bw, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, agw, auw, wg->rows, yg, yu, ystride, wg->K)
-            Q27_NR_CASES(Q27_WL)
-#undef Q27_WL
-        } else {
-#define Q27_WL0(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_guw_nr<2,1,N,0>), gw, bw, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, agw, auw, wg->rows, yg, yu, ystride, wg->K)
-            Q27_NR_CASES(Q27_WL0)
-#undef Q27_WL0
-        }
-        return 1;
-    }
-    // The LDS-staged form has no MXFP4 instantiation (it re-derives the scale plane stride itself),
-    // so an MXFP4 pair always takes the register form regardless of NR. Falling through to the LDS
-    // kernel would read the K/32 plane with a K/16 stride -- silently wrong weights, not a crash.
-    const int mx = (wg->gs_mx && wu->gs_mx) ? 1 : 0;
-    if (!mx && NR >= q27_nr_lds_min()) return q27_nvfp4_gu_lds8(wg, wu, xq_perm, wg->K, xs, yg, yu, ystride, NR, s);
-    if (mx && NR > 4) return 0;
+    if (NR >= q27_nr_lds_min()) return q27_nvfp4_gu_lds8(wg, wu, xq_perm, wg->K, xs, yg, yu, ystride, NR, s);
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g64((unsigned)((wg->rows + 4 * Q27_NR_R - 1) / (4 * Q27_NR_R))), b64(256);
-    // BOTH planes must be eligible: one kernel reads both, so a single unvalidated plane takes the
-    // whole launch back to the full decoder. gs_fast is 0 unless q27_nvfp4_gs_validate proved it.
-#define Q27_L1(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_nr<5,N,Q27_NR_R,1>), g64, b64, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
+#define Q27_L(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_nr<5,N,Q27_NR_R>), g64, b64, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
                      (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-#define Q27_L0(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_nr<5,N,Q27_NR_R,0>), g64, b64, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-#define Q27_LMX(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_nr<5,N,Q27_NR_R,0,1>), g64, b64, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-    if (mx)                                 { Q27_NR_CASES(Q27_LMX) }
-    else if (wg->gs_fast && wu->gs_fast)    { Q27_NR_CASES(Q27_L1) }
-    else                                    { Q27_NR_CASES(Q27_L0) }
-#undef Q27_L1
-#undef Q27_L0
-#undef Q27_LMX
-    return 1;
-}
-
-// Q27_GU_SWILU: same GEMV as gu_nr but lane-0 writes silu(g)*u into yg only (no yu).
-extern "C" int q27_proj_nvfp4_gu_swilu(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                       const signed char* xq_perm, const float* xs,
-                                       float* yg, int ystride, int NR, hipStream_t s)
-{
-    if (!wg || !wu || !wg->w || !wu->w || wg->rows != wu->rows || wg->K != 5120 ||
-        wg->gs_mx || NR < 1 || NR > 8) return 0;
-    const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
-    const dim3 g64((unsigned)((wg->rows + 3) / 4)), b64(256);
-    float* yu = yg;   // unused when SW=1
-#define Q27_SW(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_gu_nr<5,N,1,0,0,1>), g64, b64, 0, s, \
-                     wg->w, wg->gs, wu->w, wu->gs, (const unsigned*)xq_perm, xs, \
-                     ag, au, wg->rows, yg, yu, ystride, wg->K)
-    switch (NR) {
-        case 1: Q27_SW(1); break;
-        case 2: Q27_SW(2); break;
-        case 3: Q27_SW(3); break;
-        case 4: Q27_SW(4); break;
-        default: return 0;
-    }
-#undef Q27_SW
-    return 1;
-}
-
-// Q27_GU_SWILU_Q: one launch for GEMV + SwiGLU + group-4 quant. 16 waves (rows) per block so
-// one quant group (16 consecutive INTER rows) is resident in LDS. Same GEMV arithmetic as
-// gu_nr (g = lane + i*64, q27_grp16), same even-then-odd output permutation as
-// q27_k_quant_group4. NR=1 only (native trunk); NR>1 falls back to gu_swilu + quant_group4.
-__global__ __launch_bounds__(1024) void q27_k_gu_swilu_q16(
-        const unsigned char* __restrict__ WG, const unsigned char* __restrict__ SG,
-        const unsigned char* __restrict__ WU, const unsigned char* __restrict__ SU,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float ag, float au, int rows, int xst,
-        signed char* __restrict__ Q, float* __restrict__ QS, float gscale)
-{
-    const int wave = threadIdx.x >> 6;
-    const int lane = threadIdx.x & 63;
-    const int row0 = blockIdx.x * 16;
-    const int row  = row0 + wave;
-    if (row0 >= rows) return;
-    const int NG = 5 * 64, KP = NG * 8;
-    float accg = 0.f, accu = 0.f;
-    if (row < rows) {
-        const unsigned char* wg = WG + (size_t)row * KP;
-        const unsigned char* wu = WU + (size_t)row * KP;
-        const unsigned char* sg = SG + (size_t)row * NG;
-        const unsigned char* su = SU + (size_t)row * NG;
-        #pragma unroll
-        for (int i = 0; i < 5; ++i) {
-            const int g = lane + i * 64;
-            const uint2 wgv = *(const uint2*)(wg + (size_t)g * 8u);
-            const uint2 wuv = *(const uint2*)(wu + (size_t)g * 8u);
-            const float eg = q27_e4m3(sg[g]), eu = q27_e4m3(su[g]);
-            const uint4 xv = *(const uint4*)(Xp + (size_t)g * 4);
-            const float xsc = Xs[g] * 0.5f;
-            const uint2 e = make_uint2(xv.x, xv.y);
-            const uint2 o = make_uint2(xv.z, xv.w);
-            accg = fmaf((float)q27_grp16(wgv, e, o), eg * xsc, accg);
-            accu = fmaf((float)q27_grp16(wuv, e, o), eu * xsc, accu);
-        }
-        #pragma unroll
-        for (int o = 32; o; o >>= 1) { accg += __shfl_down(accg, o, 64); accu += __shfl_down(accu, o, 64); }
-    }
-    __shared__ float ys[16];
-    if (lane == 0 && row < rows) {
-        const float g = accg * ag, u = accu * au;
-        ys[wave] = g / (1.0f + __expf(-g)) * u * gscale;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float mx = 0.f;
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) mx = fmaxf(mx, fabsf(ys[j]));
-        const float sc = mx * (1.0f / 127.0f);
-        const float inv = (sc > 0.f) ? (1.0f / sc) : 0.f;
-        const int grp = row0 >> 4;
-        QS[grp] = sc;
-        signed char* qp = Q + (size_t)grp * 16;
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int src = (j < 8) ? 2 * j : 2 * (j - 8) + 1;
-            int q = (int)rintf(ys[src] * inv);
-            q = q < -127 ? -127 : (q > 127 ? 127 : q);
-            qp[j] = (signed char)q;
-        }
-    }
-}
-
-extern "C" int q27_gu_swilu_q16(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                const signed char* xq_perm, const float* xs,
-                                signed char* xq, float* xss, int n, float in_scale, hipStream_t s)
-{
-    if (!wg || !wu || !wg->w || !wu->w || wg->rows != wu->rows || wg->K != 5120 ||
-        wg->gs_mx || n != wg->rows || n <= 0 || (n & 15)) return 0;
-    if (!(in_scale > 0.f)) return 0;
-    const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
-    const dim3 grid((unsigned)((n + 15) / 16), 1);
-    hipLaunchKernelGGL(q27_k_gu_swilu_q16, grid, dim3(1024), 0, s,
-                       wg->w, wg->gs, wu->w, wu->gs, (const unsigned*)xq_perm, xs,
-                       ag, au, n, wg->K, xq, xss, 1.0f / in_scale);
-    return 1;
-}
-
-// Q27_GU_INT4: one-time pack of NVFP4 E2M1 weights to signed int4 + fp32 per-16 scales.
-// Per group of 16: v[i]=2*E2M1(nib[i]); quantum=max|v|/7; c[i]=round(v/quantum) in [-7,7];
-// new_gs = e4m3(old_gs) * quantum. Runtime uses q27_dq4_i4 (linear tables) and the same
-// `scale * xs * 0.5` fold as the E2M1 path. Load-time only, not per-step.
-__global__ void q27_k_nvfp4_to_int4(
-        const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
-        unsigned char* __restrict__ W4, float* __restrict__ S4, int rows, int K)
-{
-    const size_t ng = (size_t)(K >> 4);
-    const size_t total = (size_t)rows * ng;
-    for (size_t t = blockIdx.x * 256u + threadIdx.x; t < total; t += (size_t)gridDim.x * 256u) {
-        const size_t r = t / ng, g = t % ng;
-        const unsigned char* wp = W + r * (size_t)(K >> 1) + g * 8u;
-        float v[16]; float mx = 0.f;
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const unsigned b = wp[i];
-            const int n0 = (int)(b & 15u), n1 = (int)(b >> 4);
-            // E2M1 nibble -> 2x value as int8 magnitude code (0,1,2,3,4,6,8,12)
-            static const int mag[8] = {0, 1, 2, 3, 4, 6, 8, 12};
-            const int s0 = (n0 & 8) ? -1 : 1, s1 = (n1 & 8) ? -1 : 1;
-            v[2 * i]     = (float)(s0 * mag[n0 & 7]);
-            v[2 * i + 1] = (float)(s1 * mag[n1 & 7]);
-            mx = fmaxf(mx, fmaxf(fabsf(v[2 * i]), fabsf(v[2 * i + 1])));
-        }
-        const float gs = q27_e4m3(S[r * ng + g]);
-        const float quantum = mx * (1.0f / 7.0f);
-        const float inv = (quantum > 0.f) ? (1.0f / quantum) : 0.f;
-        S4[r * ng + g] = gs * quantum;
-        // 16 int4 nibbles = 8 bytes: two unsigned dwords, same layout as E2M1.
-        unsigned p0 = 0, p1 = 0;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int c0 = (int)rintf(v[2 * i] * inv);
-            int c1 = (int)rintf(v[2 * i + 1] * inv);
-            c0 = c0 < -7 ? -7 : (c0 > 7 ? 7 : c0);
-            c1 = c1 < -7 ? -7 : (c1 > 7 ? 7 : c1);
-            p0 |= (unsigned)((c0 & 15) << (8 * i)) | (unsigned)((c1 & 15) << (8 * i + 4));
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int c0 = (int)rintf(v[8 + 2 * i] * inv);
-            int c1 = (int)rintf(v[8 + 2 * i + 1] * inv);
-            c0 = c0 < -7 ? -7 : (c0 > 7 ? 7 : c0);
-            c1 = c1 < -7 ? -7 : (c1 > 7 ? 7 : c1);
-            p1 |= (unsigned)((c0 & 15) << (8 * i)) | (unsigned)((c1 & 15) << (8 * i + 4));
-        }
-        unsigned char* out = W4 + r * (size_t)(K >> 1) + g * 8u;
-        *(unsigned*)out = p0;
-        *(unsigned*)(out + 4) = p1;
-    }
-}
-
-// Int4 GEMV: same geometry as q27_k_nvfp4_w64_gu_nr (g = lane + i*64, q27_grp16) but weights
-// are linear int4 (q27_dq4_i4) and scales are fp32 per-16.
-template<int UPL2, int NR>
-__global__ __launch_bounds__(256) void q27_k_int4_w64_gu_nr(
-        const unsigned char* __restrict__ WG, const float* __restrict__ SG,
-        const unsigned char* __restrict__ WU, const float* __restrict__ SU,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float ag, float au, int rows, float* __restrict__ YG, float* __restrict__ YU, int ystride, int xst)
-{
-    const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 6));
-    if (row0 >= rows) return;
-    const int lane = threadIdx.x & 63;
-    const int NG = UPL2 * 64, KP = NG * 8;
-    float accg[NR], accu[NR];
-    #pragma unroll
-    for (int n = 0; n < NR; ++n) { accg[n] = 0.f; accu[n] = 0.f; }
-    #pragma unroll
-    for (int i = 0; i < UPL2; ++i) {
-        const int g = lane + i * 64;
-        const uint2 wgd = *(const uint2*)(WG + (size_t)row0 * KP + (size_t)g * 8u);
-        const uint2 wud = *(const uint2*)(WU + (size_t)row0 * KP + (size_t)g * 8u);
-        const float eg = SG[(size_t)row0 * NG + g], eu = SU[(size_t)row0 * NG + g];
-        unsigned wd[4], wu4[4];
-        q27_grp16_pre_from_i4(wgd, wd); q27_grp16_pre_from_i4(wud, wu4);
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) {
-            const uint4 xv = *(const uint4*)(Xp + (size_t)n * (size_t)(xst >> 2) + (size_t)g * 4);
-            const float xsc = Xs[(size_t)n * (size_t)(xst >> 4) + g] * 0.5f;
-            accg[n] = fmaf((float)q27_grp16_dot(wd, xv), eg * xsc, accg[n]);
-            accu[n] = fmaf((float)q27_grp16_dot(wu4, xv), eu * xsc, accu[n]);
-        }
-    }
-    #pragma unroll
-    for (int o = 32; o; o >>= 1)
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { accg[n] += __shfl_down(accg[n], o, 64); accu[n] += __shfl_down(accu[n], o, 64); }
-    if (lane == 0) {
-        #pragma unroll
-        for (int n = 0; n < NR; ++n) { YG[(size_t)n * ystride + row0] = accg[n] * ag; YU[(size_t)n * ystride + row0] = accu[n] * au; }
-    }
-}
-
-// Q27_GU_E8M0: one-time pack of NVFP4 scales to E8M0-per-32 and rescale weights. After this
-// the existing MX=1 kernels run (gsi=g>>1, q27_e8m0=1 shift). Load-time only.
-__global__ void q27_k_nvfp4_to_e8m0(
-        unsigned char* __restrict__ W, unsigned char* __restrict__ S,
-        unsigned char* __restrict__ S8, int rows, int K)
-{
-    const size_t ng = (size_t)(K >> 4);
-    const size_t n32 = (size_t)(K >> 5);
-    const size_t total = (size_t)rows * n32;
-    const int et[8] = {0, 1, 2, 3, 4, 6, 8, 12};
-    for (size_t t = blockIdx.x * 256u + threadIdx.x; t < total; t += (size_t)gridDim.x * 256u) {
-        const size_t r = t / n32, g32 = t % n32;
-        const unsigned char* sp = S + r * ng + g32 * 2u;
-        const float s0 = q27_e4m3(sp[0]), s1 = q27_e4m3(sp[1]);
-        const float smax = fmaxf(s0, s1);
-        int e = (int)rintf(log2f(smax)) + 127;
-        if (e < 1) e = 1; if (e > 254) e = 254;
-        S8[r * n32 + g32] = (unsigned char)e;
-        const float news = __uint_as_float((unsigned)e << 23);
-        const float f0 = (news > 0.f) ? (s0 / news) : 1.f;
-        const float f1 = (news > 0.f) ? (s1 / news) : 1.f;
-        unsigned char* wp = W + r * (size_t)(K >> 1) + g32 * 16u;
-        for (int i = 0; i < 32; ++i) {
-            const int bytei = i >> 1, h = i & 1;
-            unsigned char b = wp[bytei];
-            const int n = (h == 0) ? (int)(b & 15u) : (int)(b >> 4);
-            const float f = (i < 16) ? f0 : f1;
-            const int mag = n & 7, sgn = (n & 8) ? -1 : 1;
-            const float v2 = (float)(sgn * et[mag]) * f;
-            int nm = 0; float best = 1e30f;
-            for (int m = 0; m < 8; ++m) {
-                const float d = fabsf(v2 - (float)(sgn * et[m]));
-                if (d < best) { best = d; nm = m; }
-            }
-            const int nn = (sgn < 0 ? 8 : 0) | nm;
-            if (h == 0) b = (unsigned char)((b & 0xF0u) | (nn & 15u));
-            else        b = (unsigned char)((b & 0x0Fu) | ((nn & 15u) << 4));
-            wp[bytei] = b;
-        }
-    }
-}
-extern "C" int q27_nvfp4_to_e8m0(const q27_nvfp4_t* w, unsigned char* s8, hipStream_t s)
-{
-    if (!w || !w->w || !w->gs || !s8 || w->K != 5120 || w->gs_mx) return 0;
-    const size_t n32 = (size_t)w->rows * (size_t)(w->K >> 5);
-    const dim3 g((unsigned)((n32 + 255) / 256)), b(256);
-    // pack kernel rescales weights in place (cast away const; one-time load materialization)
-    hipLaunchKernelGGL(q27_k_nvfp4_to_e8m0, g, b, 0, s,
-                       const_cast<unsigned char*>(w->w), const_cast<unsigned char*>(w->gs), s8, w->rows, w->K);
-    return 1;
-}
-
-// Q27_QUANT_DOWN: quant_group4 + down GEMV in one launch. First nq blocks quantize, then a
-// grid atomic barrier, then all blocks run the down GEMV. Saves one launch per layer.
-// Down arithmetic is the w64t2_nr body (FULL2 uint2 loads + TAIL, same q27_grp16_dot).
-__global__ __launch_bounds__(256) void q27_k_quant_down(
-        const float* __restrict__ Y, signed char* __restrict__ Q, float* __restrict__ QS,
-        int n, float gscale,
-        const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
-        const unsigned* __restrict__ Xp, const float* __restrict__ Xs,
-        float alpha, int rows, float* __restrict__ Out, int ystride,
-        const unsigned short* __restrict__ radd, int rstride, float rs, int xst,
-        int FULL2, int TAIL, int nq, int* __restrict__ qflag)
-{
-    // ---- phase 1: quant (first nq blocks, 64 of 256 threads) ----
-    if ((int)blockIdx.x < nq) {
-        const int t = blockIdx.x * 64 + threadIdx.x;
-        const int g = t >> 2, lane = t & 3;
-        if (g < (n >> 4) && threadIdx.x < 64) {
-            const size_t base = (size_t)(g << 4);
-            float v[4], mx = 0.f;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int dp = lane * 4 + j;
-                const int src = (dp < 8) ? 2 * dp : 2 * (dp - 8) + 1;
-                v[j] = Y[base + src] * gscale;
-                mx = fmaxf(mx, fabsf(v[j]));
-            }
-            mx = fmaxf(mx, __shfl_xor(mx, 1, 4));
-            mx = fmaxf(mx, __shfl_xor(mx, 2, 4));
-            const float sc = mx * (1.0f / 127.0f);
-            const float inv = (sc > 0.f) ? (1.0f / sc) : 0.f;
-            if (lane == 0) QS[g] = sc;
-            unsigned packed = 0;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                int q = (int)rintf(v[j] * inv);
-                q = q < -127 ? -127 : (q > 127 ? 127 : q);
-                packed |= (unsigned)(q & 255) << (j * 8);
-            }
-            *(unsigned*)(Q + base + lane * 4) = packed;
-        }
-        __threadfence();
-        if (threadIdx.x == 0) atomicAdd(qflag, 1);
-    }
-    // ---- grid barrier: every block waits for all quant blocks ----
-    __threadfence();
-    while (atomicAdd(qflag, 0) < nq) { /* spin */ }
-    __threadfence();
-    if ((int)blockIdx.x < nq) return;   // quant blocks are done
-    // ---- phase 2: down GEMV (down blocks only, 4 rows each) ----
-    const int row0 = (((int)blockIdx.x - nq) * 4 + (threadIdx.x >> 6));
-    if (row0 >= rows) return;
-    const int lane = threadIdx.x & 63;
-    const int NG = FULL2 * 64 + TAIL, KP = NG * 8;
-    const bool tailact = (lane < TAIL);
-    const unsigned char* wr = W + (size_t)row0 * (size_t)KP;
-    const unsigned char* sr = S + (size_t)row0 * (size_t)NG;
-    float acc = 0.f;
-    for (int i = 0; i < FULL2 + 1; ++i) {
-        const int g = i * 64 + ((i < FULL2) ? lane : (tailact ? lane : 0));
-        const uint2 wv = *(const uint2*)(wr + (size_t)g * 8u);
-        const unsigned char cg = sr[g];
-        const uint4 xv = *(const uint4*)(Xp + (size_t)g * 4);
-        const float xsc = Xs[g] * 0.5f;
-        const uint2 e = make_uint2(xv.x, xv.y), o = make_uint2(xv.z, xv.w);
-        acc = fmaf((float)q27_grp16(wv, e, o), q27_e4m3(cg) * xsc, acc);
-    }
-    #pragma unroll
-    for (int o = 32; o; o >>= 1) acc += __shfl_down(acc, o, 64);
-    if (lane == 0) {
-        float v = acc * alpha;
-        if (radd) v += rs * q27_bf2f(radd[row0]);
-        Out[row0] = v;
-    }
-}
-
-// Fused quant+down wrapper: one launch replaces q27_quant_group4 + q27_proj_nvfp4_down_nr.
-extern "C" int q27_quant_down(const float* y, signed char* xq, float* xs, int n, float in_scale,
-                              const q27_nvfp4_t* w, const unsigned* xp, const float* xsc,
-                              float* out, int ystride, const unsigned short* radd,
-                              int rstride, float rs, int xst, hipStream_t s)
-{
-    if (!y || !xq || !xs || !w || !w->w || !w->gs || !xp || !xsc || !out) return 0;
-    if (n <= 0 || (n & 15) || !(in_scale > 0.f) || w->gs_mx) return 0;
-    if (w->K != 5760 && w->K != 5888) return 0;   // TP3 down shards only
-    const int FULL2 = 5, TAIL = (w->K == 5760) ? 40 : 48;
-    const int nq = (int)(((n >> 4) + 63) / 64);   // 64 threads * 4 lanes = 256 groups? no: 64 threads / 4 = 16 groups per block
-    // quant: 64 threads/block, 16 groups/block. n/16 groups. blocks = (n/16 + 15)/16
-    const int nq2 = (int)(((n >> 4) + 15) / 16);
-    const int nb = (int)((w->rows + 3) / 4);
-    static int qflag_host = 0;   // reset before each launch
-    // use a device counter: allocate once
-    static int* qflag = nullptr;
-    if (!qflag) { if (hipMalloc((void**)&qflag, sizeof(int)) != hipSuccess) return 0; }
-    hipMemset(qflag, 0, sizeof(int));
-    const dim3 grid((unsigned)(nq2 + nb)), block(256);
-    const float gscale = 1.0f / in_scale;
-    hipLaunchKernelGGL(q27_k_quant_down, grid, block, 0, s,
-                       y, xq, xs, n, gscale,
-                       w->w, w->gs, xp, xsc,
-                       w->in_scale * w->ws2, w->rows, out, ystride,
-                       radd, rstride, rs, xst, FULL2, TAIL, nq2, qflag);
-    return 1;
-}
-
-
-// One-time NVFP4 -> int4 pack (load-time). W4/S4 must be sized rows*(K/2) and rows*(K/16).
-extern "C" int q27_nvfp4_to_int4(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                 unsigned char* wg4, float* sg4, unsigned char* wu4, float* su4,
-                                 hipStream_t s)
-{
-    if (!wg || !wu || !wg->w || !wu->w || !wg->gs || !wu->gs) return 0;
-    if (wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || wg->gs_mx) return 0;
-    const size_t ng = (size_t)wg->rows * (size_t)(wg->K >> 4);
-    const dim3 g((unsigned)((ng + 255) / 256)), b(256);
-    hipLaunchKernelGGL(q27_k_nvfp4_to_int4, g, b, 0, s, wg->w, wg->gs, wg4, sg4, wg->rows, wg->K);
-    hipLaunchKernelGGL(q27_k_nvfp4_to_int4, g, b, 0, s, wu->w, wu->gs, wu4, su4, wu->rows, wu->K);
-    return 1;
-}
-
-// Int4 GEMV wrapper: same contract as q27_proj_nvfp4_gu_nr but reads requantized int4 weights
-// and fp32 per-16 scales. alpha = in_scale * ws2 as before; the 0.5 fold is in the kernel.
-extern "C" int q27_proj_int4_gu_nr(const unsigned char* wg4, const float* sg4,
-                                   const unsigned char* wu4, const float* su4,
-                                   const signed char* xq_perm, const float* xs,
-                                   float* yg, float* yu, int rows, int K,
-                                   float ag, float au, int ystride, int NR, hipStream_t s)
-{
-    if (!wg4 || !sg4 || !wu4 || !su4 || !xq_perm || !xs) return 0;
-    if (rows <= 0 || K != 5120 || NR < 1 || NR > 8) return 0;
-    const dim3 g64((unsigned)((rows + 3) / 4)), b64(256);
-    switch (NR) {
-        case 1: hipLaunchKernelGGL((q27_k_int4_w64_gu_nr<5,1>), g64, b64, 0, s, wg4, sg4, wu4, su4, (const unsigned*)xq_perm, xs, ag, au, rows, yg, yu, ystride, K); break;
-        case 2: hipLaunchKernelGGL((q27_k_int4_w64_gu_nr<5,2>), g64, b64, 0, s, wg4, sg4, wu4, su4, (const unsigned*)xq_perm, xs, ag, au, rows, yg, yu, ystride, K); break;
-        case 3: hipLaunchKernelGGL((q27_k_int4_w64_gu_nr<5,3>), g64, b64, 0, s, wg4, sg4, wu4, su4, (const unsigned*)xq_perm, xs, ag, au, rows, yg, yu, ystride, K); break;
-        case 4: hipLaunchKernelGGL((q27_k_int4_w64_gu_nr<5,4>), g64, b64, 0, s, wg4, sg4, wu4, su4, (const unsigned*)xq_perm, xs, ag, au, rows, yg, yu, ystride, K); break;
-        default: return 0;
-    }
-    return 1;
-}
-extern "C" int q27_proj_nvfp4_gu_wide(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu,
-                                      const signed char* xq_perm, const float* xs,
-                                      float* yg, float* yu, int ystride, int NR, hipStream_t s)
-{
-    if (!wg || !wu || !wg->w || !wu->w || wg->rows != wu->rows || wg->K != wu->K ||
-        wg->K != 5120 || wg->gs_mx || wu->gs_mx || NR < 1 || NR > 8) return 0;
-    const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
-    const dim3 gw((unsigned)((wg->rows + 3) / 4)), bw(256);
-    if (wg->gs_fast && wu->gs_fast) {
-#define Q27_WWD(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_guw_nr<2,1,N,1>), gw, bw, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-        Q27_NR_CASES(Q27_WWD)
-#undef Q27_WWD
-    } else {
-#define Q27_WWD0(N) hipLaunchKernelGGL((q27_k_nvfp4_w64_guw_nr<2,1,N,0>), gw, bw, 0, s, wg->w, wg->gs, wu->w, wu->gs, \
-                     (const unsigned*)xq_perm, xs, ag, au, wg->rows, yg, yu, ystride, wg->K)
-        Q27_NR_CASES(Q27_WWD0)
-#undef Q27_WWD0
-    }
+    Q27_NR_CASES(Q27_L)
+#undef Q27_L
     return 1;
 }
 
@@ -5894,35 +4589,14 @@ extern "C" int q27_proj_nvfp4_down_nr(const q27_nvfp4_t* w, const signed char* x
                                       float* y, int ystride, const unsigned short* radd, int rstride,
                                       float rs, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_down_nr rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
-    if (w && w->K == 2176) return q27_nvfp4_down_share<2,8>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 6528) return q27_nvfp4_down_share<6,24>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 3264) return q27_nvfp4_down_share<3,12>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // 3*1024 + 192
-    if (w && w->K == 5440) return q27_nvfp4_down_share<5,20>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // 5*1024 + 320
-    if (w && w->K == 5888) return q27_nvfp4_down_share<5,48>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 768
-    if (w && w->K == 5760) return q27_nvfp4_down_share<5,40>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 640
-    if (w && w->K == 6400) return q27_nvfp4_down_share<6,16>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 6*1024 + 256
-    if (w && w->K == 5504) return q27_nvfp4_down_share<5,24>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 384
-    if (w && w->K == 6656) return q27_nvfp4_down_share<6,32>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 6*1024 + 512
-    if (w && w->K == 5376) return q27_nvfp4_down_share<5,16>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 256
-    if (w && w->K == 6016) return q27_nvfp4_down_share<5,56>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 896
-    if (w && w->K == 5696) return q27_nvfp4_down_share<5,36>(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);   // Q27_TP3: 5*1024 + 576
     if (!w || w->K != 4352 || NR < 1 || NR > 8) return 0;
-    const int mx = w->gs_mx ? 1 : 0;   // see q27_proj_nvfp4_gu_nr: no MXFP4 LDS instantiation exists
-    if (!mx && NR >= q27_nr_lds_min()) return q27_nvfp4_down_lds8(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (mx && NR > 4) return 0;
+    if (NR >= q27_nr_lds_min()) return q27_nvfp4_down_lds8(w, xq_perm, w->K, xs, y, ystride, radd, rstride, rs, NR, s);
     const float alpha = w->in_scale * w->ws2;
     const dim3 g64((unsigned)((w->rows + 4 * Q27_NR_R - 1) / (4 * Q27_NR_R))), b64(256);
-#define Q27_LFS(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,Q27_NR_R,0,1>), g64, b64, 0, s, w->w, w->gs, \
-                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, w->K, (uint2*)nullptr, 0, 0u)
-#define Q27_L(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,Q27_NR_R,0,0>), g64, b64, 0, s, w->w, w->gs, \
-                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, w->K, (uint2*)nullptr, 0, 0u)
-#define Q27_LMX(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,Q27_NR_R,1,0>), g64, b64, 0, s, w->w, w->gs, \
-                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, w->K, (uint2*)nullptr, 0, 0u)
-    if (mx) { Q27_NR_CASES(Q27_LMX) } else if (w->gs_fast) { Q27_NR_CASES(Q27_LFS) } else { Q27_NR_CASES(Q27_L) }
+#define Q27_L(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,Q27_NR_R>), g64, b64, 0, s, w->w, w->gs, \
+                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, w->K)
+    Q27_NR_CASES(Q27_L)
 #undef Q27_L
-#undef Q27_LMX
     return 1;
 }
 
@@ -5931,8 +4605,6 @@ extern "C" int q27_proj_nvfp4_down_nr(const q27_nvfp4_t* w, const signed char* x
 extern "C" int q27_proj_nvfp4_gu_nrs(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu, const signed char* xq_perm, int xst,
                                      const float* xs, float* yg, float* yu, int ystride, int NR, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_nrs rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || NR < 1 || NR > 8) return 0;
     if (NR >= q27_nr_lds_min()) return q27_nvfp4_gu_lds8(wg, wu, xq_perm, xst, xs, yg, yu, ystride, NR, s);
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
@@ -5946,29 +4618,13 @@ extern "C" int q27_proj_nvfp4_gu_nrs(const q27_nvfp4_t* wg, const q27_nvfp4_t* w
 extern "C" int q27_proj_nvfp4_down_nrs(const q27_nvfp4_t* w, const signed char* xq_perm, int xst, const float* xs,
                                        float* y, int ystride, const unsigned short* radd, int rstride, float rs, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_down_nrs rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
-    if (w && w->K == 2176) return q27_nvfp4_down_share<2,8>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 6528) return q27_nvfp4_down_share<6,24>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 3264) return q27_nvfp4_down_share<3,12>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5440) return q27_nvfp4_down_share<5,20>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5888) return q27_nvfp4_down_share<5,48>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5760) return q27_nvfp4_down_share<5,40>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 6400) return q27_nvfp4_down_share<6,16>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5504) return q27_nvfp4_down_share<5,24>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 6656) return q27_nvfp4_down_share<6,32>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5376) return q27_nvfp4_down_share<5,16>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 6016) return q27_nvfp4_down_share<5,56>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
-    if (w && w->K == 5696) return q27_nvfp4_down_share<5,36>(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
     if (!w || w->K != 4352 || NR < 1 || NR > 8) return 0;
     if (NR >= q27_nr_lds_min()) return q27_nvfp4_down_lds8(w, xq_perm, xst, xs, y, ystride, radd, rstride, rs, NR, s);
     const float alpha = w->in_scale * w->ws2;
     const dim3 g64((unsigned)((w->rows + 3) / 4)), b64(256);
-#define Q27_LFS(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,1,0,1>), g64, b64, 0, s, w->w, w->gs, \
-                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst, (uint2*)nullptr, 0, 0u)
-#define Q27_L(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,1,0,0>), g64, b64, 0, s, w->w, w->gs, \
-                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst, (uint2*)nullptr, 0, 0u)
-    if (w->gs_fast) { Q27_NR_CASES(Q27_LFS) } else { Q27_NR_CASES(Q27_L) }
+#define Q27_L(N) hipLaunchKernelGGL((q27_k_nvfp4_w64t2_nr<4,16,N,1>), g64, b64, 0, s, w->w, w->gs, \
+                     (const unsigned*)xq_perm, xs, alpha, w->rows, y, ystride, radd, rstride, rs, xst)
+    Q27_NR_CASES(Q27_L)
 #undef Q27_L
     return 1;
 }
@@ -6525,8 +5181,6 @@ static inline int q27_nr_rpw(int rows) { int r = rows / 720; return r < 1 ? 1 : 
 extern "C" int q27_proj_nvfp4_lds(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs,
                                   float* y, int ystride, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_lds rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 5120 || NR < 1 || NR > 4) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int rpw = q27_nr_rpw(w->rows);
@@ -6541,8 +5195,6 @@ extern "C" int q27_proj_nvfp4_gu_lds(const q27_nvfp4_t* wg, const q27_nvfp4_t* w
                                      const signed char* xq_perm, const float* xs,
                                      float* yg, float* yu, int ystride, int NR, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_lds rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || NR < 1 || NR > 4) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const int rpw = q27_nr_rpw(wg->rows);
@@ -6557,8 +5209,6 @@ extern "C" int q27_proj_nvfp4_down_lds(const q27_nvfp4_t* w, const signed char* 
                                        float* y, int ystride, const unsigned short* radd, int rstride,
                                        float rs, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_down_lds rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || NR < 1 || NR > 4) return 0;
     const float alpha = w->in_scale * w->ws2;
     const int rpw = q27_nr_rpw(w->rows);
@@ -6744,8 +5394,6 @@ __global__ __launch_bounds__(256) void q27_k_nvfp4_t2_hg_nr(
 extern "C" int q27_proj_nvfp4_hg(const q27_nvfp4_t* w, const signed char* xq_perm, const float* xs,
                                  float* y, int ystride, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_hg rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 5120 || NR < 1 || NR > 4) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g2((unsigned)((w->rows + 1) / 2)), b256(256);
@@ -6759,8 +5407,6 @@ extern "C" int q27_proj_nvfp4_gu_hg(const q27_nvfp4_t* wg, const q27_nvfp4_t* wu
                                     const signed char* xq_perm, const float* xs,
                                     float* yg, float* yu, int ystride, int NR, hipStream_t s)
 {
-    if ((wg) && !((wg)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_gu_hg rows=%d K=%d\n", (wg)->rows, (wg)->K); std::fflush(stderr); std::abort(); }
-
     if (!wg || !wu || wg->rows != wu->rows || wg->K != wu->K || wg->K != 5120 || NR < 1 || NR > 4) return 0;
     const float ag = wg->in_scale * wg->ws2, au = wu->in_scale * wu->ws2;
     const dim3 g2((unsigned)((wg->rows + 1) / 2)), b256(256);
@@ -6774,8 +5420,6 @@ extern "C" int q27_proj_nvfp4_down_hg(const q27_nvfp4_t* w, const signed char* x
                                       float* y, int ystride, const unsigned short* radd, int rstride,
                                       float rs, int NR, hipStream_t s)
 {
-    if ((w) && !((w)->w)) { std::fprintf(stderr, "Q27_NVFP4_NULL_READ q27_proj_nvfp4_down_hg rows=%d K=%d\n", (w)->rows, (w)->K); std::fflush(stderr); std::abort(); }
-
     if (!w || w->K != 4352 || NR < 1 || NR > 4) return 0;
     const float alpha = w->in_scale * w->ws2;
     const dim3 g2((unsigned)((w->rows + 1) / 2)), b256(256);

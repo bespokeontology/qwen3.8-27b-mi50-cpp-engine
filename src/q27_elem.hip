@@ -218,19 +218,8 @@ __global__ __launch_bounds__(Q27_EL_BLK) void q27_k_embed_gen(
 // Two stages on the caller's stream — no host sync between them. Inter-stage scratch is a
 // file-scope device arena (process-global, no per-token allocation). Consequence: q27_argmax is
 // not re-entrant across concurrent streams; the engine is single-user by construction.
-__device__ float        g_q27_am_val[4][Q27_AM_GRID];
-// Four logical Q27 shards may share physical GPUs. Device-global scratch must
-// retain a separate bank for each logical shard. hipGetDevice uses the same
-// logical namespace as the loader and worker when the native adapter is active.
-static int q27_scratch_bank() {
-    int d = -1;
-    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 4) {
-        fprintf(stderr, "Q27 scratch requires logical device 0..3\n"); abort();
-    }
-    return d;
-}
-
-__device__ unsigned int g_q27_am_idx[4][Q27_AM_GRID];
+__device__ float        g_q27_am_val[Q27_AM_GRID];
+__device__ unsigned int g_q27_am_idx[Q27_AM_GRID];
 
 #define Q27_AM_NONE 0xFFFFFFFFu
 
@@ -271,7 +260,7 @@ __device__ __forceinline__ void q27_block_amax(float& bv, unsigned int& bi,
 }
 
 template<int BLOCK, bool VEC>
-__global__ __launch_bounds__(BLOCK) void q27_k_amax1(const float* __restrict__ p, int n, int bank) {
+__global__ __launch_bounds__(BLOCK) void q27_k_amax1(const float* __restrict__ p, int n) {
     __shared__ float        sv[BLOCK / Q27_WAVE];
     __shared__ unsigned int si[BLOCK / Q27_WAVE];
 
@@ -299,20 +288,20 @@ __global__ __launch_bounds__(BLOCK) void q27_k_amax1(const float* __restrict__ p
     }
 
     q27_block_amax<BLOCK>(bv, bi, sv, si);
-    if (threadIdx.x == 0) { g_q27_am_val[bank][blockIdx.x] = bv; g_q27_am_idx[bank][blockIdx.x] = bi; }
+    if (threadIdx.x == 0) { g_q27_am_val[blockIdx.x] = bv; g_q27_am_idx[blockIdx.x] = bi; }
 }
 
 // Stage 2 that also emits the winning VALUE.  The tensor-parallel head needs it: each card owns
 // 62080 of the 248320 logits, and the four cards settle the token with a 4-way max over
 // (value, GLOBAL index) -- 4x8 bytes instead of an all-gather of 993 KB.
 __global__ __launch_bounds__(Q27_AM_GRID) void q27_k_amax2_val(unsigned int* __restrict__ out,
-                                                               float* __restrict__ oval, int nblk, int bank) {
+                                                               float* __restrict__ oval, int nblk) {
     __shared__ float        sv[Q27_AM_GRID / Q27_WAVE];
     __shared__ unsigned int si[Q27_AM_GRID / Q27_WAVE];
     float        bv = -INFINITY;
     unsigned int bi = Q27_AM_NONE;
     const int t = threadIdx.x;
-    if (t < nblk) { bv = g_q27_am_val[bank][t]; bi = g_q27_am_idx[bank][t]; }
+    if (t < nblk) { bv = g_q27_am_val[t]; bi = g_q27_am_idx[t]; }
     q27_block_amax<Q27_AM_GRID>(bv, bi, sv, si);
     if (t == 0) {
         const bool none = (bi == Q27_AM_NONE);
@@ -321,13 +310,13 @@ __global__ __launch_bounds__(Q27_AM_GRID) void q27_k_amax2_val(unsigned int* __r
     }
 }
 
-__global__ __launch_bounds__(Q27_AM_GRID) void q27_k_amax2(unsigned int* __restrict__ out, int nblk, int bank) {
+__global__ __launch_bounds__(Q27_AM_GRID) void q27_k_amax2(unsigned int* __restrict__ out, int nblk) {
     __shared__ float        sv[Q27_AM_GRID / Q27_WAVE];
     __shared__ unsigned int si[Q27_AM_GRID / Q27_WAVE];
     float        bv = -INFINITY;
     unsigned int bi = Q27_AM_NONE;
     const int t = threadIdx.x;
-    if (t < nblk) { bv = g_q27_am_val[bank][t]; bi = g_q27_am_idx[bank][t]; }
+    if (t < nblk) { bv = g_q27_am_val[t]; bi = g_q27_am_idx[t]; }
     q27_block_amax<Q27_AM_GRID>(bv, bi, sv, si);
     if (t == 0) *out = (bi == Q27_AM_NONE) ? 0u : bi;   // all-non-finite -> token 0, never garbage
 }
@@ -417,9 +406,9 @@ void q27_argmax(const float* logits, unsigned* out, int n, hipStream_t s)
     if (grid > Q27_AM_GRID) grid = Q27_AM_GRID;
     if (grid < 1) grid = 1;
 
-    if (vec) q27_k_amax1<Q27_AM_BLK, true ><<<grid, Q27_AM_BLK, 0, s>>>(logits, n, q27_scratch_bank());
-    else     q27_k_amax1<Q27_AM_BLK, false><<<grid, Q27_AM_BLK, 0, s>>>(logits, n, q27_scratch_bank());
-    q27_k_amax2<<<1, Q27_AM_GRID, 0, s>>>(out, grid, q27_scratch_bank());
+    if (vec) q27_k_amax1<Q27_AM_BLK, true ><<<grid, Q27_AM_BLK, 0, s>>>(logits, n);
+    else     q27_k_amax1<Q27_AM_BLK, false><<<grid, Q27_AM_BLK, 0, s>>>(logits, n);
+    q27_k_amax2<<<1, Q27_AM_GRID, 0, s>>>(out, grid);
 }
 
 // Same reduction, but the winning value comes back too (see q27_k_amax2_val).
@@ -432,9 +421,9 @@ void q27_argmax_val(const float* logits, unsigned* out_idx, float* out_val, int 
     if (grid > Q27_AM_GRID) grid = Q27_AM_GRID;
     if (grid < 1) grid = 1;
 
-    if (vec) q27_k_amax1<Q27_AM_BLK, true ><<<grid, Q27_AM_BLK, 0, s>>>(logits, n, q27_scratch_bank());
-    else     q27_k_amax1<Q27_AM_BLK, false><<<grid, Q27_AM_BLK, 0, s>>>(logits, n, q27_scratch_bank());
-    q27_k_amax2_val<<<1, Q27_AM_GRID, 0, s>>>(out_idx, out_val, grid, q27_scratch_bank());
+    if (vec) q27_k_amax1<Q27_AM_BLK, true ><<<grid, Q27_AM_BLK, 0, s>>>(logits, n);
+    else     q27_k_amax1<Q27_AM_BLK, false><<<grid, Q27_AM_BLK, 0, s>>>(logits, n);
+    q27_k_amax2_val<<<1, Q27_AM_GRID, 0, s>>>(out_idx, out_val, grid);
 }
 
 }   // extern "C"
@@ -1160,11 +1149,11 @@ __global__ __launch_bounds__(256) void q27_k_push_bf16_3(const float4* __restric
     uint2 o;
     o.x = (unsigned)q27_f2bf(v.x) | ((unsigned)q27_f2bf(v.y) << 16);
     o.y = (unsigned)q27_f2bf(v.z) | ((unsigned)q27_f2bf(v.w) << 16);
-    d0[i] = o; d1[i] = o; if (d2) d2[i] = o;   // d2 null at 3 cards (2026-09-28)
+    d0[i] = o; d1[i] = o; d2[i] = o;
 }
 extern "C" int q27_push_bf16_3(const float* src, unsigned short* d0, unsigned short* d1, unsigned short* d2, int n, hipStream_t s)
 {
-    if (!src || !d0 || !d1 || (n & 3)) return 0;
+    if (!src || !d0 || !d1 || !d2 || (n & 3)) return 0;
     const int n4 = n >> 2;
     hipLaunchKernelGGL(q27_k_push_bf16_3, dim3((n4 + 255) / 256), dim3(256), 0, s,
                        (const float4*)src, (uint2*)d0, (uint2*)d1, (uint2*)d2, n4);
@@ -1184,7 +1173,6 @@ __device__ __forceinline__ float4 q27_round_bf16_f4(float4 v) {
 }
 // own = this card's fp32 partial (card index g), rk = the received bf16 rows of the other three cards in card
 // order; the sum is formed as ((c0 + c1) + (c2 + c3)) by card index on every card.
-template<int NDEV>
 __global__ __launch_bounds__(256) void q27_k_red_nr_local(const float4* __restrict__ own, int g,
         const uint2* __restrict__ ra, const uint2* __restrict__ rb, const uint2* __restrict__ rc,
         float4* __restrict__ red, float* __restrict__ ssp, int nv4)
@@ -1194,12 +1182,10 @@ __global__ __launch_bounds__(256) void q27_k_red_nr_local(const float4* __restri
     if (i >= nv4) return;
     const size_t o = (size_t)c * nv4 + i;
     const float4 mine = q27_round_bf16_f4(own[o]);
-    const float4 a = q27_bf16x4_to_f4(ra[o]), b = q27_bf16x4_to_f4(rb[o]);
-    const float4 cc = (NDEV == 4) ? q27_bf16x4_to_f4(rc[o]) : make_float4(0.f, 0.f, 0.f, 0.f);   // 3 cards: slot 3 is an exact zero pad
+    const float4 a = q27_bf16x4_to_f4(ra[o]), b = q27_bf16x4_to_f4(rb[o]), cc = q27_bf16x4_to_f4(rc[o]);
     // place by card index: slots a/b/c hold the cards != g in ascending order
     float4 p[4];
-    p[3] = make_float4(0.f, 0.f, 0.f, 0.f);
-    { int j = 0; for (int k = 0; k < NDEV; ++k) { if (k == g) p[k] = mine; else { p[k] = (j == 0) ? a : (j == 1) ? b : cc; ++j; } } }
+    { int j = 0; for (int k = 0; k < 4; ++k) { if (k == g) p[k] = mine; else { p[k] = (j == 0) ? a : (j == 1) ? b : cc; ++j; } } }
     float4 r;
     r.x = (p[0].x + p[1].x) + (p[2].x + p[3].x);
     r.y = (p[0].y + p[1].y) + (p[2].y + p[3].y);
@@ -1220,11 +1206,9 @@ extern "C" int q27_red_rn_nr_local(int mode, const float* own, int g, const unsi
         float* red, float* ssp, const unsigned short* wgt, unsigned short* hid, unsigned short* y,
         signed char* xq, float* xs, int n, int plus_one, float in_scale, int C, hipStream_t s)
 {
-    if (n != Q27_HID || !own || !ra || !rb || !red || !ssp || C < 1 || g < 0 || g > 3) return 0;
+    if (n != Q27_HID || !own || !ra || !rb || !rc || !red || !ssp || C < 1 || g < 0 || g > 3) return 0;
     const int nv4 = n >> 2;
-    if (rc) hipLaunchKernelGGL(q27_k_red_nr_local<4>, dim3(Q27_NRP_SB, C), dim3(256), 0, s,
-                       (const float4*)own, g, (const uint2*)ra, (const uint2*)rb, (const uint2*)rc, (float4*)red, ssp, nv4);
-    else    hipLaunchKernelGGL(q27_k_red_nr_local<3>, dim3(Q27_NRP_SB, C), dim3(256), 0, s,   // 3 cards (2026-09-28): rc null
+    hipLaunchKernelGGL(q27_k_red_nr_local, dim3(Q27_NRP_SB, C), dim3(256), 0, s,
                        (const float4*)own, g, (const uint2*)ra, (const uint2*)rb, (const uint2*)rc, (float4*)red, ssp, nv4);
     if (mode == 2) return 1;
     if (!(in_scale > 0.f) || !wgt || !hid || !xq || !xs) return 0;
@@ -1576,487 +1560,3 @@ extern "C" int q27_rmsnorm_hostss_g64_b(const float* x, const unsigned short* wg
                        (const float4*)x, wgt, xq, xs, nv4, invp, plus_one ? 1.0f : 0.0f, 1.0f / in_scale);
     return 1;
 }
-
-// ============================================================================
-// Q27_NR_P2P=4 (2026-09-28): the LL (flag-in-data) transport for the NR-row decode collective.
-// The host-staged site pays, on the GPU's critical path, a staging D2H, the host b1 arrival skew,
-// the host reduce, b2, the flag publish and the CP's flag poll; the event-chained P2P path (modes
-// 1-3) removes the host arithmetic but still orders every site with a host barrier and two
-// cross-device event waits. Here NOTHING but the data crosses the cards: every 8-byte word the
-// producer stores into a peer's fine-grained (L2-bypassing) receive slot carries two bf16 elements
-// and the site's 32-bit sequence number in ONE dwordx2 store, so the flag can never be seen ahead
-// of its data (no fence, no event, no host barrier). The consumer's reduce kernel spins per word on
-// the sequence number, then sums own (bf16-rounded, so every card adds identical inputs) + the
-// received rows in card order: ((c0 + c1) + (c2 + c3)) at 4 cards, ((c0 + c1) + c2) at 3 -- the
-// exact association of the host path. Slots alternate per site (Q27_LL_SLOTS deep) and the
-// consumer of site s is stream-ordered before the producer of site s+1 on every card, so a slot is
-// never overwritten before its reader has finished (the reader of s ran before the writer's own
-// reduce of s+1 could observe the peer's push of s+1, which the peer enqueued after its reduce of s).
-// A word that never arrives is REPORTED, not hung on: after Q27_LL_SPIN_MAX polls the kernel
-// writes {seq, word} into err[] and proceeds with whatever it read (the host aborts on err[0]).
-// ============================================================================
-#define Q27_LL_SPIN_MAX 0x2000000u
-__global__ __launch_bounds__(256) void q27_k_push_ll(const float2* __restrict__ src,
-        uint2* __restrict__ d0, uint2* __restrict__ d1, uint2* __restrict__ d2, int nw, unsigned seq)
-{
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= nw) return;
-    const float2 v = src[i];
-    uint2 o;
-    o.x = (unsigned)q27_f2bf(v.x) | ((unsigned)q27_f2bf(v.y) << 16);
-    o.y = seq;
-    d0[i] = o; d1[i] = o;
-    if (d2) d2[i] = o;
-}
-// Q27_LL_W16=1: the same words, two per lane in one 16-byte store (halves the store instructions; the two 8-byte halves
-// stay individually atomic on the wire, so the reader is unchanged).
-__global__ __launch_bounds__(256) void q27_k_push_ll16(const float4* __restrict__ src,
-        uint4* __restrict__ d0, uint4* __restrict__ d1, uint4* __restrict__ d2, int n4, unsigned seq)
-{
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= n4) return;
-    const float4 v = src[i];
-    uint4 o;
-    o.x = (unsigned)q27_f2bf(v.x) | ((unsigned)q27_f2bf(v.y) << 16); o.y = seq;
-    o.z = (unsigned)q27_f2bf(v.z) | ((unsigned)q27_f2bf(v.w) << 16); o.w = seq;
-    d0[i] = o; d1[i] = o;
-    if (d2) d2[i] = o;
-}
-// Q27_LL_SDMA (default on, 2026-09-28): pack the LL words ONCE into a local coarse staging row block; the copy engine
-// (hipMemcpyPeerAsync) then writes them into the peers' uncached slots in bursts. Measured on this box (llbench):
-// shader stores into uncached peer memory serialize at ~0.6-0.9 GB/s (23-32 us per 2 x 10 KB at NR=1, 97-101 us at
-// NR=3), while pack + two SDMA copies take 10.7 / 12.8 us and the whole spin site 15.5 / 17.9 us.
-__global__ __launch_bounds__(256) void q27_k_pack_ll(const float4* __restrict__ src, uint4* __restrict__ dst, int n4, unsigned seq)
-{
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= n4) return;
-    const float4 v = src[i];
-    uint4 o;
-    o.x = (unsigned)q27_f2bf(v.x) | ((unsigned)q27_f2bf(v.y) << 16); o.y = seq;
-    o.z = (unsigned)q27_f2bf(v.z) | ((unsigned)q27_f2bf(v.w) << 16); o.w = seq;
-    dst[i] = o;
-}
-extern "C" int q27_pack_ll(const float* src, unsigned* dst, int n, int C, unsigned seq, hipStream_t s)
-{
-    if (!src || !dst || (n & 3) || C < 1) return 0;
-    const int n4 = (n >> 2) * C;
-    hipLaunchKernelGGL(q27_k_pack_ll, dim3((n4 + 255) / 256), dim3(256), 0, s, (const float4*)src, (uint4*)dst, n4, seq);
-    return 1;
-}
-// Q27_LL_EPI (2026-09-28): producer-epilogue LL pack. The layer loop ARMS a hint (the LL staging words for the coming
-// site + its sequence number) right before the site's producer GEMV; a register-form kernel that knows how to write the
-// LL words TAKES it and packs the bf16 pairs itself (one launch less per site); q27_ll_hint_done() tells the caller whether
-// it was taken (else the separate pack kernel runs as before). Thread-local: each worker thread owns its own layer loop.
-static thread_local unsigned* q27_ll_hint_ptr = nullptr;
-static thread_local unsigned  q27_ll_hint_seq = 0;
-static thread_local int       q27_ll_hint_state = 0;   // 0 none, 1 armed, 2 taken
-extern "C" void q27_ll_hint_arm(unsigned* stage_words, unsigned seq) { q27_ll_hint_ptr = stage_words; q27_ll_hint_seq = seq; q27_ll_hint_state = stage_words ? 1 : 0; }
-extern "C" int  q27_ll_hint_take(unsigned** p, unsigned* seq) { if (q27_ll_hint_state != 1) return 0; *p = q27_ll_hint_ptr; *seq = q27_ll_hint_seq; q27_ll_hint_state = 2; return 1; }
-extern "C" int  q27_ll_hint_done(void) { const int t = (q27_ll_hint_state == 2) ? 1 : 0; q27_ll_hint_state = 0; q27_ll_hint_ptr = nullptr; return t; }
-static int q27_ll_w16 = -1;
-// src fp32 [C][n] local; d0..d2 = the peers' receive slots (uint2 [C][n/2], PEER memory); d2 may be null (3 cards)
-extern "C" int q27_push_ll(const float* src, unsigned* d0, unsigned* d1, unsigned* d2, int n, int C, unsigned seq, hipStream_t s)
-{
-    if (!src || !d0 || !d1 || (n & 3) || C < 1) return 0;
-    if (q27_ll_w16 < 0) { const char* e = getenv("Q27_LL_W16"); q27_ll_w16 = (e && atoi(e)) ? 1 : 0; }
-    if (q27_ll_w16) {
-        const int n4 = (n >> 2) * C;
-        hipLaunchKernelGGL(q27_k_push_ll16, dim3((n4 + 255) / 256), dim3(256), 0, s,
-                           (const float4*)src, (uint4*)d0, (uint4*)d1, (uint4*)d2, n4, seq);
-        return 1;
-    }
-    const int nw = (n >> 1) * C;
-    hipLaunchKernelGGL(q27_k_push_ll, dim3((nw + 255) / 256), dim3(256), 0, s,
-                       (const float2*)src, (uint2*)d0, (uint2*)d1, (uint2*)d2, nw, seq);
-    return 1;
-}
-__device__ __forceinline__ uint4 q27_ll_load16(const uint4* p) {
-    // one 16-byte load, L1 bypassed (glc), L2 bypassed by the slot's uncached/fine-grained MTYPE
-    const unsigned long long* q = (const unsigned long long*)p;
-    uint4 r;
-    const unsigned long long a = __hip_atomic_load(q,     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    const unsigned long long b = __hip_atomic_load(q + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    r.x = (unsigned)a; r.y = (unsigned)(a >> 32); r.z = (unsigned)b; r.w = (unsigned)(b >> 32);
-    return r;
-}
-__device__ __forceinline__ float4 q27_ll_unpack(uint4 w) {
-    float4 r;
-    r.x = __uint_as_float(w.x << 16); r.y = __uint_as_float(w.x & 0xffff0000u);
-    r.z = __uint_as_float(w.z << 16); r.w = __uint_as_float(w.z & 0xffff0000u);
-    return r;
-}
-// own fp32 [C][n] local (card g); ra/rb/rc = this card's receive slots for the other cards in ascending card order
-// (rc null at 3 cards); every thread owns one float4 = two LL words per peer. red fp32 [C][n], ssp [C][5].
-template<int NPEER>
-__global__ __launch_bounds__(256) void q27_k_red_nr_ll(const float4* __restrict__ own, int g,
-        const uint4* __restrict__ ra, const uint4* __restrict__ rb, const uint4* __restrict__ rc,
-        float4* __restrict__ red, float* __restrict__ ssp, int nv4, unsigned seq, unsigned* __restrict__ err)
-{
-    const int c = blockIdx.y, bx = blockIdx.x, t = threadIdx.x;
-    const int i = bx * 256 + t;
-    if (i >= nv4) return;
-    const size_t o = (size_t)c * nv4 + i;
-    float4 p[4];
-    p[0] = p[1] = p[2] = p[3] = make_float4(0.f, 0.f, 0.f, 0.f);
-    const float4 mine = q27_round_bf16_f4(own[o]);
-    const uint4* rs[3] = { ra, rb, rc };
-    float4 got[3];
-    #pragma unroll
-    for (int j = 0; j < NPEER; ++j) {
-        uint4 w = q27_ll_load16(rs[j] + o);
-        unsigned spins = 0;
-        while (w.y != seq || w.w != seq) {
-            if (++spins > Q27_LL_SPIN_MAX) { if (err) { err[0] = seq; err[1] = (unsigned)o; err[2] = (unsigned)j + 1; err[3] = w.y; } break; }
-            __builtin_amdgcn_s_sleep(1);
-            w = q27_ll_load16(rs[j] + o);
-        }
-        got[j] = q27_ll_unpack(w);
-    }
-    { int j = 0; for (int k = 0; k < NPEER + 1; ++k) { if (k == g) p[k] = mine; else p[k] = got[j++]; } }
-    float4 r;
-    r.x = (p[0].x + p[1].x) + (p[2].x + p[3].x);
-    r.y = (p[0].y + p[1].y) + (p[2].y + p[3].y);
-    r.z = (p[0].z + p[1].z) + (p[2].z + p[3].z);
-    r.w = (p[0].w + p[1].w) + (p[2].w + p[3].w);
-    red[o] = r;
-    float ss = fmaf(r.x, r.x, fmaf(r.y, r.y, fmaf(r.z, r.z, r.w * r.w)));
-    __shared__ float sm[4];
-    #pragma unroll
-    for (int oo = 32; oo; oo >>= 1) ss += __shfl_xor(ss, oo, 64);
-    const int w = t >> 6;
-    if ((t & 63) == 0) sm[w] = ss;
-    __syncthreads();
-    if (t == 0) ssp[c * Q27_NRP_SB + bx] = (sm[0] + sm[1]) + (sm[2] + sm[3]);
-}
-// Q27_LL_REG_RECV: TP3 trunk-only receiver. Keep both peers in scalar registers from
-// the initial loads through card-ordered reduction. SPIN_MAX is overridden only by
-// the bounded component error test; the product instantiation keeps the old limit.
-template<unsigned SPIN_MAX = Q27_LL_SPIN_MAX>
-__global__ __launch_bounds__(256) void q27_k_red_nr_ll_regs(const float4* __restrict__ own, int g,
-        const uint4* __restrict__ ra, const uint4* __restrict__ rb,
-        float4* __restrict__ red, float* __restrict__ ssp, int nv4, unsigned seq, unsigned* __restrict__ err)
-{
-    const int c = blockIdx.y, bx = blockIdx.x, t = threadIdx.x;
-    const int i = bx * 256 + t;
-    if (i >= nv4) return;
-    const size_t o = (size_t)c * nv4 + i;
-    const float4 mine = q27_round_bf16_f4(own[o]);
-    uint4 first0 = q27_ll_load16(ra + o);
-    uint4 first1 = q27_ll_load16(rb + o);
-    const bool missing0 = first0.y != seq || first0.w != seq;
-    const bool missing1 = first1.y != seq || first1.w != seq;
-    unsigned spins0 = 0;
-    if (missing0) {
-        while (first0.y != seq || first0.w != seq) {
-            if (++spins0 > SPIN_MAX) { if (err) { err[0] = seq; err[1] = (unsigned)o; err[2] = 1; err[3] = first0.y; } break; }
-            __builtin_amdgcn_s_sleep(1);
-            first0 = q27_ll_load16(ra + o);
-        }
-    }
-    if (missing1) {
-        // An early stale sample must not add a sleep after waiting for peer0.
-        if (spins0) first1 = q27_ll_load16(rb + o);
-        unsigned spins1 = 0;
-        while (first1.y != seq || first1.w != seq) {
-            if (++spins1 > SPIN_MAX) { if (err) { err[0] = seq; err[1] = (unsigned)o; err[2] = 2; err[3] = first1.y; } break; }
-            __builtin_amdgcn_s_sleep(1);
-            first1 = q27_ll_load16(rb + o);
-        }
-    }
-    const float4 a = q27_ll_unpack(first0), b = q27_ll_unpack(first1);
-    const float4 p0 = (g == 0) ? mine : a;
-    const float4 p1 = (g == 1) ? mine : ((g == 0) ? a : b);
-    const float4 p2 = (g == 2) ? mine : b;
-    float4 r;
-    r.x = (p0.x + p1.x) + (p2.x + 0.f);
-    r.y = (p0.y + p1.y) + (p2.y + 0.f);
-    r.z = (p0.z + p1.z) + (p2.z + 0.f);
-    r.w = (p0.w + p1.w) + (p2.w + 0.f);
-    red[o] = r;
-    float ss = fmaf(r.x, r.x, fmaf(r.y, r.y, fmaf(r.z, r.z, r.w * r.w)));
-    __shared__ float sm[4];
-    #pragma unroll
-    for (int oo = 32; oo; oo >>= 1) ss += __shfl_xor(ss, oo, 64);
-    const int w = t >> 6;
-    if ((t & 63) == 0) sm[w] = ss;
-    __syncthreads();
-    if (t == 0) ssp[c * Q27_NRP_SB + bx] = (sm[0] + sm[1]) + (sm[2] + sm[3]);
-}
-// Q27_LL_FUSED=1 (2026-09-28): the whole consumer half in ONE launch, one 256-thread block per row: spin on the peers'
-// words, reduce in registers (5 float4 per thread), block-reduce the sum of squares, then the exact norm/quant tail of
-// q27_k_rn_ssp_b<MODE> (same expressions, same width-4 group shuffles: threads 4j..4j+3 hold one 16-element group).
-// MODE 2 writes the fp32 rows (the head reads them); MODE 0/1 write hid (+y) and the int8 quant, never the fp32 rows.
-template<int NPEER, int MODE>
-__global__ __launch_bounds__(256) void q27_k_red_rn_ll_fused(const float4* __restrict__ own, int g,
-        const uint4* __restrict__ ra, const uint4* __restrict__ rb, const uint4* __restrict__ rc,
-        float4* __restrict__ red, const unsigned short* __restrict__ w,
-        unsigned short* __restrict__ hid, unsigned short* __restrict__ y,
-        signed char* __restrict__ q, float* __restrict__ qs,
-        int nv4, unsigned seq, unsigned* __restrict__ err, float plus, float sc_in)
-{
-    const int c = blockIdx.x, t = threadIdx.x;
-    const size_t rowo = (size_t)c * nv4;
-    const uint4* rs[3] = { ra, rb, rc };
-    float4 r[5];
-    float ss = 0.f;
-    #pragma unroll
-    for (int e = 0; e < 5; ++e) {
-        const int i = t + 256 * e;
-        const size_t o = rowo + i;
-        float4 p[4];
-        p[0] = p[1] = p[2] = p[3] = make_float4(0.f, 0.f, 0.f, 0.f);
-        const float4 mine = q27_round_bf16_f4(own[o]);
-        float4 got[3];
-        #pragma unroll
-        for (int j = 0; j < NPEER; ++j) {
-            uint4 wv = q27_ll_load16(rs[j] + o);
-            unsigned spins = 0;
-            while (wv.y != seq || wv.w != seq) {
-                if (++spins > Q27_LL_SPIN_MAX) { if (err) { err[0] = seq; err[1] = (unsigned)o; err[2] = (unsigned)j + 1; err[3] = wv.y; } break; }
-                __builtin_amdgcn_s_sleep(1);
-                wv = q27_ll_load16(rs[j] + o);
-            }
-            got[j] = q27_ll_unpack(wv);
-        }
-        { int j = 0; for (int k = 0; k < NPEER + 1; ++k) { if (k == g) p[k] = mine; else p[k] = got[j++]; } }
-        r[e].x = (p[0].x + p[1].x) + (p[2].x + p[3].x);
-        r[e].y = (p[0].y + p[1].y) + (p[2].y + p[3].y);
-        r[e].z = (p[0].z + p[1].z) + (p[2].z + p[3].z);
-        r[e].w = (p[0].w + p[1].w) + (p[2].w + p[3].w);
-        ss = fmaf(r[e].x, r[e].x, fmaf(r[e].y, r[e].y, fmaf(r[e].z, r[e].z, fmaf(r[e].w, r[e].w, ss))));
-        if (MODE == 2) red[o] = r[e];
-    }
-    if (MODE == 2) return;
-    __shared__ float sm[4];
-    #pragma unroll
-    for (int oo = 32; oo; oo >>= 1) ss += __shfl_xor(ss, oo, 64);
-    if ((t & 63) == 0) sm[t >> 6] = ss;
-    __syncthreads();
-    const float sst = (sm[0] + sm[1]) + (sm[2] + sm[3]);
-    const float inv = 1.0f / sqrtf(sst / (float)(nv4 << 2) + Q27_RMS_EPS);
-    hid += rowo << 2; if (y) y += rowo << 2; q += rowo << 2; qs += rowo >> 2;
-    const int lane4 = t & 3;
-    #pragma unroll
-    for (int e = 0; e < 5; ++e) {
-        const int i = t + 256 * e, k0 = i << 2;
-        const float4 xv = r[e];
-        const ushort4 wv = *(const ushort4*)(w + k0);
-        ushort4 hv;
-        hv.x = q27_f2bf(xv.x); hv.y = q27_f2bf(xv.y); hv.z = q27_f2bf(xv.z); hv.w = q27_f2bf(xv.w);
-        *(ushort4*)(hid + k0) = hv;
-        float n0 = xv.x * inv * (plus + q27_bf2f(wv.x));
-        float n1 = xv.y * inv * (plus + q27_bf2f(wv.y));
-        float n2 = xv.z * inv * (plus + q27_bf2f(wv.z));
-        float n3 = xv.w * inv * (plus + q27_bf2f(wv.w));
-        if (y) { ushort4 yv; yv.x = q27_f2bf(n0); yv.y = q27_f2bf(n1); yv.z = q27_f2bf(n2); yv.w = q27_f2bf(n3);
-                 *(ushort4*)(y + k0) = yv; }
-        float v0 = n0, v1 = n1, v2 = n2, v3 = n3;
-        if (MODE == 1) { v0 *= sc_in; v1 *= sc_in; v2 *= sc_in; v3 *= sc_in; }
-        float mx = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
-        mx = fmaxf(mx, __shfl_down(mx, 1, 4));
-        mx = fmaxf(mx, __shfl_down(mx, 2, 4));
-        mx = __shfl(mx, 0, 4);
-        const int gi = i >> 2;
-        float sc, qi;
-        if (MODE == 1) { sc = mx * (1.f/127.f);            qi = (sc > 0.f) ? 1.0f/sc : 0.f; }
-        else           { sc = mx * sc_in * (1.f/127.f);    qi = (sc > 0.f) ? sc_in/sc : 0.f; }
-        if (lane4 == 0) qs[gi] = sc;
-        const float vv[4] = { v0, v1, v2, v3 };
-        #pragma unroll
-        for (int ee = 0; ee < 4; ++ee) {
-            int cq = (int)rintf(vv[ee] * qi);
-            cq = cq < -127 ? -127 : (cq > 127 ? 127 : cq);
-            const int lane16 = (lane4 << 2) + ee;
-            const int dp = (MODE == 1) ? ((lane16 & 1) ? (8 + (lane16 >> 1)) : (lane16 >> 1)) : lane16;
-            q[(gi << 4) + dp] = (signed char)cq;
-        }
-    }
-}
-// Q27_LL_LB=1 (2026-09-28): the LAST-BLOCK fused consumer. Same grid as the two-kernel path (5 blocks x NR rows: the spin
-// and the reduce stay spread over 5 CUs per row), but the last block to finish a row (atomic counter) also runs the
-// norm/quant tail of q27_k_rn_ssp_b<MODE> over the whole row, so reduce + norm is ONE launch. The one-block-per-row
-// fused form (Q27_LL_FUSED) lost because it serialised the 60 KB of uncached spin-reads on one CU; here only the
-// ~20 KB L2-hot norm pass is serialised. cnt: NR u32 per card, zero at rest (the last block resets its row's counter).
-template<int NPEER, int MODE>
-__global__ __launch_bounds__(256) void q27_k_red_rn_ll_lb(const float4* __restrict__ own, int g,
-        const uint4* __restrict__ ra, const uint4* __restrict__ rb, const uint4* __restrict__ rc,
-        float4* __restrict__ red, float* __restrict__ ssp, const unsigned short* __restrict__ w,
-        unsigned short* __restrict__ hid, unsigned short* __restrict__ y,
-        signed char* __restrict__ q, float* __restrict__ qs,
-        int nv4, unsigned seq, unsigned* __restrict__ err, unsigned* __restrict__ cnt, float plus, float sc_in)
-{
-    const int c = blockIdx.y, bx = blockIdx.x, t = threadIdx.x;
-    const int i = bx * 256 + t;
-    __shared__ float sm[4];
-    __shared__ int last;
-    if (i < nv4) {
-        const size_t o = (size_t)c * nv4 + i;
-        float4 p[4];
-        p[0] = p[1] = p[2] = p[3] = make_float4(0.f, 0.f, 0.f, 0.f);
-        const float4 mine = q27_round_bf16_f4(own[o]);
-        const uint4* rs[3] = { ra, rb, rc };
-        float4 got[3];
-        #pragma unroll
-        for (int j = 0; j < NPEER; ++j) {
-            uint4 wv = q27_ll_load16(rs[j] + o);
-            unsigned spins = 0;
-            while (wv.y != seq || wv.w != seq) {
-                if (++spins > Q27_LL_SPIN_MAX) { if (err) { err[0] = seq; err[1] = (unsigned)o; err[2] = (unsigned)j + 1; err[3] = wv.y; } break; }
-                __builtin_amdgcn_s_sleep(1);
-                wv = q27_ll_load16(rs[j] + o);
-            }
-            got[j] = q27_ll_unpack(wv);
-        }
-        { int j = 0; for (int k = 0; k < NPEER + 1; ++k) { if (k == g) p[k] = mine; else p[k] = got[j++]; } }
-        float4 r;
-        r.x = (p[0].x + p[1].x) + (p[2].x + p[3].x);
-        r.y = (p[0].y + p[1].y) + (p[2].y + p[3].y);
-        r.z = (p[0].z + p[1].z) + (p[2].z + p[3].z);
-        r.w = (p[0].w + p[1].w) + (p[2].w + p[3].w);
-        red[o] = r;
-        float ss = fmaf(r.x, r.x, fmaf(r.y, r.y, fmaf(r.z, r.z, r.w * r.w)));
-        #pragma unroll
-        for (int oo = 32; oo; oo >>= 1) ss += __shfl_xor(ss, oo, 64);
-        if ((t & 63) == 0) sm[t >> 6] = ss;
-    }
-    __syncthreads();
-    if (t == 0) {
-        ssp[c * Q27_NRP_SB + bx] = (sm[0] + sm[1]) + (sm[2] + sm[3]);
-        __threadfence();                                   // partial sums + this block's red slice visible device-wide
-        const unsigned prev = atomicAdd(cnt + c, 1u);
-        last = (prev == (unsigned)(Q27_NRP_SB - 1)) ? 1 : 0;
-        if (last) cnt[c] = 0u;                              // reset for the next site (no other block touches it now)
-    }
-    __syncthreads();
-    if (MODE == 2 || !last) return;
-    __threadfence();
-    // ---- the last block: 1/rms from the five partials (fixed order = identical on every card), then the whole row ----
-    const float* sp = ssp + c * Q27_NRP_SB;
-    const float sst = ((sp[0] + sp[1]) + (sp[2] + sp[3])) + sp[4];   // after the acquire fence: L1 invalidated, L2 coherent
-    const float inv = 1.0f / sqrtf(sst / (float)(nv4 << 2) + Q27_RMS_EPS);
-    const float4* x = red + (size_t)c * nv4;
-    hid += (size_t)c * (nv4 << 2); if (y) y += (size_t)c * (nv4 << 2); q += (size_t)c * (nv4 << 2); qs += (size_t)c * (nv4 >> 2);
-    const int lane4 = t & 3;
-    for (int e = 0; e < Q27_NRP_SB; ++e) {
-        const int ii = e * 256 + t;
-        if (ii >= nv4) break;
-        const int k0 = ii << 2;
-        const float4 xv = x[ii];
-        const ushort4 wv = *(const ushort4*)(w + k0);
-        ushort4 hv;
-        hv.x = q27_f2bf(xv.x); hv.y = q27_f2bf(xv.y); hv.z = q27_f2bf(xv.z); hv.w = q27_f2bf(xv.w);
-        *(ushort4*)(hid + k0) = hv;
-        float n0 = xv.x * inv * (plus + q27_bf2f(wv.x));
-        float n1 = xv.y * inv * (plus + q27_bf2f(wv.y));
-        float n2 = xv.z * inv * (plus + q27_bf2f(wv.z));
-        float n3 = xv.w * inv * (plus + q27_bf2f(wv.w));
-        if (y) { ushort4 yv; yv.x = q27_f2bf(n0); yv.y = q27_f2bf(n1); yv.z = q27_f2bf(n2); yv.w = q27_f2bf(n3);
-                 *(ushort4*)(y + k0) = yv; }
-        float v0 = n0, v1 = n1, v2 = n2, v3 = n3;
-        if (MODE == 1) { v0 *= sc_in; v1 *= sc_in; v2 *= sc_in; v3 *= sc_in; }
-        float mx = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
-        mx = fmaxf(mx, __shfl_down(mx, 1, 4));
-        mx = fmaxf(mx, __shfl_down(mx, 2, 4));
-        mx = __shfl(mx, 0, 4);
-        const int gi = ii >> 2;
-        float sc, qi;
-        if (MODE == 1) { sc = mx * (1.f/127.f);            qi = (sc > 0.f) ? 1.0f/sc : 0.f; }
-        else           { sc = mx * sc_in * (1.f/127.f);    qi = (sc > 0.f) ? sc_in/sc : 0.f; }
-        if (lane4 == 0) qs[gi] = sc;
-        const float vv[4] = { v0, v1, v2, v3 };
-        #pragma unroll
-        for (int ee = 0; ee < 4; ++ee) {
-            int cq = (int)rintf(vv[ee] * qi);
-            cq = cq < -127 ? -127 : (cq > 127 ? 127 : cq);
-            const int lane16 = (lane4 << 2) + ee;
-            const int dp = (MODE == 1) ? ((lane16 & 1) ? (8 + (lane16 >> 1)) : (lane16 >> 1)) : lane16;
-            q[(gi << 4) + dp] = (signed char)cq;
-        }
-    }
-}
-static int q27_ll_fused = -1;
-static int q27_ll_lb = -1;
-// mode 0/1: reduce + norm/quant; mode 2: reduce only. ndev 3 or 4. err: 4 x u32 (device-visible, zero = clean). cnt: NR u32 (Q27_LL_LB).
-extern "C" int q27_red_rn_nr_ll(int mode, const float* own, int g, int ndev, const unsigned* ra, const unsigned* rb, const unsigned* rc,
-        unsigned seq, float* red, float* ssp, const unsigned short* wgt, unsigned short* hid, unsigned short* y,
-        signed char* xq, float* xs, int n, int plus_one, float in_scale, int C, unsigned* err, unsigned* cnt, hipStream_t s)
-{
-    if (n != Q27_HID || !own || !ra || !rb || !red || !ssp || C < 1 || g < 0 || g >= ndev || (ndev != 3 && ndev != 4) || (ndev == 4 && !rc)) return 0;
-    const int nv4 = n >> 2;
-    if (q27_ll_fused < 0) { const char* e = getenv("Q27_LL_FUSED"); q27_ll_fused = (e && atoi(e)) ? 1 : 0; }
-    if (q27_ll_lb < 0) { const char* e = getenv("Q27_LL_LB"); q27_ll_lb = (e && atoi(e)) ? 1 : 0; }
-    if (q27_ll_lb && cnt && mode != 2 && nv4 == Q27_NRP_SB * 256) {
-        if (!(in_scale > 0.f) || !wgt || !hid || !xq || !xs) return 0;
-        const float plus = plus_one ? 1.0f : 0.0f, sci = 1.0f / in_scale;
-        #define Q27_LLB(NP, MD) hipLaunchKernelGGL((q27_k_red_rn_ll_lb<NP, MD>), dim3(Q27_NRP_SB, C), dim3(256), 0, s, (const float4*)own, g, (const uint4*)ra, (const uint4*)rb, (const uint4*)rc, (float4*)red, ssp, wgt, hid, y, xq, xs, nv4, seq, err, cnt, plus, sci)
-        if (ndev == 4) { if (mode == 1) Q27_LLB(3, 1); else Q27_LLB(3, 0); }
-        else           { if (mode == 1) Q27_LLB(2, 1); else Q27_LLB(2, 0); }
-        #undef Q27_LLB
-        return 1;
-    }
-    if (q27_ll_fused && nv4 == 1280) {
-        if (mode != 2 && (!(in_scale > 0.f) || !wgt || !hid || !xq || !xs)) return 0;
-        const float plus = plus_one ? 1.0f : 0.0f, sci = (mode == 2) ? 1.0f : 1.0f / in_scale;
-        #define Q27_LLF(NP, MD) hipLaunchKernelGGL((q27_k_red_rn_ll_fused<NP, MD>), dim3(C), dim3(256), 0, s, (const float4*)own, g, (const uint4*)ra, (const uint4*)rb, (const uint4*)rc, (float4*)red, wgt, hid, y, xq, xs, nv4, seq, err, plus, sci)
-        if (ndev == 4) { if (mode == 2) Q27_LLF(3, 2); else if (mode == 1) Q27_LLF(3, 1); else Q27_LLF(3, 0); }
-        else           { if (mode == 2) Q27_LLF(2, 2); else if (mode == 1) Q27_LLF(2, 1); else Q27_LLF(2, 0); }
-        #undef Q27_LLF
-        return 1;
-    }
-    if (ndev == 4) hipLaunchKernelGGL(q27_k_red_nr_ll<3>, dim3(Q27_NRP_SB, C), dim3(256), 0, s,
-                       (const float4*)own, g, (const uint4*)ra, (const uint4*)rb, (const uint4*)rc, (float4*)red, ssp, nv4, seq, err);
-    else           hipLaunchKernelGGL(q27_k_red_nr_ll<2>, dim3(Q27_NRP_SB, C), dim3(256), 0, s,
-                       (const float4*)own, g, (const uint4*)ra, (const uint4*)rb, (const uint4*)rc, (float4*)red, ssp, nv4, seq, err);
-    if (mode == 2) return 1;
-    if (!(in_scale > 0.f) || !wgt || !hid || !xq || !xs) return 0;
-    const dim3 grid((nv4 + 63) / 64, C), blk(64);
-    if (mode == 1) hipLaunchKernelGGL(q27_k_rn_ssp_b<1>, grid, blk, 0, s, (const float4*)red, (const float*)ssp, wgt, hid, y, xq, xs, nv4, plus_one ? 1.0f : 0.0f, 1.0f / in_scale);
-    else           hipLaunchKernelGGL(q27_k_rn_ssp_b<0>, grid, blk, 0, s, (const float4*)red, (const float*)ssp, wgt, hid, y, xq, xs, nv4, plus_one ? 1.0f : 0.0f, 1.0f / in_scale);
-    return 1;
-}
-// Explicit trunk entry point. MTP-head callers continue using q27_red_rn_nr_ll.
-// Keep the candidate off by default and do not compose it with banked LL variants.
-extern "C" int q27_red_rn_nr_ll_trunk(int mode, const float* own, int g, int ndev, const unsigned* ra, const unsigned* rb, const unsigned* rc,
-        unsigned seq, float* red, float* ssp, const unsigned short* wgt, unsigned short* hid, unsigned short* y,
-        signed char* xq, float* xs, int n, int plus_one, float in_scale, int C, unsigned* err, unsigned* cnt, hipStream_t s)
-{
-    static const bool enabled = [] { const char* e = getenv("Q27_LL_REG_RECV"); return e && atoi(e); }();
-    if (q27_ll_fused < 0) { const char* e = getenv("Q27_LL_FUSED"); q27_ll_fused = (e && atoi(e)) ? 1 : 0; }
-    if (q27_ll_lb < 0) { const char* e = getenv("Q27_LL_LB"); q27_ll_lb = (e && atoi(e)) ? 1 : 0; }
-    if (!enabled || ndev != 3 || q27_ll_fused || q27_ll_lb)
-        return q27_red_rn_nr_ll(mode, own, g, ndev, ra, rb, rc, seq, red, ssp, wgt, hid, y, xq, xs, n, plus_one, in_scale, C, err, cnt, s);
-    if (n != Q27_HID || !own || !ra || !rb || !red || !ssp || C < 1 || g < 0 || g >= ndev) return 0;
-    const int nv4 = n >> 2;
-    hipLaunchKernelGGL((q27_k_red_nr_ll_regs<>), dim3(Q27_NRP_SB, C), dim3(256), 0, s,
-                      (const float4*)own, g, (const uint4*)ra, (const uint4*)rb, (float4*)red, ssp, nv4, seq, err);
-    static thread_local unsigned logged_rows = 0;
-    const unsigned row_bit = 1u << ((C <= 31) ? C - 1 : 31);
-    if (!(logged_rows & row_bit)) {
-        logged_rows |= row_bit;
-        std::fprintf(stderr, "Q27_LL_REG_RECV_DISPATCH g=%d ndev=3 nr=%d mode=%d trunk=1 kernel=q27_k_red_nr_ll_regs spin_max=%u\n", g, C, mode, Q27_LL_SPIN_MAX);
-    }
-    if (mode == 2) return 1;
-    if (!(in_scale > 0.f) || !wgt || !hid || !xq || !xs) return 0;
-    const dim3 grid((nv4 + 63) / 64, C), blk(64);
-    if (mode == 1) hipLaunchKernelGGL(q27_k_rn_ssp_b<1>, grid, blk, 0, s, (const float4*)red, (const float*)ssp, wgt, hid, y, xq, xs, nv4, plus_one ? 1.0f : 0.0f, 1.0f / in_scale);
-    else           hipLaunchKernelGGL(q27_k_rn_ssp_b<0>, grid, blk, 0, s, (const float4*)red, (const float*)ssp, wgt, hid, y, xq, xs, nv4, plus_one ? 1.0f : 0.0f, 1.0f / in_scale);
-    return 1;
-}
-// LL self-test kernels: a spinning reader (launched FIRST, so the write it waits for cannot have happened yet) and a
-// single-word writer on the source card. The reader also re-reads a word it has ALREADY loaded (cache-staleness leg).
-__global__ void q27_k_ll_probe_wait(const uint4* p, unsigned seq, unsigned* out)
-{
-    if (threadIdx.x) return;
-    uint4 w = q27_ll_load16(p);
-    out[1] = w.y;                       // what the slot held BEFORE (stale value: must differ from seq)
-    unsigned spins = 0;
-    while (w.y != seq || w.w != seq) { if (++spins > Q27_LL_SPIN_MAX) break; __builtin_amdgcn_s_sleep(1); w = q27_ll_load16(p); }
-    out[0] = (w.y == seq && w.w == seq) ? w.x : 0xFFFFFFFFu;
-    out[2] = spins;
-}
-extern "C" int q27_ll_probe_wait(const unsigned* slot, unsigned seq, unsigned* out, hipStream_t s)
-{ hipLaunchKernelGGL(q27_k_ll_probe_wait, dim3(1), dim3(64), 0, s, (const uint4*)slot, seq, out); return 1; }
-__global__ void q27_k_ll_probe_write(uint2* p, unsigned data, unsigned seq)
-{ if (threadIdx.x == 0) { uint2 o; o.x = data; o.y = seq; p[0] = o; p[1] = o; } }
-extern "C" int q27_ll_probe_write(unsigned* slot, unsigned data, unsigned seq, hipStream_t s)
-{ hipLaunchKernelGGL(q27_k_ll_probe_write, dim3(1), dim3(64), 0, s, (uint2*)slot, data, seq); return 1; }
